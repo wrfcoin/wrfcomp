@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 from wrfcomp.harness.align import align_truth
 from wrfcomp.harness.evaluate import app, canonical_json
 from wrfcomp.harness.hashing import content_sha256
-from wrfcomp.harness.schemas import Scorecard
+from wrfcomp.harness.schemas import GATE_NAMES, Scorecard
 
 HOUR = np.timedelta64(1, "h")
 N_REQUIRED = 20  # stations in the synthetic stations file
@@ -298,9 +298,10 @@ def test_no_baseline_scores_but_cannot_pass(tmp_path, synthetic) -> None:
 def test_better_candidate_passes_the_gate(tmp_path, synthetic) -> None:
     out = tmp_path / "s.json"
     card = _scored(_run(_stores(tmp_path, synthetic), out), out)
-    assert card["gates"] == {
-        v: {"skill": True, "tail": True, "spread_skill": True, "dm": True} for v in card["gates"]
-    }
+    assert set(card["gates"]) == {"t2m", "u10"}
+    for name, per_gate in card["gates"].items():
+        assert set(per_gate) == set(GATE_NAMES), name  # the kernel's gate list, whatever it holds
+        assert all(per_gate.values()), (name, per_gate)
     assert card["passed_gate"] is True
 
 
