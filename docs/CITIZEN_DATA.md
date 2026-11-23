@@ -78,8 +78,14 @@ rows are as recorded in the first pass of this lane and were not fetched a secon
 
 **Fetcher:** `scripts/fetch_citizen_sample.py`
 
-- 2-hour windows per region, at most `4` concurrent requests, `500 MiB` hard transfer cap, dates before
-  the sealed-test start only. `--sample-windows N` fetches N windows and prints a size projection without
+- 2-hour windows per region, at most `4` concurrent requests, dates before the sealed-test start only.
+- The `500 MiB` hard cap applies twice: to the bytes transferred (the run aborts when the running total
+  passes it) and to the bytes stored (after each region is saved the `*.nc` files in the folder are
+  added up; a region that would take the total over the cap is deleted again and the run fails).
+- Storage: one NetCDF4 file per region, float32 values, station token and variable name as fixed-width
+  byte strings, zlib compression. A first version of this lane wrote the same rows uncompressed with
+  wide text columns, about 123 bytes per row (573 MB for the Seattle region); the present layout takes
+  about 5 bytes per row. `--sample-windows N` fetches N windows and prints a size projection without
   writing data.
 - A window that still fails after three tries is counted in `errors` in the summary; the sample is then
   incomplete for that window and section 3 says so.

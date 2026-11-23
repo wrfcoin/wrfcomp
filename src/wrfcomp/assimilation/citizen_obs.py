@@ -416,7 +416,12 @@ def save_citizen_batch(batch: ObservationBatch, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.part")
     try:
-        ds.to_netcdf(tmp, engine="h5netcdf")
+        # Fixed-width byte strings and zlib: millions of rows repeat a few hundred tokens and eight
+        # variable names, so this is some 20 times smaller than the default layout.
+        encoding: dict[str, dict[str, Any]] = {name: {"zlib": True, "complevel": 4} for name in ds.data_vars}
+        encoding["station_id"]["dtype"] = "S11"
+        encoding["variable"]["dtype"] = "S16"
+        ds.to_netcdf(tmp, engine="h5netcdf", encoding=encoding)
         tmp.replace(path)
     finally:
         tmp.unlink(missing_ok=True)

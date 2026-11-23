@@ -43,7 +43,7 @@ from wrfcomp.assimilation.tokens import ObservationBatch
 MADIS_CGI_URL = "https://madis-data.ncep.noaa.gov/madisPublic1/cgi-bin/madisXmlPublicDir"
 MADIS_NVARS = ("LAT", "LON", "ELEV", "T", "TD", "DD", "FF", "FFGUST", "P", "SLP", "PCP1H")
 MAX_CONCURRENCY = 4
-HARD_CAP_BYTES = 500 * 1024 * 1024  # 500 MiB hard transfer cap
+HARD_CAP_BYTES = 500 * 1024 * 1024  # 500 MiB hard cap, on the bytes transferred AND on the bytes stored
 # From configs/splits.yaml, by way of the loader.
 SEALED_DATE = dt.date.fromisoformat(str(SEALED_START.astype("datetime64[D]")))
 
@@ -82,6 +82,18 @@ def default_data_dir() -> Path:
     if env_dir:
         return Path(env_dir).expanduser()
     return Path.home() / "wrfcomp-data"
+
+
+def stored_bytes(citizen_dir: Path) -> int:
+    """Total size of the stored sample files (``*.nc``) in the citizen data folder."""
+    return sum(p.stat().st_size for p in Path(citizen_dir).glob("*.nc"))
+
+
+def check_stored_cap(citizen_dir: Path, *, cap_bytes: int = HARD_CAP_BYTES) -> None:
+    """Raise if the stored sample is larger than the cap."""
+    total = stored_bytes(citizen_dir)
+    if total > cap_bytes:
+        raise RuntimeError(f"stored-size cap exceeded ({total:,} > {cap_bytes:,} bytes)")
 
 
 def build_madis_window_url(
@@ -288,6 +300,11 @@ def main(
             )
             if sample_windows is None:
                 save_citizen_batch(batch, nc_path)
+                try:
+                    check_stored_cap(out_dir)
+                except RuntimeError:
+                    nc_path.unlink(missing_ok=True)  # never leave an over-cap sample on disk
+                    raise
 
         stats = summarize_batch(batch)
         stats["download_bytes"] = r_bytes
@@ -303,6 +320,7 @@ def main(
 
     elapsed = time.monotonic() - t0
     summary["total_download_bytes"] = byte_counter[0]
+    summary["total_stored_bytes"] = stored_bytes(out_dir)
     summary["elapsed_seconds"] = round(elapsed, 2)
 
     if sample_windows is not None:

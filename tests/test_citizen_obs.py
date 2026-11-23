@@ -157,7 +157,11 @@ def test_netcdf_roundtrip_holds_only_rounded_positions(tmp_path: Path) -> None:
         assert float(ds["lat"].values[0]) == pytest.approx(47.6, abs=1e-5)
         assert float(ds["lon"].values[0]) == pytest.approx(-122.3, abs=1e-5)
         assert float(ds["elevation_m"].values[0]) == 60.0
-        assert str(ds["station_id"].values[0]) == anonymize_station_id("PRIVATE99", key=KEY)
+        assert ds["station_id"].values[0].decode() == anonymize_station_id("PRIVATE99", key=KEY)
+        # Stored compactly: float32 values, fixed-width byte strings, compressed.
+        assert ds["value"].dtype == np.float32 and ds["lat"].dtype == np.float32
+        assert ds["station_id"].dtype == np.dtype("S11") and ds["variable"].dtype == np.dtype("S16")
+        assert all(ds[name].encoding.get("zlib") for name in ds.data_vars)
 
     reloaded = load_citizen_batch(nc_path)
     assert reloaded.station_ids.tolist() == batch.station_ids.tolist()
@@ -275,6 +279,36 @@ def test_merge_and_summary_are_aggregates_only() -> None:
     for sid in batch.station_ids.tolist():
         assert sid not in text  # not even the tokens
     assert "SYN" not in text and "35.2" not in text and "101.8" not in text
+
+
+def test_stored_size_is_capped_and_a_large_sample_stays_small(tmp_path: Path) -> None:
+    mod = _load_fetch_module()
+    # 400 000 random rows: under 30 bytes a row (the first, uncompressed layout took about 123).
+    rng = np.random.default_rng(7)
+    n = 400_000
+    stations = np.array([anonymize_station_id(f"SYN{i:03d}", key=KEY) for i in range(300)])
+    batch = type(_sample_batch())(
+        station_ids=stations[rng.integers(0, 300, n)],
+        lat=np.round(rng.uniform(46.5, 48.5, n), 1),
+        lon=np.round(rng.uniform(-123.5, -121.0, n), 1),
+        elevation_m=np.round(rng.uniform(0, 900, n), -1),
+        obs_time=np.datetime64("2024-07-08T00:00", "ns")
+        + rng.integers(0, 14 * 1440, n) * np.timedelta64(1, "m"),
+        sensor_type_id=np.full(n, CITIZEN_SENSOR_TYPE_ID),
+        variable=np.array(
+            ["t2m", "td2m", "u10", "v10", "wind_speed", "wind_gust", "precip", "station_pressure"]
+        )[rng.integers(0, 8, n)],
+        values=rng.normal(290, 5, n).astype(np.float32),
+    )
+    path = tmp_path / "citizen" / "big.nc"
+    save_citizen_batch(batch, path)
+    assert path.stat().st_size < 30 * n
+
+    # The cap counts what is stored, not only what is transferred.
+    assert mod.stored_bytes(tmp_path / "citizen") == path.stat().st_size
+    mod.check_stored_cap(tmp_path / "citizen", cap_bytes=path.stat().st_size)
+    with pytest.raises(RuntimeError, match="stored-size cap"):
+        mod.check_stored_cap(tmp_path / "citizen", cap_bytes=path.stat().st_size - 1)
 
 
 def test_fetch_script_guards_and_logs(monkeypatch: pytest.MonkeyPatch) -> None:
