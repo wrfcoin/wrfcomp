@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wrfcomp"
+version = "0.1.0"
+description = "Verification harness, station quality control and forecast baselines for WRFCoin."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "dask>=2024.10.0",
+    "numpy>=2.0.0",
+    "pandas>=2.2.0",
+    "pydantic>=2.9.0",
+    "pyyaml>=6.0",
+    "scores>=2.0.0",
+    "scipy>=1.14.0",
+    "typer>=0.12.0",
+    "xarray>=2024.10.0",
+    "zarr>=2.18.0",
+]
+
+[project.optional-dependencies]
+# GPU-only. Not installed in CI and not needed by the harness. No NVIDIA GPU exists yet.
+ai = [
+    "earth2studio>=0.9.0",
+    "torch>=2.5.0",
+]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.7.0",
+]
+
+[project.scripts]
+wrfcomp-eval = "wrfcomp.harness.evaluate:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wrfcomp"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# typer puts Option(...) calls in argument defaults by design
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

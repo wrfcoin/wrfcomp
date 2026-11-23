@@ -1,0 +1,42 @@
+# WRFComp Immutable Temporal Splits & Verification Configuration
+# Locked after Phase 1 sign-off — do NOT modify during automated model/swarm runs.
+
+protocol_version: "0.1.0"
+
+splits:
+  train:
+    start_utc: "1979-01-01T00:00:00Z"
+    end_utc: "2023-12-17T18:00:00Z"
+    embargo_days_after: 14
+    purpose: "Model training, QC calibration, and fixed 95th-percentile extreme thresholds"
+
+  validation:
+    start_utc: "2024-01-01T00:00:00Z"
+    end_utc: "2024-12-17T18:00:00Z"
+    embargo_days_after: 14
+    purpose: "Architecture search, assimilation tuning, and bounded agentic experiment loops"
+
+  sealed_test:
+    start_utc: "2025-01-01T00:00:00Z"
+    end_utc: null
+    purpose: "OFF-LIMITS to automated loops; human-approved release verification only"
+
+evaluation:
+  init_hours_utc: [0, 6, 12, 18]
+  lead_hours: [1, 3, 6, 12, 24, 48]   # v1 energy-trading & rapid-refresh target window
+  extended_lead_hours: [72, 120, 168]
+  truth_tolerance_minutes: 15
+  variables:
+    primary: ["t2m", "td2m", "u10", "v10", "msl"]   # K, K, m/s, m/s, Pa
+    secondary_upper_air: ["z500", "t850"]           # deferred, not part of the v1 gate
+  stations_file: "configs/stations_conus.csv"
+  promotion_gate:
+    alpha_dm: 0.05
+    min_crpss_vs_baseline: 0.0
+    spread_skill_min: 0.85
+    spread_skill_max: 1.15
+    tail_quantile: 0.95
+    tail_threshold_source: "train"   # per station and calendar month, from the train split only
+    loss_weights:
+      crps_fair: 0.70
+      twcrps_p95: 0.30

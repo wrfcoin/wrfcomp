@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WRFCoin Proof-of-Forecast-Skill Simulator</title>
+  <style>
+    body, svg, button, input, select { font-family: var(--ff-sans, 'Google Sans Flex', 'Google Sans', sans-serif); }
+    .top-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+    .kpi-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .kpi-val { font-size: 22px; line-height: 28px; font-weight: 470; font-variant-numeric: tabular-nums; color: var(--on-surface); margin-top: 4px; }
+    .kpi-sub { font-size: 12px; color: var(--on-surface-variant); margin-top: 2px; font-variant-numeric: tabular-nums; }
+    .stage-card { background: var(--surface-bright); border-radius: var(--r-m); padding: 16px 20px; margin-bottom: 14px; }
+    .stage-label { font-size: 13px; font-weight: 500; color: var(--on-surface); margin-bottom: 10px; }
+    .split-bar { display: flex; height: 26px; border-radius: var(--r-s); overflow: hidden; gap: 2px; margin-bottom: 10px; }
+    .split-seg { display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; transition: width 0.15s ease; white-space: nowrap; overflow: hidden; }
+    .legend-row { display: flex; gap: 16px; font-size: 12px; color: var(--on-surface-variant); flex-wrap: wrap; margin-bottom: 16px; }
+    .legend-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+    .actor-list { display: flex; flex-direction: column; gap: 10px; }
+    .actor-row { display: grid; grid-template-columns: 185px 1fr 110px; align-items: center; gap: 12px; }
+    .actor-name { font-size: 13px; color: var(--on-surface); line-height: 1.3; }
+    .actor-meta { font-size: 12px; color: var(--on-surface-variant); }
+    .bar-track { position: relative; height: 22px; background: var(--surface-dim); border-radius: var(--r-s); overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: var(--r-s); transition: width 0.15s ease, background-color 0.15s ease; }
+    .actor-val { text-align: right; font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
+    .val-pos { color: var(--positive); }
+    .val-neg { color: var(--error); }
+    .val-mid { color: var(--on-surface-variant); }
+    .control-deck { display: flex; flex-direction: column; gap: 14px; padding: 16px 20px; background: var(--surface-bright); border-radius: var(--r-m); }
+    @media (max-width: 560px) {
+      .actor-row { grid-template-columns: 1fr 96px; }
+      .bar-track { grid-column: 1 / -1; order: 3; }
+    }
+  </style>
+</head>
+<body>
+  <div class="widget-container">
+    <div class="top-bar">
+      <div class="lumi-segmented-group" role="group" aria-label="Tokenomics Presets">
+        <button type="button" class="lumi-segmented-btn is-active" data-preset="balanced">Balanced Launch</button>
+        <button type="button" class="lumi-segmented-btn" data-preset="anticopy">Strict Anti-Copycat</button>
+        <button type="button" class="lumi-segmented-btn" data-preset="iot">IoT Growth Push</button>
+      </div>
+      <div class="kpi-sub" id="ratio-badge">Innovator / Copycat ratio: 10.7×</div>
+    </div>
+
+    <div class="kpi-strip">
+      <div class="lumi-summary-card">
+        <div class="lumi-label-s" style="color: var(--on-surface-variant);">Honest Innovator</div>
+        <div class="kpi-val val-pos" id="kpi-innovator">+690 WRF</div>
+        <div class="kpi-sub" id="kpi-innovator-sub">Net per 6h epoch</div>
+      </div>
+      <div class="lumi-summary-card">
+        <div class="lumi-label-s" style="color: var(--on-surface-variant);">Free-Model Copycat</div>
+        <div class="kpi-val" id="kpi-copycat">+64 WRF</div>
+        <div class="kpi-sub" id="kpi-copycat-sub">Relays public AIFS/GFS</div>
+      </div>
+      <div class="lumi-summary-card">
+        <div class="lumi-label-s" style="color: var(--on-surface-variant);">Rural High-QoD Station</div>
+        <div class="kpi-val val-pos" id="kpi-rural">+74 WRF</div>
+        <div class="kpi-sub" id="kpi-rural-sub">QoD 0.96 · Sparse cell</div>
+      </div>
+    </div>
+
+    <div class="stage-card">
+      <div class="stage-label">Epoch Emission Pool Split (10% Fixed Validator Pool)</div>
+      <div class="split-bar" role="img" aria-label="Epoch emission split across compute, weather stations, and validators">
+        <div id="seg-compute" class="split-seg" style="background: var(--chart-1); width: 50%;">50%</div>
+        <div id="seg-station" class="split-seg" style="background: var(--chart-3); width: 40%;">40%</div>
+        <div id="seg-validator" class="split-seg" style="background: var(--chart-2); width: 10%;">10%</div>
+      </div>
+      <div class="legend-row">
+        <span><span class="legend-dot" style="background: var(--chart-1);"></span>Compute Pool (<span id="leg-compute">5,000</span> WRF)</span>
+        <span><span class="legend-dot" style="background: var(--chart-3);"></span>Station Pool (<span id="leg-station">4,000</span> WRF)</span>
+        <span><span class="legend-dot" style="background: var(--chart-2);"></span>Validators (<span id="leg-val">1,000</span> WRF)</span>
+      </div>
+
+      <div class="stage-label">Net Payout / Slash per Epoch by Network Participant</div>
+      <div class="actor-list" id="actor-list"></div>
+    </div>
+
+    <div class="control-deck">
+      <div class="lumi-slider-row">
+        <label class="lumi-slider-label" for="in-emissions">Total Epoch Emissions (WRF)</label>
+        <div class="lumi-slider-container">
+          <input id="in-emissions" class="lumi-slider" type="range" min="2000" max="50000" step="1000" value="10000" style="--progress: 16.7%;">
+          <div id="val-emissions" class="lumi-slider-value">10k</div>
+        </div>
+      </div>
+      <div class="lumi-slider-row">
+        <label class="lumi-slider-label" for="in-compute">Compute Pool Share (Remainder to Stations)</label>
+        <div class="lumi-slider-container">
+          <input id="in-compute" class="lumi-slider" type="range" min="20" max="75" step="5" value="50" style="--progress: 54.5%;">
+          <div id="val-compute" class="lumi-slider-value">50%</div>
+        </div>
+      </div>
+      <div class="lumi-slider-row">
+        <label class="lumi-slider-label" for="in-delta">Delta-CRPS Weight (Uniqueness vs. Raw Skill)</label>
+        <div class="lumi-slider-container">
+          <input id="in-delta" class="lumi-slider" type="range" min="0" max="100" step="5" value="70" style="--progress: 70%;">
+          <div id="val-delta" class="lumi-slider-value">70%</div>
+        </div>
+      </div>
+      <div class="lumi-slider-row">
+        <label class="lumi-slider-label" for="in-slash">Max Stake Slashing Cap (5,000 WRF Stake)</label>
+        <div class="lumi-slider-container">
+          <input id="in-slash" class="lumi-slider" type="range" min="0" max="20" step="1" value="5" style="--progress: 25%;">
+          <div id="val-slash" class="lumi-slider-value">5%</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function getCssVar(name, fallback = '') {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+    }
+    function contrastText(bg) {
+      const c = (bg || '').replace(/\s/g, '');
+      let r = 0, g = 0, b = 0;
+      if (c.startsWith('#')) {
+        const hex = c.slice(1);
+        const full = hex.length === 3 ? hex.split('').map(x => x + x).join('') : hex;
+        r = parseInt(full.slice(0, 2), 16);
+        g = parseInt(full.slice(2, 4), 16);
+        b = parseInt(full.slice(4, 6), 16);
+      } else {
+        const m = c.match(/\d+/g);
+        if (!m || m.length < 3) return getCssVar('--on-surface', '#000000');
+        [r, g, b] = m.map(Number);
+      }
+      const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      return lum > 0.45 ? '#000000' : '#ffffff';
+    }
+    function syncSlider(slider) {
+      const min = parseFloat(slider.min || '0');
+      const max = parseFloat(slider.max || '100');
+      const val = parseFloat(slider.value || '0');
+      slider.style.setProperty('--progress', `${((val - min) / (max - min)) * 100}%`);
+    }
+
+    const PRESETS = {
+      balanced: { emissions: 10000, compute: 50, delta: 70, slash: 5 },
+      anticopy: { emissions: 10000, compute: 55, delta: 90, slash: 10 },
+      iot:      { emissions: 15000, compute: 35, delta: 65, slash: 5 }
+    };
+
+    const inEmissions = document.getElementById('in-emissions');
+    const inCompute = document.getElementById('in-compute');
+    const inDelta = document.getElementById('in-delta');
+    const inSlash = document.getElementById('in-slash');
+    const presetBtns = Array.from(document.querySelectorAll('.lumi-segmented-btn'));
+
+    const fmtInt = new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 });
+
+    function updateSim() {
+      [inEmissions, inCompute, inDelta, inSlash].forEach(syncSlider);
+
+      const emissions = parseFloat(inEmissions.value);
+      const computePct = parseFloat(inCompute.value);
+      const validatorPct = 10;
+      const stationPct = 90 - computePct;
+      const wDelta = parseFloat(inDelta.value) / 100;
+      const slashCap = parseFloat(inSlash.value) / 100;
+
+      document.getElementById('val-emissions').textContent = `${Math.round(emissions / 1000)}k`;
+      document.getElementById('val-compute').textContent = `${computePct}%`;
+      document.getElementById('val-delta').textContent = `${Math.round(wDelta * 100)}%`;
+      document.getElementById('val-slash').textContent = `${Math.round(slashCap * 100)}%`;
+
+      const computePool = emissions * (computePct / 100);
+      const stationPool = emissions * (stationPct / 100);
+      const valPool = emissions * (validatorPct / 100);
+
+      const segC = document.getElementById('seg-compute');
+      const segS = document.getElementById('seg-station');
+      const segV = document.getElementById('seg-validator');
+      segC.style.width = `${computePct}%`; segC.textContent = `${computePct}%`;
+      segS.style.width = `${stationPct}%`; segS.textContent = `${stationPct}%`;
+      segV.style.width = `${validatorPct}%`; segV.textContent = `${validatorPct}%`;
+      segC.style.color = contrastText(getCssVar('--chart-1', '#2575fc'));
+      segS.style.color = contrastText(getCssVar('--chart-3', '#228a49'));
+      segV.style.color = contrastText(getCssVar('--chart-2', '#5b6e9e'));
+
+      document.getElementById('leg-compute').textContent = fmtInt.format(computePool);
+      document.getElementById('leg-station').textContent = fmtInt.format(stationPool);
+      document.getElementById('leg-val').textContent = fmtInt.format(valPool);
+
+      // Representative testnet cohort: 5 innovators, 10 copycats, 5 noisy miners (5,000 WRF stake each)
+      const stake = 5000;
+      const sInnov = (1 - wDelta) * 0.18 + wDelta * 0.14;
+      const sCopy  = (1 - wDelta) * 0.06 + wDelta * 0.00;
+      const sNoisy = (1 - wDelta) * (-0.09) + wDelta * (-0.04);
+
+      const totalPosScore = 5 * Math.max(0, sInnov) + 10 * Math.max(0, sCopy);
+      const payInnov = totalPosScore > 0 ? computePool * (Math.max(0, sInnov) / totalPosScore) : 0;
+      const payCopy  = totalPosScore > 0 ? computePool * (Math.max(0, sCopy) / totalPosScore) : 0;
+      const slashNoisy = -Math.min(slashCap, Math.abs(sNoisy) * 1.1) * stake;
+
+      // Representative station cohort: 65 effective station-weight units network-wide
+      const totalStationWeight = 65.0;
+      const payRural   = stationPool * ((0.96 * 1.0 * 1.25) / totalStationWeight);
+      const payCrowded = stationPool * ((0.42 * 0.90 * (1 / 8)) / totalStationWeight);
+
+      const ratio = payCopy > 0.5 ? `${(payInnov / payCopy).toFixed(1)}×` : '∞ (Copycat zeroed)';
+      document.getElementById('ratio-badge').textContent = `Innovator / Copycat ratio: ${ratio}`;
+
+      document.getElementById('kpi-innovator').textContent = `+${fmtInt.format(payInnov)} WRF`;
+      document.getElementById('kpi-copycat').textContent = `+${fmtInt.format(payCopy)} WRF`;
+      document.getElementById('kpi-copycat').className = payCopy < 30 ? 'kpi-val val-mid' : 'kpi-val';
+      document.getElementById('kpi-rural').textContent = `+${fmtInt.format(payRural)} WRF`;
+
+      const actors = [
+        { name: 'Honest Innovator', meta: 'CRPSS +0.18 · Δ-CRPS +0.14', val: payInnov, color: 'var(--chart-1)' },
+        { name: 'Free-Model Copycat', meta: 'CRPSS +0.06 · Δ-CRPS 0.00', val: payCopy, color: 'var(--chart-8)' },
+        { name: 'Noisy / Bad Miner', meta: 'CRPSS -0.09 · Slashed stake', val: slashNoisy, color: 'var(--error)' },
+        { name: 'Rural High-QoD Station', meta: 'QoD 0.96 · Sparse H3 cell', val: payRural, color: 'var(--chart-3)' },
+        { name: 'Crowded Backyard Sybil', meta: 'QoD 0.42 · 8 sensors in cell', val: payCrowded, color: 'var(--chart-2)' }
+      ];
+
+      const maxAbs = Math.max(100, ...actors.map(a => Math.abs(a.val)));
+      const listEl = document.getElementById('actor-list');
+      listEl.replaceChildren(...actors.map(a => {
+        const row = document.createElement('div');
+        row.className = 'actor-row';
+
+        const info = document.createElement('div');
+        const title = document.createElement('div');
+        title.className = 'actor-name';
+        title.textContent = a.name;
+        const meta = document.createElement('div');
+        meta.className = 'actor-meta';
+        meta.textContent = a.meta;
+        info.append(title, meta);
+
+        const track = document.createElement('div');
+        track.className = 'bar-track';
+        const fill = document.createElement('div');
+        fill.className = 'bar-fill';
+        fill.style.width = `${Math.max(2, (Math.abs(a.val) / maxAbs) * 100)}%`;
+        fill.style.background = a.color;
+        track.appendChild(fill);
+
+        const valEl = document.createElement('div');
+        valEl.className = `actor-val ${a.val < 0 ? 'val-neg' : (a.val < 15 ? 'val-mid' : 'val-pos')}`;
+        const sign = a.val > 0 ? '+' : '';
+        valEl.textContent = `${sign}${fmtInt.format(a.val)} WRF`;
+
+        row.append(info, track, valEl);
+        return row;
+      }));
+    }
+
+    presetBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        presetBtns.forEach(b => b.classList.remove('is-active'));
+        btn.classList.add('is-active');
+        const p = PRESETS[btn.dataset.preset];
+        inEmissions.value = p.emissions;
+        inCompute.value = p.compute;
+        inDelta.value = p.delta;
+        inSlash.value = p.slash;
+        updateSim();
+      });
+    });
+
+    [inEmissions, inCompute, inDelta, inSlash].forEach(el => {
+      el.addEventListener('input', () => {
+        presetBtns.forEach(b => b.classList.remove('is-active'));
+        updateSim();
+      });
+    });
+
+    updateSim();
+  </script>
+</body>
+</html>

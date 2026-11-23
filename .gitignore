@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+# data and model outputs never go in git
+data/
+outputs/
+*.zarr/
+*.nc
+*.grib2
+*.idx
+.env
