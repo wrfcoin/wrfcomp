@@ -89,6 +89,18 @@ def test_alignment_does_not_depend_on_storage(tmp_path, synthetic) -> None:
     assert content_sha256(direct) == content_sha256(stored.load())
 
 
+def test_offset_companion_variables_are_ignored(synthetic) -> None:
+    # Data contract addendum 1: truth carries X_offset_min (int16) next to each X. Scoring ignores them.
+    truth = synthetic.truth.copy()
+    for name in ("t2m", "u10"):
+        offset = np.where(np.isnan(truth[name].values), -32768, 7).astype("int16")
+        truth[f"{name}_offset_min"] = (("valid_time", "station_id"), offset)
+    obs = align_truth(synthetic.candidate, truth)
+    assert set(obs.data_vars) == {"t2m", "u10"}
+    assert content_sha256(obs) == content_sha256(align_truth(synthetic.candidate, synthetic.truth))
+    check_nan_rule(synthetic.candidate, obs)
+
+
 def test_duplicate_truth_time_is_refused() -> None:
     truth = _tiny_truth(["2024-03-01T06", "2024-03-01T06"], ["A"], np.array([[1.0], [2.0]]))
     with pytest.raises(ValueError, match="duplicate"):
