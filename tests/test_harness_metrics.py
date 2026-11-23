@@ -1,0 +1,583 @@
+"""Scoring kernel tests. All data is synthetic and generated here with fixed seeds."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+import xarray as xr
+
+from wrfcomp.harness import metrics as M
+from wrfcomp.harness.config import load_config
+from wrfcomp.harness.schemas import GATE_NAMES, LeadMetrics, validate_thresholds
+
+CFG = load_config()
+POINT_DIMS = ("init_time", "lead_time", "station_id")
+FCST_DIMS = (*POINT_DIMS, "ens_member")
+
+
+def station_ids(n: int) -> list[str]:
+    return [f"7{i:05d}99999" for i in range(n)]
+
+
+def coords(
+    n_init: int, leads: tuple[int, ...], n_sta: int, start: str = "2024-02-01", freq: str = "6h"
+) -> dict:
+    return {
+        "init_time": pd.date_range(start, periods=n_init, freq=freq).values.astype("datetime64[ns]"),
+        "lead_time": np.array(leads, dtype="timedelta64[h]").astype("timedelta64[ns]"),
+        "station_id": station_ids(n_sta),
+    }
+
+
+def as_fcst(values: np.ndarray, c: dict) -> xr.DataArray:
+    return xr.DataArray(
+        values.astype(np.float32), dims=FCST_DIMS, coords={**c, "ens_member": np.arange(values.shape[-1])}
+    )
+
+
+def as_obs(values: np.ndarray, c: dict) -> xr.DataArray:
+    return xr.DataArray(values.astype(np.float32), dims=POINT_DIMS, coords=c)
+
+
+def flat_threshold(n_sta: int, value: float) -> xr.DataArray:
+    return xr.DataArray(
+        np.full((n_sta, 12), value, dtype=np.float32),
+        dims=("station_id", "month"),
+        coords={"station_id": station_ids(n_sta), "month": np.arange(1, 13)},
+    )
+
+
+def brute_fair_crps(members: np.ndarray, y: float) -> float:
+    m = len(members)
+    term1 = sum(abs(float(x) - y) for x in members) / m
+    term2 = sum(abs(float(a) - float(b)) for a in members for b in members) / (2 * m * (m - 1))
+    return term1 - term2
+
+
+def brute_pointwise(fcst: xr.DataArray, obs: xr.DataArray, clip: np.ndarray | None = None) -> np.ndarray:
+    f = fcst.transpose(*FCST_DIMS).values.astype(np.float64)
+    o = obs.transpose(*POINT_DIMS).values.astype(np.float64)
+    out = np.full(o.shape, np.nan)
+    for idx in np.ndindex(o.shape):
+        if not np.isfinite(o[idx]):
+            continue
+        members, y = f[idx], o[idx]
+        if clip is not None:
+            members, y = np.maximum(members, clip[idx]), max(y, clip[idx])
+        out[idx] = brute_fair_crps(members, y)
+    return out
+
+
+def synthetic(
+    seed: int, *, n_init: int = 120, leads: tuple[int, ...] = (6, 24), n_sta: int = 8, n_mem: int = 20
+) -> dict:
+    """Obs = 280 + 3*mu1 + 2*mu2 + 0.5*eps.
+
+    The `good` ensemble knows mu1 and mu2 (spread 0.5); the `base` ensemble knows only mu1 and has the
+    matching wider spread. Both are calibrated; `good` is sharper.
+    """
+    rng = np.random.default_rng(seed)
+    c = coords(n_init, leads, n_sta)
+    shape = (n_init, len(leads), n_sta)
+    mu1, mu2, eps = (rng.normal(size=shape) for _ in range(3))
+    known = 280.0 + 3.0 * mu1 + 2.0 * mu2
+    obs = known + 0.5 * eps
+    good = known[..., None] + 0.5 * rng.normal(size=(*shape, n_mem))
+    base = (280.0 + 3.0 * mu1)[..., None] + math.sqrt(4.25) * rng.normal(size=(*shape, n_mem))
+    return {
+        "coords": c,
+        "known": known,
+        "obs": as_obs(obs, c),
+        "good": as_fcst(good, c),
+        "base": as_fcst(base, c),
+        "threshold": flat_threshold(n_sta, 285.0),
+        "rng": rng,
+    }
+
+
+# --- fair CRPS and tail CRPS against brute force -----------------------------------------------
+
+
+def small_case(seed: int = 7):
+    rng = np.random.default_rng(seed)
+    c = coords(3, (6, 24), 4, start="2024-01-30", freq="12h")  # valid times cross into February
+    shape = (3, 2, 4)
+    fcst = as_fcst(rng.normal(280, 4, size=(*shape, 5)), c)
+    obs = as_obs(rng.normal(280, 4, size=shape), c)
+    return rng, c, fcst, obs
+
+
+def test_fair_crps_matches_brute_force() -> None:
+    _, _, fcst, obs = small_case()
+    got = M.fair_crps(fcst, obs).transpose(*POINT_DIMS).values
+    np.testing.assert_allclose(got, brute_pointwise(fcst, obs), rtol=1e-12, atol=1e-12)
+    assert (got > 0).all()
+
+
+def test_fair_crps_two_members_by_hand() -> None:
+    c = coords(1, (6,), 1)
+    fcst = as_fcst(np.array([1.0, 3.0]).reshape(1, 1, 1, 2), c)
+    obs = as_obs(np.array([2.0]).reshape(1, 1, 1), c)
+    # mean|x - y| = 1 ; fair spread term = (|1-3| + |3-1|) / (2 * 2 * 1) = 1
+    assert float(M.fair_crps(fcst, obs).squeeze()) == pytest.approx(0.0, abs=1e-12)
+    with pytest.raises(ValueError, match="at least 2"):
+        M.fair_crps(fcst.isel(ens_member=[0]), obs)
+
+
+def test_tail_crps_matches_brute_force_with_station_month_thresholds() -> None:
+    rng, c, fcst, obs = small_case()
+    threshold = xr.DataArray(
+        rng.normal(281, 2, size=(4, 12)).astype(np.float32),
+        dims=("station_id", "month"),
+        coords={"station_id": c["station_id"], "month": np.arange(1, 13)},
+    )
+    valid = c["init_time"][:, None] + c["lead_time"][None, :]
+    months = pd.DatetimeIndex(valid.ravel()).month.values.reshape(valid.shape)
+    assert set(months.ravel().tolist()) == {1, 2}  # the month really is taken from the valid time
+    clip = np.empty((3, 2, 4))
+    for i, j, k in np.ndindex(clip.shape):
+        clip[i, j, k] = threshold.values.astype(np.float64)[k, months[i, j] - 1]
+
+    np.testing.assert_array_equal(
+        M.broadcast_threshold(threshold, fcst["init_time"], fcst["lead_time"]).values.astype(np.float64), clip
+    )
+    got = M.tail_crps(fcst, obs, threshold).transpose(*POINT_DIMS).values
+    np.testing.assert_allclose(got, brute_pointwise(fcst, obs, clip), rtol=1e-12, atol=1e-12)
+    assert (got >= -1e-12).all()
+    # a threshold far below everything gives back the plain fair CRPS
+    np.testing.assert_allclose(
+        M.tail_crps(fcst, obs, -1e6).transpose(*POINT_DIMS).values, brute_pointwise(fcst, obs), rtol=1e-9
+    )
+
+
+def test_tail_crps_is_zero_below_threshold() -> None:
+    _, c, fcst, obs = small_case()
+    above_everything = float(max(fcst.max(), obs.max())) + 1.0
+    np.testing.assert_array_equal(M.tail_crps(fcst, obs, above_everything).values, 0.0)
+    np.testing.assert_array_equal(M.tail_crps(fcst, obs, flat_threshold(4, above_everything)).values, 0.0)
+    result = M.score_variable(fcst, obs, flat_threshold(4, above_everything), cfg=CFG)
+    assert result["all"]["twcrps_p95"] == 0.0
+    assert result["all"]["loss"] == pytest.approx(0.70 * result["all"]["crps"])
+
+
+# --- thresholds --------------------------------------------------------------------------------
+
+
+def train_truth(end: str, hours: int = 24 * 70) -> xr.DataArray:
+    rng = np.random.default_rng(11)
+    times = pd.date_range(end=end, periods=hours, freq="1h").values.astype("datetime64[ns]")
+    values = rng.normal(280, 5, size=(hours, 3)).astype(np.float32)
+    values[rng.random(values.shape) < 0.1] = np.nan
+    return xr.DataArray(
+        values, dims=("valid_time", "station_id"), coords={"valid_time": times, "station_id": station_ids(3)}
+    )
+
+
+def test_tail_thresholds_match_numpy_quantiles() -> None:
+    truth = train_truth("2023-12-17T18:00")
+    out = M.compute_tail_thresholds(truth, 0.95, cfg=CFG)
+    assert out.dims == ("station_id", "month")
+    assert out["month"].values.tolist() == list(range(1, 13))
+    assert out.dtype == np.float32
+    months = pd.DatetimeIndex(truth["valid_time"].values).month.values
+    present = sorted(set(months.tolist()))
+    assert present == [10, 11, 12]
+    for s in range(3):
+        for month in range(1, 13):
+            got = out.values[s, month - 1]
+            if month not in present:
+                assert np.isnan(got)
+                continue
+            expected = np.nanquantile(truth.values[months == month, s].astype(np.float64), 0.95)
+            assert got == np.float32(expected)
+    ds = M.compute_tail_thresholds(truth.to_dataset(name="t2m"), CFG.gate.tail_quantile, cfg=CFG)
+    validate_thresholds(ds, variables=["t2m"])
+    np.testing.assert_array_equal(ds["t2m"].values, out.values)
+
+
+def test_tail_thresholds_refuse_post_train_data() -> None:
+    M.compute_tail_thresholds(train_truth("2023-12-17T18:00", hours=48), 0.95, cfg=CFG)  # exactly the end
+    with pytest.raises(ValueError, match="after the train split end"):
+        M.compute_tail_thresholds(train_truth("2023-12-17T19:00", hours=48), 0.95, cfg=CFG)
+    with pytest.raises(ValueError, match="after the train split end"):
+        late = train_truth("2024-03-01T00:00", hours=48).to_dataset(name="t2m")
+        M.compute_tail_thresholds(late, 0.95, cfg=CFG)
+    with pytest.raises(ValueError, match="after the train split end"):
+        M.compute_tail_thresholds(train_truth("2024-03-01T00:00", hours=48), 0.95)  # default config too
+
+
+# --- spread-skill ------------------------------------------------------------------------------
+
+
+def test_spread_skill_calibrated_near_one_and_overconfident_fails() -> None:
+    rng = np.random.default_rng(3)
+    n_mem = 50
+    c = coords(200, (6, 24), 10)
+    shape = (200, 2, 10)
+    centre = 280 + 3 * rng.normal(size=shape)
+    obs = as_obs(centre + 2.0 * rng.normal(size=shape), c)
+    calibrated = as_fcst(centre[..., None] + 2.0 * rng.normal(size=(*shape, n_mem)), c)
+    overconfident = as_fcst(centre[..., None] + 0.6 * rng.normal(size=(*shape, n_mem)), c)
+
+    ratio = float(M.spread_skill_ratio(calibrated, obs))
+    # expected sqrt(M / (M + 1)) = 0.990 for 50 members; 4000 points, tolerance +-0.03
+    assert ratio == pytest.approx(math.sqrt(n_mem / (n_mem + 1)), abs=0.03)
+    per_lead = M.spread_skill_ratio(calibrated, obs, preserve_dims=("lead_time",))
+    assert per_lead.dims == ("lead_time",)
+    assert np.all(np.abs(per_lead.values - 1.0) < 0.05)
+
+    threshold = flat_threshold(10, 285.0)
+    good = M.score_variable(calibrated, obs, threshold, cfg=CFG)
+    assert good["all"]["spread_skill_ratio"] == pytest.approx(ratio, rel=1e-12)
+    assert M.evaluate_gates(good, CFG)["spread_skill"] is True
+
+    bad = M.score_variable(overconfident, obs, threshold, cfg=CFG)
+    assert bad["all"]["spread_skill_ratio"] < CFG.gate.spread_skill_min
+    assert bad["all"]["spread_skill_ratio"] == pytest.approx(0.3, abs=0.05)
+    assert M.evaluate_gates(bad, CFG)["spread_skill"] is False
+
+
+def test_composite_loss_uses_config_weights() -> None:
+    assert M.composite_loss(2.0, 1.0, CFG) == pytest.approx(0.70 * 2.0 + 0.30 * 1.0)
+    weights = CFG.gate.loss_weights
+    assert M.composite_loss(1.0, 0.0, CFG) == weights.crps_fair
+    assert M.composite_loss(0.0, 1.0, CFG) == weights.twcrps_p95
+
+
+# --- score_variable and gates ------------------------------------------------------------------
+
+
+def test_score_variable_matches_brute_force_and_schema() -> None:
+    s = synthetic(21, n_init=12, n_sta=4, n_mem=6)
+    obs = s["obs"].copy()
+    obs.values[2, 0, 1] = np.nan
+    obs.values[5, 1, :] = np.nan
+    result = M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
+    assert list(result) == ["all", "6", "24"]
+
+    mask = np.isfinite(obs.values)
+    clip = np.full(mask.shape, 285.0)
+    crps_c, tw_c = brute_pointwise(s["good"], obs), brute_pointwise(s["good"], obs, clip)
+    crps_b, tw_b = brute_pointwise(s["base"], obs), brute_pointwise(s["base"], obs, clip)
+    for key, sel in (("all", slice(None)), ("6", slice(0, 1)), ("24", slice(1, 2))):
+        m = mask[:, sel, :]
+        entry = result[key]
+        assert entry["n_pairs"] == int(m.sum())
+        crps, tw = crps_c[:, sel, :][m].mean(), tw_c[:, sel, :][m].mean()
+        base_crps, base_tw = crps_b[:, sel, :][m].mean(), tw_b[:, sel, :][m].mean()
+        assert entry["crps"] == pytest.approx(crps, rel=1e-10)
+        assert entry["twcrps_p95"] == pytest.approx(tw, rel=1e-10)
+        assert entry["loss"] == pytest.approx(0.7 * crps + 0.3 * tw, rel=1e-10)
+        assert entry["baseline_twcrps_p95"] == pytest.approx(base_tw, rel=1e-10)
+        assert entry["crpss_vs_baseline"] == pytest.approx(
+            1 - (0.7 * crps + 0.3 * tw) / (0.7 * base_crps + 0.3 * base_tw), rel=1e-9
+        )
+        LeadMetrics.model_validate(entry)  # the dict is exactly what the Scorecard stores
+    assert result["all"]["n_pairs"] == result["6"]["n_pairs"] + result["24"]["n_pairs"] == mask.sum()
+
+
+def test_identical_baseline_has_zero_skill_and_fails() -> None:
+    s = synthetic(22)
+    result = M.score_variable(s["good"], s["obs"], s["threshold"], s["good"].copy(), cfg=CFG)
+    for entry in result.values():
+        assert entry["crpss_vs_baseline"] == 0.0
+        assert entry["baseline_twcrps_p95"] == entry["twcrps_p95"]
+        assert entry["dm_pvalue"] is None  # all differences are exactly zero: the test is undefined
+    gates = M.evaluate_gates(result, CFG)
+    assert gates["skill"] is False
+    assert gates["dm"] is False
+    assert not all(gates.values())
+
+
+def test_clearly_better_candidate_passes_all_gates() -> None:
+    s = synthetic(23)
+    result = M.score_variable(s["good"], s["obs"], s["threshold"], s["base"], cfg=CFG)
+    gates = M.evaluate_gates(result, CFG)
+    assert tuple(gates) == GATE_NAMES
+    assert gates == dict.fromkeys(GATE_NAMES, True)
+    assert result["all"]["crpss_vs_baseline"] > 0.5
+    assert result["all"]["dm_pvalue"] < 1e-6
+    # and the reverse comparison fails skill, tail and significance
+    reverse = M.score_variable(s["base"], s["obs"], s["threshold"], s["good"], cfg=CFG)
+    reverse_gates = M.evaluate_gates(reverse, CFG)
+    assert reverse["all"]["crpss_vs_baseline"] < 0
+    assert reverse["all"]["dm_pvalue"] > 0.999
+    assert (reverse_gates["skill"], reverse_gates["tail"], reverse_gates["dm"]) == (False, False, False)
+
+
+def test_better_on_average_but_worse_in_tail_fails() -> None:
+    s = synthetic(24)
+    rng = s["rng"]
+    shape = s["known"].shape
+    n_mem = s["good"].sizes["ens_member"]
+    # Sharp in ordinary weather, but falls back to a flat climatological guess whenever it gets warm.
+    warm = s["known"] > 283.0
+    members = np.where(
+        warm[..., None],
+        280.0 + 3.6 * rng.normal(size=(*shape, n_mem)),
+        s["known"][..., None] + 0.5 * rng.normal(size=(*shape, n_mem)),
+    )
+    candidate = as_fcst(members, s["coords"])
+    result = M.score_variable(candidate, s["obs"], s["threshold"], s["base"], cfg=CFG)
+    entry = result["all"]
+    assert entry["crpss_vs_baseline"] > 0.1  # better on the headline loss
+    assert entry["twcrps_p95"] > entry["baseline_twcrps_p95"]  # worse in the tail
+    gates = M.evaluate_gates(result, CFG)
+    assert gates["skill"] is True
+    assert gates["tail"] is False
+    assert not all(gates.values())
+
+
+def test_no_baseline_means_gate_not_passed() -> None:
+    s = synthetic(25, n_init=20)
+    result = M.score_variable(s["good"], s["obs"], s["threshold"], cfg=CFG)
+    assert set(result["all"]) == {"crps", "twcrps_p95", "loss", "spread_skill_ratio", "n_pairs"}
+    gates = M.evaluate_gates(result, CFG)
+    assert gates == {"skill": False, "tail": False, "spread_skill": True, "dm": False}
+    with pytest.raises(ValueError, match="'all'"):
+        M.evaluate_gates({"6": result["6"]}, CFG)
+
+
+def test_gate_boundaries() -> None:
+    base = {"crps": 1.0, "twcrps_p95": 0.2, "loss": 0.76, "n_pairs": 10, "baseline_twcrps_p95": 0.2}
+
+    def gates(**changes: float | None) -> dict[str, bool]:
+        entry = {**base, "crpss_vs_baseline": 0.1, "spread_skill_ratio": 1.0, "dm_pvalue": 0.01, **changes}
+        return M.evaluate_gates({"all": entry}, CFG)
+
+    assert all(gates().values())
+    assert gates(crpss_vs_baseline=0.0)["skill"] is False  # strictly greater than the minimum
+    assert gates(twcrps_p95=0.2)["tail"] is True  # equal tail is "not worse"
+    assert gates(twcrps_p95=0.2000001)["tail"] is False
+    assert gates(spread_skill_ratio=0.85)["spread_skill"] is True
+    assert gates(spread_skill_ratio=1.15)["spread_skill"] is True
+    assert gates(spread_skill_ratio=0.8499)["spread_skill"] is False
+    assert gates(spread_skill_ratio=1.1501)["spread_skill"] is False
+    assert gates(dm_pvalue=0.05)["dm"] is False  # strictly below alpha
+    assert gates(dm_pvalue=0.0499)["dm"] is True
+    for key in ("crpss_vs_baseline", "spread_skill_ratio", "dm_pvalue", "twcrps_p95", "baseline_twcrps_p95"):
+        assert not all(gates(**{key: None}).values())
+
+
+# --- masking -----------------------------------------------------------------------------------
+
+
+def test_nan_obs_masked_identically_for_candidate_and_baseline() -> None:
+    s = synthetic(26, n_init=40)
+    rng = np.random.default_rng(99)
+    obs = s["obs"].copy()
+    holes = rng.random(obs.shape) < 0.2
+    obs.values[holes] = np.nan
+    obs.values[7] = np.nan  # one init time with no observation at all
+    n_valid = int(np.isfinite(obs.values).sum())
+
+    result = M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
+    assert result["all"]["n_pairs"] == n_valid
+
+    # The baseline is scored on exactly the candidate's mask: scoring it alone gives the same numbers.
+    base_alone = M.score_variable(s["base"], obs, s["threshold"], cfg=CFG)
+    for key in result:
+        assert result[key]["n_pairs"] == base_alone[key]["n_pairs"]
+        assert result[key]["baseline_twcrps_p95"] == base_alone[key]["twcrps_p95"]
+        assert result[key]["crpss_vs_baseline"] == pytest.approx(
+            1 - result[key]["loss"] / base_alone[key]["loss"], rel=1e-12
+        )
+
+    # What either forecast says at unobserved points cannot matter, even if it is NaN there.
+    cand2, base2 = s["good"].copy(), s["base"].copy()
+    cand2.values[~np.isfinite(obs.values)] = np.nan
+    base2.values[~np.isfinite(obs.values)] = 1e6
+    assert M.score_variable(cand2, obs, s["threshold"], base2, cfg=CFG) == result
+
+    # A hole in either forecast at an observed point is refused (no cherry-picking).
+    i, j, k = np.argwhere(np.isfinite(obs.values))[0]
+    broken = s["good"].copy()
+    broken.values[i, j, k, 0] = np.nan
+    with pytest.raises(ValueError, match="forecast has missing"):
+        M.score_variable(broken, obs, s["threshold"], s["base"], cfg=CFG)
+    broken_base = s["base"].copy()
+    broken_base.values[i, j, k, 3] = np.inf
+    with pytest.raises(ValueError, match="baseline has missing"):
+        M.score_variable(s["good"], obs, s["threshold"], broken_base, cfg=CFG)
+
+
+def test_lead_with_no_observations_is_undefined_not_zero() -> None:
+    s = synthetic(27, n_init=30)
+    obs = s["obs"].copy()
+    obs.values[:, 0, :] = np.nan
+    result = M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
+    assert result["6"] == {
+        "crps": None,
+        "twcrps_p95": None,
+        "loss": None,
+        "spread_skill_ratio": None,
+        "n_pairs": 0,
+        "crpss_vs_baseline": None,
+        "baseline_twcrps_p95": None,
+        "dm_pvalue": None,
+    }
+    assert result["all"]["n_pairs"] == result["24"]["n_pairs"] > 0
+    assert result["all"]["crps"] == result["24"]["crps"]
+
+
+def test_score_variable_refuses_bad_inputs() -> None:
+    s = synthetic(28, n_init=10, n_sta=4, n_mem=4)
+    good, obs, thr, base = s["good"], s["obs"], s["threshold"], s["base"]
+    with pytest.raises(ValueError, match="align obs"):
+        M.score_variable(good, obs.isel(init_time=slice(1, None)), thr, cfg=CFG)
+    with pytest.raises(ValueError, match="baseline does not cover"):
+        M.score_variable(good, obs, thr, base.isel(lead_time=[0]), cfg=CFG)
+    with pytest.raises(ValueError, match="does not cover every station"):
+        M.score_variable(good, obs, thr.isel(station_id=slice(1, None)), cfg=CFG)
+    nan_thr = thr.copy()
+    nan_thr.values[0, 1] = np.nan  # February: every valid time of this case
+    with pytest.raises(ValueError, match="tail_threshold is not finite"):
+        M.score_variable(good, obs, nan_thr, cfg=CFG)
+    with pytest.raises(ValueError, match="must have dims"):
+        M.score_variable(good.isel(ens_member=0, drop=True), obs, thr, cfg=CFG)
+    half_hour = good.assign_coords(lead_time=good["lead_time"].values + np.timedelta64(30, "m"))
+    with pytest.raises(ValueError, match="whole number of hours"):
+        M.score_variable(half_hour, obs.assign_coords(lead_time=half_hour["lead_time"].values), thr, cfg=CFG)
+    # a baseline with extra leads, stations and a different ensemble size is fine
+    extra = synthetic(28, n_init=10, leads=(6, 24, 48), n_sta=5, n_mem=7)["base"]
+    M.score_variable(good, obs, thr, extra, cfg=CFG)
+
+
+# --- determinism -------------------------------------------------------------------------------
+
+
+def test_result_independent_of_chunking_and_input_order() -> None:
+    s = synthetic(29, n_init=30, n_sta=6, n_mem=8)
+    obs = s["obs"].copy()
+    obs.values[np.random.default_rng(5).random(obs.shape) < 0.15] = np.nan
+    reference = M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
+    assert M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG) == reference
+
+    chunked = M.score_variable(
+        s["good"].chunk({"init_time": 7, "station_id": 4, "ens_member": 3}),
+        obs.chunk({"init_time": 11}),
+        s["threshold"],
+        s["base"].chunk({"lead_time": 1, "ens_member": 5}),
+        cfg=CFG,
+    )
+    assert chunked == reference
+
+    rng = np.random.default_rng(6)
+    order = {dim: rng.permutation(obs.sizes[dim]) for dim in POINT_DIMS}
+    shuffled = M.score_variable(
+        s["good"].isel(order).isel(ens_member=rng.permutation(8)).transpose("ens_member", "station_id", ...),
+        obs.isel(order).transpose("station_id", "lead_time", "init_time"),
+        s["threshold"].isel(station_id=order["station_id"]).transpose("month", "station_id"),
+        s["base"].isel(init_time=order["init_time"][::-1]),
+        cfg=CFG,
+    )
+    assert shuffled == reference
+
+
+# --- Diebold-Mariano ---------------------------------------------------------------------------
+
+
+def series(values: np.ndarray, freq: str = "6h") -> xr.DataArray:
+    times = pd.date_range("2024-01-01", periods=len(values), freq=freq).values.astype("datetime64[ns]")
+    return xr.DataArray(np.asarray(values, dtype=np.float64), dims="init_time", coords={"init_time": times})
+
+
+def ar1(rng: np.random.Generator, n: int, phi: float) -> np.ndarray:
+    noise = rng.standard_normal(n + 100)
+    out = np.zeros(n + 100)
+    for i in range(1, n + 100):
+        out[i] = phi * out[i - 1] + noise[i]
+    return out[100:]
+
+
+def test_dm_lag_grows_with_lead() -> None:
+    assert [M.dm_lag(lead, 6) for lead in (1, 3, 6, 12, 24, 48)] == [1, 1, 1, 2, 4, 8]
+    assert M.dm_lag(48, 24) == 2
+    assert M.dm_lag(48, 12) == 4
+    assert M.dm_lag(7, 6) == 2
+    assert M.dm_lag(48, 6) > M.dm_lag(6, 6)
+    with pytest.raises(ValueError):
+        M.dm_lag(0, 6)
+
+
+def test_dm_passes_the_lead_based_lag_to_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[int] = []
+    real = M.diebold_mariano
+
+    def spy(da: xr.DataArray, ts_dim: str, h_coord: str, **kwargs: object) -> xr.Dataset:
+        seen.append(int(da[h_coord].values[0]))
+        assert kwargs == {"method": "HG", "statistic_distribution": "t"}
+        return real(da, ts_dim, h_coord, **kwargs)
+
+    monkeypatch.setattr(M, "diebold_mariano", spy)
+    values = ar1(np.random.default_rng(0), 200, 0.5)
+    M.diebold_mariano_pvalue(series(values), 6)  # spacing inferred from the 6-hourly init times
+    M.diebold_mariano_pvalue(series(values), 48)
+    M.diebold_mariano_pvalue(series(values, freq="24h"), 48)
+    M.diebold_mariano_pvalue(series(values), 48, 12.0)
+    assert seen == [1, 8, 2, 4]
+
+    # score_variable: each lead gets its own lag, "all" gets the longest lead's
+    seen.clear()
+    s = synthetic(30, n_init=40, leads=(6, 24, 48))
+    M.score_variable(s["good"], s["obs"], s["threshold"], s["base"], cfg=CFG)
+    assert seen == [8, 1, 4, 8]
+
+
+def test_dm_rejection_rate_under_the_null_is_near_alpha() -> None:
+    # Null: mean-zero AR(1) differences (phi = 0.5), 300 init times, 48 h lead at 6 h spacing.
+    # 400 seeds. Nominal rate 0.05; binomial standard error 0.011; accepted band 0.02..0.08.
+    alpha = CFG.gate.alpha_dm
+    n_seeds = 400
+    rejections = 0
+    for seed in range(n_seeds):
+        values = ar1(np.random.default_rng(seed), 300, 0.5)
+        pvalue = M.diebold_mariano_pvalue(series(values), 48)
+        assert pvalue is not None
+        rejections += pvalue < alpha
+    rate = rejections / n_seeds
+    assert abs(rate - alpha) <= 0.03, rate
+
+
+def test_dm_is_one_sided_and_detects_a_real_gain() -> None:
+    noise = ar1(np.random.default_rng(1), 300, 0.5)
+    better = M.diebold_mariano_pvalue(series(noise + 1.0), 24)
+    worse = M.diebold_mariano_pvalue(series(-(noise + 1.0)), 24)
+    assert better < 1e-6
+    assert worse > 1 - 1e-6
+    assert better + worse == pytest.approx(1.0, abs=1e-12)
+    assert M.diebold_mariano_pvalue(series(np.full(50, 0.25)), 6) < 1e-12  # the same gain every time
+
+
+def test_dm_nan_gaps_and_short_series() -> None:
+    values = ar1(np.random.default_rng(2), 120, 0.4) + 0.2
+    gappy = values.copy()
+    gappy[[5, 6, 40, 119]] = np.nan
+    # NaNs are dropped and the rest is treated as consecutive; the lag still comes from the full grid
+    expected = M.diebold_mariano_pvalue(series(values[~np.isnan(gappy)]), 24, 6.0)
+    assert M.diebold_mariano_pvalue(series(gappy), 24) == expected
+    # uneven init times: the smallest gap sets the spacing
+    uneven = series(values).isel(init_time=[*range(0, 60, 2), *range(60, 120)])
+    assert M.diebold_mariano_pvalue(uneven, 24) == M.diebold_mariano_pvalue(uneven, 24, 6.0)
+    # HG models the autocovariance over max((n - 1) // 2, h) lags: on a long series the lag does not
+    # change the answer, on a short one it does.
+    assert M.diebold_mariano_pvalue(uneven, 24) == M.diebold_mariano_pvalue(uneven, 24, 12.0)
+    short = series(values[:12])
+    assert M.diebold_mariano_pvalue(short, 48, 6.0) != M.diebold_mariano_pvalue(short, 48, 48.0)
+    # order of the init_time coordinate does not matter
+    assert M.diebold_mariano_pvalue(series(values).isel(init_time=slice(None, None, -1)), 24) == (
+        M.diebold_mariano_pvalue(series(values), 24)
+    )
+
+    assert M.diebold_mariano_pvalue(series(np.zeros(50)), 6) is None  # all zero
+    assert M.diebold_mariano_pvalue(series(values[:8]), 48) is None  # 8 values, lag 8
+    assert M.diebold_mariano_pvalue(series(values[:9]), 48) is not None
+    assert M.diebold_mariano_pvalue(series(values[:1]), 6) is None  # one init time: no spacing
+    assert M.diebold_mariano_pvalue(series(np.full(20, np.nan)), 6) is None
+    with pytest.raises(ValueError, match="infinite"):
+        M.diebold_mariano_pvalue(series(np.array([1.0, np.inf, 2.0, 3.0])), 6)
+    with pytest.raises(ValueError, match="dims"):
+        M.diebold_mariano_pvalue(xr.DataArray(values, dims="time"), 6, 6.0)
