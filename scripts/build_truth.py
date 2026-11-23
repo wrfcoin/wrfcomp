@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -31,6 +32,7 @@ from wrfcomp.harness.truth import (
     load_stations_metadata,
     match_station_to_hours,
     parse_isd_csv,
+    write_truth_netcdf,
 )
 
 app = typer.Typer(help="Download and build NOAA ISD hourly truth NetCDF datasets.")
@@ -117,6 +119,14 @@ def main(
         AWS_GLOBAL_HOURLY_BASE_URL,
         help="Base URL for ISD global-hourly station-year CSVs.",
     ),
+    min_free_gb: float = typer.Option(
+        40.0,
+        help="Abort immediately if free disk space on the data volume drops below this many GB.",
+    ),
+    max_fail_rate: float = typer.Option(
+        0.02,
+        help="Abort immediately if failed requests exceed this fraction of total station-years.",
+    ),
 ) -> None:
     if year is not None and (start_year is not None or end_year is not None):
         typer.echo("Specify either --year or --start-year/--end-year, not both.", err=True)
@@ -138,9 +148,21 @@ def main(
 
     years = list(range(y0, y1 + 1))
     data_dir = _default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = cache_dir or (data_dir / "raw" / "isd")
     parsed_dir = data_dir / "parsed" / "isd"
     tol_min = get_truth_tolerance_minutes()
+
+    def _check_free_disk() -> None:
+        free_gb = shutil.disk_usage(data_dir).free / (1024**3)
+        if free_gb < min_free_gb:
+            typer.echo(
+                f"ABORT: free disk space ({free_gb:.2f} GB) dropped below {min_free_gb:.2f} GB limit.",
+                err=True,
+            )
+            raise typer.Exit(code=3)
+
+    _check_free_disk()
 
     meta_df = load_stations_metadata(stations)
     if station_ids is not None:
@@ -150,6 +172,7 @@ def main(
 
     t0 = time.perf_counter()
     failed: list[tuple[str, int, str]] = []
+    max_failures = int(len(selected_ids) * len(years) * max_fail_rate)
 
     if not skip_download:
         typer.echo(
@@ -159,6 +182,7 @@ def main(
         if discard_raw:
             tasks = [(sid, yr) for yr in years for sid in selected_ids]
             done = 0
+            aborted_reason: str | None = None
             with ThreadPoolExecutor(max_workers=min(max_workers, MAX_CONCURRENT_REQUESTS)) as pool:
                 fmap = {
                     pool.submit(
@@ -179,9 +203,41 @@ def main(
                         fut.result()
                     except Exception as exc:
                         failed.append((sid, yr, str(exc)))
+                    if done % 10 == 0 or done == len(tasks):
+                        free_gb = shutil.disk_usage(data_dir).free / (1024**3)
+                        if free_gb < min_free_gb:
+                            aborted_reason = (
+                                f"free disk ({free_gb:.2f} GB) dropped below {min_free_gb:.2f} GB limit"
+                            )
+                    if len(failed) > max_failures:
+                        aborted_reason = (
+                            f"failures ({len(failed)}/{len(tasks)}) exceeded "
+                            f"{max_fail_rate * 100:.1f}% limit ({max_failures})"
+                        )
                     if done % 100 == 0 or done == len(tasks):
-                        typer.echo(f"  progress: {done}/{len(tasks)} ({len(failed)} failed)")
+                        free_gb = shutil.disk_usage(data_dir).free / (1024**3)
+                        typer.echo(
+                            f"  progress: {done}/{len(tasks)} "
+                            f"({len(failed)} failed, {free_gb:.1f} GB free)"
+                        )
+                    if aborted_reason is not None:
+                        for pending in fmap:
+                            pending.cancel()
+                        break
             failed.sort()
+            if aborted_reason is not None:
+                typer.echo(f"ABORTING bulk download: {aborted_reason}", err=True)
+                if failed:
+                    failed_log = out.with_suffix(out.suffix + ".failed.json")
+                    failed_log.parent.mkdir(parents=True, exist_ok=True)
+                    failed_log.write_text(
+                        json.dumps(
+                            [{"station_id": s, "year": y, "reason": r} for s, y, r in failed],
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                raise typer.Exit(code=3)
         else:
             _, failed = download_stations(
                 selected_ids,
@@ -190,6 +246,12 @@ def main(
                 max_workers=max_workers,
                 base_url=base_url,
             )
+            if len(failed) > max_failures:
+                typer.echo(
+                    f"ABORT: failures ({len(failed)}) exceeded {max_fail_rate * 100:.1f}% limit.",
+                    err=True,
+                )
+                raise typer.Exit(code=3)
 
     if failed:
         typer.echo(f"Failed station-years ({len(failed)}):", err=True)
@@ -208,6 +270,7 @@ def main(
         )
         typer.echo(f"Wrote failure list to {failed_log}", err=True)
 
+    _check_free_disk()
     typer.echo(f"Building truth dataset for {y0}-01-01T00:00:00 .. {y1}-12-31T23:00:00...")
     ds = build_truth(
         selected_ids,
@@ -219,10 +282,7 @@ def main(
         parsed_cache_dir=parsed_dir if discard_raw else None,
     )
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    tmp_out = out.with_name(f".{out.name}.part")
-    ds.to_netcdf(tmp_out)
-    tmp_out.replace(out)
+    write_truth_netcdf(ds, out)
 
     elapsed = time.perf_counter() - t0
     completeness = compute_completeness(ds)

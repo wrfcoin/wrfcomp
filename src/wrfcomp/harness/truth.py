@@ -771,8 +771,7 @@ def build_truth(
             offset_arrays[var],
             {
                 "units": "minutes",
-                "long_name": f"Observation time offset from valid_time for {var}",
-                "missing_sentinel": int(OFFSET_FILL_VALUE),
+                "long_name": f"Observation time offset from valid_time for {var} (-32768 when missing)",
             },
         )
 
@@ -875,6 +874,30 @@ def validate_truth_dataset(ds: xr.Dataset, tolerance_minutes: int | None = None)
     both = np.isfinite(t2m) & np.isfinite(td2m)
     if np.any(td2m[both] > t2m[both]):
         raise ValueError("Truth dataset violates physical constraint td2m <= t2m.")
+
+
+def write_truth_netcdf(ds: xr.Dataset, out: Path | str) -> None:
+    """Write a validated truth Dataset atomically to NetCDF.
+
+    Ensures ``X_offset_min`` variables are stored as plain ``int16`` with ``-32768``
+    where ``X`` is ``NaN`` and no ``_FillValue`` attribute or encoding.
+    """
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    encoding: dict[str, dict[str, object]] = {}
+    for off_var in OFFSET_VARS:
+        if off_var in ds.data_vars:
+            ds[off_var].attrs.pop("_FillValue", None)
+            ds[off_var].encoding.pop("_FillValue", None)
+            encoding[off_var] = {"dtype": "int16", "_FillValue": None}
+
+    tmp_out = out_path.with_name(f".{out_path.name}.part")
+    try:
+        ds.to_netcdf(tmp_out, encoding=encoding)
+        tmp_out.replace(out_path)
+    finally:
+        if tmp_out.exists():
+            tmp_out.unlink(missing_ok=True)
 
 
 def compute_completeness(ds: xr.Dataset) -> dict[str, float]:

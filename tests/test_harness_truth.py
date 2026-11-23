@@ -11,7 +11,9 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from scipy.io import netcdf_file
 
+from wrfcomp.harness.schemas import validate_truth_dataset as validate_schema_truth
 from wrfcomp.harness.truth import (
     OFFSET_FILL_VALUE,
     OFFSET_VARS,
@@ -26,6 +28,7 @@ from wrfcomp.harness.truth import (
     parse_wnd,
     validate_truth_dataset,
     wind_to_uv,
+    write_truth_netcdf,
 )
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -289,12 +292,21 @@ def test_build_truth_contract_and_netcdf_roundtrip(tmp_path: Path) -> None:
     assert np.isnan(float(t_var["u10"]))
     assert int(t_var["u10_offset_min"]) == int(OFFSET_FILL_VALUE)
 
-    # NetCDF roundtrip must preserve int16 dtype and -32768 sentinel
+    # Primary variables pass harness schema validator
+    validate_schema_truth(ds[list(PRIMARY_VARS)])
+
+    # NetCDF roundtrip must preserve plain int16 dtype, -32768 sentinel, and NO _FillValue attr/encoding
     nc_path = tmp_path / "truth_roundtrip.nc"
-    ds.to_netcdf(nc_path)
+    write_truth_netcdf(ds, nc_path)
+    with netcdf_file(nc_path, "r") as nf:
+        for off_var in OFFSET_VARS:
+            assert "_FillValue" not in nf.variables[off_var]._attributes
     with xr.open_dataset(nc_path) as reloaded:
         validate_truth_dataset(reloaded)
-        assert reloaded["t2m_offset_min"].dtype == np.int16
+        for off_var in OFFSET_VARS:
+            assert reloaded[off_var].dtype == np.int16
+            assert "_FillValue" not in reloaded[off_var].attrs
+            assert "_FillValue" not in reloaded[off_var].encoding
         reloaded_missing = reloaded.sel(valid_time="2024-01-17T21:00:00", station_id="72363023047")
         assert int(reloaded_missing["t2m_offset_min"]) == -32768
 
