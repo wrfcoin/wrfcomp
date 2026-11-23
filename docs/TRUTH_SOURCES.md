@@ -147,6 +147,14 @@ Special ISD wind type codes (`isd-format-document.pdf`, p. 8):
   automatically including the last 15 minutes of the previous year and the first 15 minutes of the
   next year whenever the window crosses a year boundary (and never reading or downloading anything
   from the sealed test split). Both build paths produce identical output.
+- Canonical output windows:
+  - Validation truth (`truth/isd_conus_2024.nc`): `2023-12-31T18:00:00` through
+    `2024-12-31T23:00:00` UTC (gives persistence baselines a 6-hour causal lookback into 2023 while
+    reusing the 2023 station files already needed for training).
+  - Training truth (`truth/isd_conus_train.nc`): `2014-01-01T01:00:00` through
+    `2023-12-17T18:00:00` UTC (`train.end_utc` in `configs/splits.yaml`). Starting at `01:00Z` on
+    2014-01-01 keeps the `±15 min` matching window inside 2014 (`00:45Z` onward) so the 2013 archive
+    does not have to be downloaded solely for the 15-minute lookback of `2014-01-01T00:00Z`.
 - Matching rule: for each variable independently, pick the QC-passing finite observation with
   minimum `|obs_time - valid_time|` within tolerance. Exact ties pick the **earlier** report.
   Unmatched hours are `NaN` and never interpolated.

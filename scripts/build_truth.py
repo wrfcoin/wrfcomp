@@ -7,9 +7,9 @@ Examples
         --start 2023-12-31T18:00:00 --end 2024-12-31T23:00:00 \\
         --discard-raw --out ~/wrfcomp-data/truth/isd_conus_2024.nc
 
-    # 2014-2023 training truth (through configs/splits.yaml train.end_utc)
+    # 2014-2023 training truth (01Z start avoids downloading 2013 solely for 2014-01-01T00Z)
     uv run python scripts/build_truth.py \\
-        --start 2014-01-01T00:00:00 --end 2023-12-17T18:00:00 \\
+        --start 2014-01-01T01:00:00 --end 2023-12-17T18:00:00 \\
         --discard-raw --out ~/wrfcomp-data/truth/isd_conus_train.nc
 """
 
