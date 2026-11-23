@@ -7,6 +7,7 @@ They read coordinates and metadata only, never the full data arrays, so they are
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime
 from importlib.metadata import version as _pkg_version
 from typing import Annotated
 
@@ -262,6 +263,11 @@ class Scorecard(_Strict):
     baseline_sha256: Sha256 | None = None
     thresholds_sha256: Sha256
     commit_sha256: Sha256 | None = None
+    # First and last init time scored, UTC, timezone-naive (ISO strings without offset in JSON).
+    period_start: datetime
+    period_end: datetime
+    # True when any scored time lies in the sealed-test split. Set by the evaluation CLI.
+    sealed_data_used: bool = False
     n_stations: int = Field(ge=0)
     n_init_times: int = Field(ge=0)
     init_hours_scored: list[Annotated[int, Field(ge=0, le=23)]]
@@ -275,6 +281,11 @@ class Scorecard(_Strict):
     def _check(self) -> Scorecard:
         if (self.baseline_id is None) != (self.baseline_sha256 is None):
             raise ValueError("baseline_id and baseline_sha256 must be given together")
+        for name in ("period_start", "period_end"):
+            if getattr(self, name).tzinfo is not None:
+                raise ValueError(f"{name} must be timezone-naive UTC (no offset)")
+        if self.period_end < self.period_start:
+            raise ValueError("period_end is before period_start")
         for name in ("init_hours_scored", "leads_scored"):
             values = getattr(self, name)
             if values != sorted(set(values)):

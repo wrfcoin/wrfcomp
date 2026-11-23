@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import json
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -319,6 +321,8 @@ def scorecard_payload() -> dict:
         "forecast_sha256": SHA_B,
         "baseline_sha256": SHA_C,
         "thresholds_sha256": SHA_D,
+        "period_start": "2024-03-01T00:00:00",
+        "period_end": "2024-03-01T18:00:00",
         "n_stations": 3,
         "n_init_times": 4,
         "init_hours_scored": [0, 6, 12, 18],
@@ -334,8 +338,16 @@ def test_scorecard_round_trips_through_json() -> None:
     card = Scorecard.model_validate(scorecard_payload())
     assert card.commit_sha256 is None
     assert card.harness_version.scores
-    again = Scorecard.model_validate_json(card.model_dump_json())
+    assert card.sealed_data_used is False
+    text = card.model_dump_json()
+    assert json.loads(text)["period_start"] == "2024-03-01T00:00:00"
+    assert json.loads(text)["period_end"] == "2024-03-01T18:00:00"
+    assert json.loads(text)["sealed_data_used"] is False
+    again = Scorecard.model_validate_json(text)
     assert again == card
+    assert again.period_start == datetime(2024, 3, 1) and again.period_start.tzinfo is None
+    flagged = Scorecard.model_validate({**scorecard_payload(), "sealed_data_used": True})
+    assert flagged.sealed_data_used is True
     assert again.metrics["t2m"]["24"].crps == 0.8
 
 
@@ -382,6 +394,12 @@ def _break_scorecard(case: str) -> dict:
         p["metrics"]["t2m"]["1"]["dm_pvalue"] = 1.5
     elif case == "baseline_id_without_sha":
         p["baseline_sha256"] = None
+    elif case == "period_with_offset":
+        p["period_start"] = "2024-03-01T00:00:00Z"
+    elif case == "period_reversed":
+        p["period_start"], p["period_end"] = p["period_end"], p["period_start"]
+    elif case == "period_missing":
+        p.pop("period_end")
     elif case == "extra_field":
         p["passed_significance_gate"] = True
     elif case == "unsorted_leads":
@@ -409,6 +427,9 @@ def _break_scorecard(case: str) -> dict:
         "nan_metric",
         "pvalue_above_one",
         "baseline_id_without_sha",
+        "period_with_offset",
+        "period_reversed",
+        "period_missing",
         "extra_field",
         "unsorted_leads",
         "empty_model_id",
