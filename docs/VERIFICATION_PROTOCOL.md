@@ -78,8 +78,8 @@ All metrics are computed via the Australian Bureau of Meteorology's peer-reviewe
 
 1. **Fair Ensemble CRPS (`crps`):** Computed via `scores.probability.crps_for_ensemble(fcst, obs, ensemble_member_dim="ens_member", method="fair")`. The `fair` estimator removes small-ensemble bias so a 16-member prototype and a 50-member operational ensemble compare on equal footing.
    - **Sampling assumption:** ensemble members must be exchangeable random draws from the forecast distribution. Fair CRPS is not a proper score for members placed deliberately: two fixed members score exactly `0` whenever the observation falls between them, and members fixed at inflated quantiles beat the true distribution while staying inside the calibration band (about 45 % with 2 members, 10 % with 10, 3 % with 32).
-   - **ECDF cross-check:** every CRPS and tail CRPS is therefore also computed with `method="ecdf"` (`crps_ecdf`, `twcrps_p95_ecdf`, `loss_ecdf`, `crpss_vs_baseline_ecdf`), which has no such hole, and both are reported. The headline-skill gate must hold under both estimators, and an ensemble with fewer than `min_members_for_gate` members (8) is scored but cannot pass the gate.
-   - **Known limitation (open for the Gate 1 owner decision):** the ECDF cross-check and the member floor do not fully close this. Members placed at plain Gaussian quantiles, with no extra information, still show skill against a *sampled* baseline of the same size and distribution under both estimators, while inside the calibration band, because a sampled ensemble pays sampling noise that a placed one does not. Measured in simulation (fair / ECDF skill): 8 members 12.3 % / 10.2 %, 10 members 9.7 % / 8.3 %, 20 members 4.9 % / 4.5 %, 32 members 3.1 % / 3.0 %, 50 members 2.0 % / 1.9 %. The tail gate and the Diebold-Mariano test use the fair estimator only.
+   - **ECDF cross-check:** every CRPS and tail CRPS is therefore also computed with `method="ecdf"` (`crps_ecdf`, `twcrps_p95_ecdf`, `loss_ecdf`, `crpss_vs_baseline_ecdf`), which has no such hole, and both are reported. The headline-skill gate must hold under both estimators, and an ensemble with fewer than `min_members_for_gate` members (20, set in `configs/splits.yaml`) is scored but cannot pass the gate.
+   - **Known limitation (owner decision 2026-11-23: floor of 20 members and minimum skill of 5%, set in `configs/splits.yaml`):** the ECDF cross-check and the member floor do not fully close this. Members placed at plain Gaussian quantiles, with no extra information, still show skill against a *sampled* baseline of the same size and distribution under both estimators, while inside the calibration band, because a sampled ensemble pays sampling noise that a placed one does not. Measured in simulation (fair / ECDF skill): 8 members 12.3 % / 10.2 %, 10 members 9.7 % / 8.3 %, 20 members 4.9 % / 4.5 %, 32 members 3.1 % / 3.0 %, 50 members 2.0 % / 1.9 %. The tail gate and the Diebold-Mariano test use the fair estimator only.
 2. **Extreme-Tail Threshold-Weighted CRPS (`twcrps_p95`):** Clips both `fcst` and `obs` below a station-and-month-specific 95th-percentile threshold `tau_95(station, month)` **precomputed strictly from the `<= 2023` training archive**, then applies fair CRPS. This focuses 30% of the headline loss on heatwaves, wind gusts, and heavy precipitation.
 3. **Composite Proper Loss & Skill Score (`crpss_vs_baseline`):**
    ```text
@@ -102,12 +102,12 @@ Because weather variance shifts dramatically from week to week, raw score improv
 
 | Gate Criterion | Requirement | Why It Exists |
 | :--- | :--- | :--- |
-| **1. Headline Skill** | `crpss_vs_baseline > 0.0` and `crpss_vs_baseline_ecdf > 0.0` across primary Tier A variables | Confirms candidate beats the locked operational baseline under both CRPS estimators |
+| **1. Headline Skill** | `crpss_vs_baseline` and `crpss_vs_baseline_ecdf` both above `min_crpss_vs_baseline` (0.05) across primary Tier A variables | Confirms candidate beats the locked operational baseline under both CRPS estimators |
 | **2. Extreme-Tail Safety** | `twcrps_p95 <= baseline_twcrps_p95` (no tail degradation) | Prevents models that boost average scores by blurring storms |
 | **3. Calibration Band** | `0.85 <= spread_skill_ratio <= 1.15` | Blocks overconfident (collapsed) or wildly over-dispersed ensembles |
 | **4. Statistical Significance** | One-sided Diebold-Mariano `dm_pvalue < 0.05` (with horizon lag `h = lead_time / init_step`) | Accounts for autocorrelation across overlapping multi-day forecasts (`scores.statistical_tests.diebold_mariano`) |
 
-**Eligibility:** a candidate needs at least `min_members_for_gate` ensemble members (8, in `configs/splits.yaml`)
+**Eligibility:** a candidate needs at least `min_members_for_gate` ensemble members (20, in `configs/splits.yaml`)
 to pass; smaller ensembles are scored and reported only. The scorecard records this as the `min_members` gate.
 
 **Where the gates are judged:** each gate is evaluated per variable on its all-leads entry

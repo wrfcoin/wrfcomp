@@ -6,8 +6,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 import xarray as xr
+import yaml
 import zarr
 from conftest import (
+    GATE_MEMBERS,
     PRIMARY,
     Synthetic,
     make_synthetic,
@@ -165,7 +167,7 @@ def test_end_to_end_scorecard_validates_and_is_byte_identical(tmp_path, syntheti
         assert per_lead["all"]["n_pairs"] == sum(per_lead[k]["n_pairs"] for k in ("6", "12", "24"))
         assert per_lead["all"]["crps"] > 0
         for entry in per_lead.values():  # final kernel API: ecdf cross-check values and the member count
-            assert entry["n_members"] == 8
+            assert entry["n_members"] == GATE_MEMBERS
             assert entry["crps_ecdf"] > 0 and entry["loss_ecdf"] > 0
             assert entry["crpss_vs_baseline_ecdf"] is not None
     assert all("min_members" in per_gate for per_gate in card["gates"].values())
@@ -485,6 +487,21 @@ def test_bad_input_exits_2(tmp_path, case: str) -> None:
     result = _run(stores, out, *extra, **kwargs)
     assert result.exit_code == 2, f"{result.output}\n{result.exception!r}"
     assert "bad input" in result.output
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("key", ["min_members_for_gate", "min_crpss_vs_baseline"])
+def test_config_without_a_gate_decision_is_refused(tmp_path, synthetic, key: str) -> None:
+    # Regression: without min_members_for_gate the gate used to fall back to 8 members.
+    stores = _stores(tmp_path, synthetic)
+    raw = yaml.safe_load(stores["config"].read_text())
+    del raw["evaluation"]["promotion_gate"][key]
+    stores["config"].write_text(yaml.safe_dump(raw))
+    out = tmp_path / "s.json"
+    result = _run(stores, out)
+    assert result.exit_code == 2, f"{result.output}\n{result.exception!r}"
+    assert "bad input: config:" in result.output
+    assert f"promotion_gate must set {key}" in result.output
     assert not out.exists()
 
 

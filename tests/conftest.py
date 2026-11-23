@@ -10,6 +10,8 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from wrfcomp.harness.config import load_config
+
 # All five primary variables: name -> (mean, day-to-day spread)
 VARIABLES = {
     "t2m": (285.0, 6.0),
@@ -20,6 +22,9 @@ VARIABLES = {
 }
 UNITS = {"t2m": "K", "td2m": "K", "u10": "m/s", "v10": "m/s", "msl": "Pa"}
 PRIMARY = set(VARIABLES)
+
+
+GATE_MEMBERS = load_config().gate.min_members_for_gate  # smallest ensemble that may pass the gate
 
 
 @dataclass
@@ -48,11 +53,17 @@ def make_synthetic(
     n_stations: int = 20,
     n_init: int = 30,
     lead_hours: tuple[int, ...] = (6, 12, 24),
-    n_members: int = 8,
+    n_members: int | None = None,
     start: str = "2024-03-01T00:00",
     n_truth_nan: int = 25,
 ) -> Synthetic:
-    """Truth = slow signal + unpredictable part. Candidate knows the signal; the baseline knows it worse."""
+    """Truth = slow signal + unpredictable part. Candidate knows the signal; the baseline knows it worse.
+
+    `n_members` defaults to the gate's member floor in `configs/splits.yaml` (`GATE_MEMBERS`), so the
+    default candidate is eligible for the gate whatever the floor is.
+    """
+    if n_members is None:
+        n_members = GATE_MEMBERS
     rng = np.random.default_rng(seed)
     stations = station_ids(n_stations)
     init = pd.date_range(start, periods=n_init, freq="12h").values.astype("datetime64[ns]")

@@ -31,6 +31,8 @@ N_STATIONS = 6
 PERIODS = ("2024-01", "2024-07")
 GEFS_LEADS = (3, 6, 12, 24, 48)
 MODELS = ("climatology", "persistence", "gefs")
+# One more than the gate's member floor, so the synthetic GEFS is always eligible for the gate.
+GEFS_MEMBERS = load_config().gate.min_members_for_gate + 1
 
 
 def load_script(name: str):
@@ -96,7 +98,6 @@ def make_truth(start: str, end: str, seed: int) -> tuple[xr.Dataset, dict[str, n
 def write_gefs_cycles(root: Path, truth: xr.Dataset, clean: dict[str, np.ndarray], seed: int) -> None:
     """One store per cycle, laid out like the real extractor's output (Zarr v2, one init time)."""
     rng = np.random.default_rng(seed)
-    cfg = load_config()
     times = truth["valid_time"].values
     leads = np.array(GEFS_LEADS, dtype="timedelta64[h]").astype("timedelta64[ns]")
     for label in PERIODS:
@@ -108,22 +109,20 @@ def write_gefs_cycles(root: Path, truth: xr.Dataset, clean: dict[str, np.ndarray
             for name, (_, _, _, sd) in VARIABLES.items():
                 error_sd = 0.25 * sd * np.sqrt(np.array(GEFS_LEADS) / 12.0)[:, None]
                 centre = clean[name][rows] + rng.normal(0, 1, (len(leads), N_STATIONS)) * error_sd
-                members = (
-                    centre[..., None] + rng.normal(0, 1, (len(leads), N_STATIONS, 9)) * error_sd[..., None]
-                )
+                noise = rng.normal(0, 1, (len(leads), N_STATIONS, GEFS_MEMBERS))
+                members = centre[..., None] + noise * error_sd[..., None]
                 dims = ("init_time", "lead_time", "station_id", "ens_member")
                 data[name] = (dims, members[None].astype("float32"), {"units": UNITS[name]})
             coords = {
                 "init_time": np.array([init], dtype="datetime64[ns]"),
                 "lead_time": leads,
                 "station_id": station_ids(N_STATIONS).astype(str),
-                "ens_member": np.arange(9),
+                "ens_member": np.arange(GEFS_MEMBERS),
                 **_station_coords(),
             }
             ds = xr.Dataset(data, coords=coords, attrs={"model_id": "noaa-gefs", "model_version": "1"})
             store = root / f"{pd.Timestamp(init):%Y%m%d%H}.zarr"
             ds.to_zarr(store, mode="w", consolidated=True, zarr_format=2)
-    assert cfg.gate.min_members_for_gate <= 9
 
 
 def build_world(root: Path) -> dict[str, Path]:
@@ -294,6 +293,14 @@ def test_runner_writes_three_scorecards_per_period_and_rerun_is_identical(
         assert cards["persistence"].leads_scored == [1, 3, 6, 12, 24, 48]
         assert cards["gefs"].model_id == "noaa-gefs" and cards["gefs"].baseline_id == "climatology"
         assert cards["gefs"].leads_scored == list(GEFS_LEADS)  # the leads the model has
+        # Every model's ensemble, as written to disk, scored and serialised, meets the configured
+        # member floor, and the scorecard's min_members gate says so.
+        floor = load_config().gate.min_members_for_gate
+        for model, card in cards.items():
+            for variable in VARIABLES:
+                assert card.metrics[variable]["all"].n_members >= floor, (model, variable)
+                assert card.gates[variable]["min_members"] is True, (model, variable)
+        assert all(cards["gefs"].metrics[v]["all"].n_members == GEFS_MEMBERS for v in VARIABLES)
         # all three were scored against the same truth and thresholds, the last two against one baseline
         assert len({c.truth_sha256 for c in cards.values()}) == 1
         assert len({c.thresholds_sha256 for c in cards.values()}) == 1

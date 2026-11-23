@@ -12,6 +12,7 @@ from wrfcomp.harness.schemas import validate_forecast_dataset
 MODELS = (climatology, persistence)
 CFG = load_config()
 FLOOR = CFG.gate.min_members_for_gate
+EVEN = FLOOR + FLOOR % 2  # an even member count at or above the floor: a two-valued pool splits in half
 END = CFG.splits.train.end
 HOUR = np.timedelta64(1, "h")
 STATION = ("valid_time", "station_id")
@@ -108,10 +109,19 @@ def test_climatology_represents_empirical_frequency_without_date_aliasing():
     sample = np.resize([280.0, 290.0], rows.sum())
     truth.t2m.values[rows, 0] = sample
     truth.t2m_offset_min.values[rows, 0] = 0
-    out = climatology.forecast(truth, [np.datetime64("2023-12-07T18")], [6], members=8)
+    out = climatology.forecast(truth, [np.datetime64("2023-12-07T18")], [6], members=EVEN)
+    # The retired picker, at the eight members it was written for, shows the aliasing.
     old = sample[np.linspace(0, len(sample) - 1, 8).round().astype(int)]
     assert np.count_nonzero(old == 290) == 0
-    np.testing.assert_array_equal(out.t2m.values[0, 0, 0], [280] * 4 + [290] * 4)
+    # The pool is the 15 reports of 1 to 15 December: 8 cold, 7 warm. A member is the inverse
+    # empirical CDF at its midpoint probability, so it is cold exactly when that probability is at
+    # most 8/15. The ensemble then holds the pool's cold share to within half a member.
+    assert (len(sample), np.count_nonzero(sample == 280)) == (15, 8)
+    cold_share = 8 / 15
+    cold = np.count_nonzero((np.arange(EVEN) + 0.5) / EVEN <= cold_share)
+    assert abs(cold / EVEN - cold_share) <= 0.5 / EVEN
+    assert 0 < cold < EVEN  # both regimes are represented, unlike the retired picker
+    np.testing.assert_array_equal(out.t2m.values[0, 0, 0], [280] * cold + [290] * (EVEN - cold))
 
 
 def test_persistence_preserves_observed_error_mass_and_falls_back_without_calibration():
@@ -127,9 +137,10 @@ def test_persistence_preserves_observed_error_mass_and_falls_back_without_calibr
             row = dict(valid_time=t + HOUR, station_id="00000000001")
             truth.t2m.loc[row] = 280 + delta
             truth.t2m_offset_min.loc[row] = 0
-    out = persistence.forecast(truth, [t], [1], members=8)
-    np.testing.assert_array_equal(out.t2m.values[0, 0, 0], [275] * 4 + [285] * 4)
-    np.testing.assert_array_equal(out.t2m.values[0, 0, 1], [280] * 8)
+    out = persistence.forecast(truth, [t], [1], members=EVEN)
+    half = EVEN // 2
+    np.testing.assert_array_equal(out.t2m.values[0, 0, 0], [275] * half + [285] * half)
+    np.testing.assert_array_equal(out.t2m.values[0, 0, 1], [280] * EVEN)
     old = np.quantile([-5, 5], (np.arange(8) + 0.5) / 8)
     assert np.ptp(old) == 8.75
 
@@ -182,16 +193,16 @@ def test_ordered_pools_and_fallback_measurement_cutoffs(model, init):
     report("2022-11-30T04", 1, 299)
 
     for stage, expected in enumerate(([270, 272], [280, 282], [290, 292])):
-        clean = model.forecast(truth, [init], [24], members=8)
+        clean = model.forecast(truth, [init], [24], members=EVEN)
         assert clean.attrs["model_version"] == "3"
-        np.testing.assert_array_equal(clean.t2m.values[0, 0, 0], np.repeat(expected, 4))
+        np.testing.assert_array_equal(clean.t2m.values[0, 0, 0], np.repeat(expected, EVEN // 2))
         assert clean.t2m.isel(station_id=1).isnull().all()
 
         poisoned = truth.copy(deep=True)
         for late, offset in [(cutoff, 1), (cutoff + 24 * HOUR, 0), (init, 1), (init + HOUR, 0)]:
             poisoned.t2m.loc[dict(valid_time=late)] = 330
             poisoned.t2m_offset_min.loc[dict(valid_time=late)] = offset
-        xr.testing.assert_identical(clean, model.forecast(poisoned, [init], [24], members=8))
+        xr.testing.assert_identical(clean, model.forecast(poisoned, [init], [24], members=EVEN))
         if stage < 2:
             removed = ["2022-12-10T18", "2022-12-11T18"] if stage == 0 else ["2022-11-17T18", "2022-11-18T18"]
             for time in removed:
