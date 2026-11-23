@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from .io import UNITS, boundaries, layout, train_truth
+from .io import UNITS, boundaries, historical_layout, train_truth
 
 
 def latest(truth, name, times):
@@ -24,14 +24,15 @@ def latest(truth, name, times):
     return out
 
 
-def forecast(truth, inits, leads, members=30):
-    out = layout(truth, inits, leads, members, "persistence")
+def forecast(truth, inits, leads, members=None):
+    """Add empirical error quantiles; missing starts or empty error pools leave all members NaN."""
+    out = historical_layout(truth, inits, leads, members, "persistence")
     archive = train_truth(truth, out)
     dates = archive.valid_time.to_index()
     times = out.init_time.values
     end, _ = boundaries()
     cutoff = min(times.min(), end)
-    qs = (np.arange(members) + 0.5) / members
+    qs = (out.ens_member.values + 0.5) / out.sizes["ens_member"]
     for name in UNITS:
         now = latest(truth, name, times)
         for j, lead in enumerate(out.lead_time.values):
@@ -50,5 +51,6 @@ def forecast(truth, inits, leads, members=30):
                 for k, series in enumerate(errors.T):
                     finite = series[np.isfinite(series)]
                     if finite.size:
-                        out[name].values[rows, j, k] = now[rows, k, None] + np.quantile(finite, qs)
+                        quantiles = np.quantile(finite, qs, method="inverted_cdf")
+                        out[name].values[rows, j, k] = now[rows, k, None] + quantiles
     return out

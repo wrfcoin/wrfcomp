@@ -20,6 +20,17 @@ def boundaries():
     return splits.train.end, splits.sealed_test.start
 
 
+def historical_layout(stations, inits, leads, members, model):
+    floor = load_config(CONFIG).gate.min_members_for_gate
+    if members is None:
+        members = max(30, floor)
+    if members < floor:
+        raise ValueError(f"{model} requires at least {floor} ensemble members")
+    forecast = layout(stations, inits, leads, members, model)
+    forecast.attrs["model_version"] = "2"
+    return forecast
+
+
 def layout(stations, inits, leads, members, model):
     times = np.asarray(inits, dtype="datetime64[ns]")
     hours = np.asarray(leads, dtype="timedelta64[h]").astype("timedelta64[ns]")
