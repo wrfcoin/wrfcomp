@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -599,6 +600,96 @@ def test_missing_threshold_masks_the_point_for_every_model() -> None:
     assert empty["all"]["n_masked_no_threshold"] == int(finite.sum())
     gates = M.evaluate_gates(empty, CFG)
     assert (gates["skill"], gates["tail"], gates["spread_skill"], gates["dm"]) == (False,) * 4
+
+
+@pytest.mark.parametrize("bad", [np.inf, -np.inf])
+def test_infinite_threshold_is_refused_on_every_direct_call(bad: float) -> None:
+    s = synthetic(35, n_init=12, n_sta=4, n_mem=6)
+    good, obs, base = s["good"], s["obs"], s["base"]
+    grid = {"cfg": CFG, "expected_init_times": obs["init_time"].values}
+    grid["expected_station_ids"] = obs["station_id"].values.tolist()
+    message = "infinite value"
+
+    # Control: NaN is the legal marker. One station without thresholds is masked and counted.
+    with_nan = s["threshold"].copy()
+    with_nan.values[1, :] = np.nan
+    control = M.score_variable(good, obs, with_nan, base, **grid)
+    assert control["all"]["n_pairs"] == 3 * 12 * 2
+    assert control["all"]["n_masked_no_threshold"] == 12 * 2
+    assert int(M.scoring_mask(obs, with_nan).sum()) == 3 * 12 * 2
+    assert np.isnan(M.tail_crps(good, obs, with_nan).sel(station_id=obs["station_id"].values[1])).all()
+
+    # The same station with an infinite threshold must not be scored as "missing": it is refused.
+    table = s["threshold"].copy()
+    table.values[1, :] = bad
+    one_cell = s["threshold"].copy()
+    one_cell.values[3, 7] = bad  # August: no valid time of this case uses it, still refused
+    for thresholds in (table, one_cell, table.chunk({"station_id": 1})):
+        with pytest.raises(ValueError, match=message):
+            M.scoring_mask(obs, thresholds)
+        with pytest.raises(ValueError, match=message):
+            M.score_variable(good, obs, thresholds, base, **grid)
+        with pytest.raises(ValueError, match=message):
+            M.score_variable(good, obs, thresholds, **grid)
+        for method in ("fair", "ecdf"):
+            with pytest.raises(ValueError, match=message):
+                M.tail_crps(good, obs, thresholds, method=method)
+
+    # tail_crps with a plain number, and with an array already on the forecast's points
+    on_points = M.broadcast_threshold(s["threshold"], obs["init_time"], obs["lead_time"]).copy()
+    on_points.values[0, 0, 0] = bad
+    for method in ("fair", "ecdf"):
+        with pytest.raises(ValueError, match=message):
+            M.tail_crps(good, obs, bad, method=method)
+        with pytest.raises(ValueError, match=message):
+            M.tail_crps(good, obs, np.float32(bad), method=method)
+        with pytest.raises(ValueError, match=message):
+            M.tail_crps(good, obs, on_points, method=method)
+        assert np.isfinite(M.tail_crps(good, obs, 285.0, method=method)).all()  # a number still works
+        assert np.isnan(M.tail_crps(good, obs, np.nan, method=method)).all()  # NaN gives NaN, no error
+
+
+WIDE_LONG_DOUBLE = np.finfo(np.longdouble).max > np.finfo(np.float64).max
+
+
+@pytest.mark.skipif(not WIDE_LONG_DOUBLE, reason="long double is no wider than float64 on this platform")
+@pytest.mark.parametrize("sign", [1, -1])
+def test_long_double_threshold_that_overflows_float64_is_refused(sign: int) -> None:
+    # 1e400 is a finite long double, but scoring works in float64, where it is infinity. The check
+    # has to look at the values that are actually used.
+    s = synthetic(36, n_init=12, n_sta=4, n_mem=6)
+    good, obs, base = s["good"], s["obs"], s["base"]
+    grid = {"cfg": CFG, "expected_init_times": obs["init_time"].values}
+    grid["expected_station_ids"] = obs["station_id"].values.tolist()
+    huge = sign * np.longdouble("1e400")
+    assert np.isfinite(huge) and np.isinf(np.float64(huge))
+    message = "infinite value\\(s\\) as float64"
+
+    wide = s["threshold"].astype(np.longdouble)
+    wide.values[1, :] = huge
+    assert np.isfinite(wide.values).all()  # finite in its own type: the old check let it through
+    on_points = M.broadcast_threshold(s["threshold"], obs["init_time"], obs["lead_time"])
+    on_points = on_points.astype(np.longdouble)
+    on_points.values[0, 0, 0] = huge
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # refused cleanly, not after an overflow warning
+        for thresholds in (wide, wide.chunk({"station_id": 1})):
+            with pytest.raises(ValueError, match=message):
+                M.scoring_mask(obs, thresholds)
+            with pytest.raises(ValueError, match=message):
+                M.score_variable(good, obs, thresholds, base, **grid)
+        for method in ("fair", "ecdf"):
+            for thresholds in (wide, on_points, huge):
+                with pytest.raises(ValueError, match=message):
+                    M.tail_crps(good, obs, thresholds, method=method)
+
+    # Controls. A long double table of ordinary values scores exactly like the float32 one, and NaN
+    # in it still means "no training data".
+    ordinary = s["threshold"].astype(np.longdouble)
+    assert M.score_variable(good, obs, ordinary, base, **grid) == score(good, obs, s["threshold"], base)
+    ordinary.values[1, :] = np.nan
+    assert int(M.scoring_mask(obs, ordinary).sum()) == 3 * 12 * 2
+    assert M.score_variable(good, obs, ordinary, base, **grid)["all"]["n_masked_no_threshold"] == 12 * 2
 
 
 def test_lead_with_no_observations_is_undefined_not_zero() -> None:

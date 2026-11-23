@@ -13,7 +13,8 @@ Rules this module follows (see docs/VERIFICATION_PROTOCOL.md and configs/splits.
   (`scoring_mask`). A threshold is missing exactly where the station has no training observation in
   that month, so the mask is fixed by the truth and the training data alone: no forecast can change
   it, and it is the same for every model. Points with a valid observation but no threshold are
-  counted per entry as `n_masked_no_threshold`. That one mask is used for the candidate and for the
+  counted per entry as `n_masked_no_threshold`. Only NaN marks a missing threshold: plus or minus
+  infinity anywhere in the thresholds is refused. That one mask is used for the candidate and for the
   baseline. A forecast (candidate or baseline) that is not finite at a scored point is an error,
   never a silently skipped point.
 * **Members are a sample.** Fair CRPS and the spread-skill correction assume the members are
@@ -139,6 +140,33 @@ def broadcast_threshold(
     return out.transpose("init_time", "lead_time", "station_id")
 
 
+def _threshold_float64(threshold: xr.DataArray | float) -> xr.DataArray | float:
+    """The threshold as float64, the type scoring computes in, refused if any value is infinite.
+
+    A threshold is a number, or NaN for "no training data". Plus or minus infinity is neither: it
+    would pass for a missing threshold in the mask, or make the tail score meaningless (clipping at
+    minus infinity gives back the plain CRPS, clipping at plus infinity gives NaN).
+
+    The check is made on the float64 values, AFTER the cast, because those are the values that are
+    used: a wider type can hold a finite number (long double 1e400) that becomes infinity in float64.
+    Every public function that takes a threshold gets it through here, before any mask or clipping.
+    """
+    with warnings.catch_warnings(), np.errstate(over="ignore"):
+        warnings.simplefilter("ignore", category=RuntimeWarning)  # the overflow is reported below
+        if isinstance(threshold, xr.DataArray):
+            cast: xr.DataArray | float = _as_float64(threshold)
+            infinite = int(np.isinf(cast).sum())
+        else:
+            cast = float(threshold)
+            infinite = int(math.isinf(cast))
+    if infinite:
+        raise ValueError(
+            f"tail threshold has {infinite} infinite value(s) as float64; "
+            "only NaN may mark a missing threshold"
+        )
+    return cast
+
+
 def tail_crps(
     fcst: xr.DataArray,
     obs: xr.DataArray,
@@ -153,16 +181,14 @@ def tail_crps(
     Uses `scores.probability.tw_crps_for_ensemble` with the chaining function `v(x) = max(x, t)`,
     which is the same as clipping forecast and observation from below at `t`. A `threshold` with a
     `month` dimension is broadcast per station and calendar month of the valid time; any other
-    threshold (a number, or an array already on the forecast's dims) is used as given.
+    threshold (a number, or an array already on the forecast's dims) is used as given. The result is
+    NaN where the threshold is NaN. An infinite threshold raises `ValueError`.
     """
     fcst = _prepare_ensemble(fcst)
-    if isinstance(threshold, xr.DataArray):
-        if "month" in threshold.dims:
-            threshold = threshold.sel(station_id=fcst["station_id"])
-            threshold = broadcast_threshold(threshold, fcst["init_time"], fcst["lead_time"])
-        threshold = _as_float64(threshold)
-    else:
-        threshold = float(threshold)
+    threshold = _threshold_float64(threshold)
+    if isinstance(threshold, xr.DataArray) and "month" in threshold.dims:
+        threshold = threshold.sel(station_id=fcst["station_id"])
+        threshold = broadcast_threshold(threshold, fcst["init_time"], fcst["lead_time"])
 
     def _clip_below(values: xr.DataArray) -> xr.DataArray:
         return np.maximum(values, threshold)  # NaN stays NaN
@@ -448,14 +474,20 @@ def _per_init_mean(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 
 def _point_thresholds(obs: xr.DataArray, tail_threshold: xr.DataArray) -> xr.DataArray:
-    """Thresholds `(station_id, month)` on the points of `obs`, float64, dims `POINT_DIMS`."""
+    """Thresholds `(station_id, month)` on the points of `obs`, float64, dims `POINT_DIMS`.
+
+    The one place `scoring_mask` and `score_variable` take their thresholds from. Refuses a value
+    anywhere in the table that is infinite as float64, so NaN is the only thing the mask can read as
+    "missing".
+    """
     if set(tail_threshold.dims) != {"station_id", "month"}:
         raise ValueError(
             f"tail_threshold must have dims (station_id, month), got {tuple(tail_threshold.dims)}"
         )
+    tail_threshold = _threshold_float64(tail_threshold)
     if not obs.indexes["station_id"].isin(tail_threshold.indexes["station_id"]).all():
         raise ValueError("tail_threshold does not cover every station of the forecast")
-    selected = _as_float64(tail_threshold).sel(station_id=obs["station_id"].values)
+    selected = tail_threshold.sel(station_id=obs["station_id"].values)
     return broadcast_threshold(selected, obs["init_time"], obs["lead_time"])
 
 
@@ -464,7 +496,8 @@ def scoring_mask(obs: xr.DataArray, tail_threshold: xr.DataArray) -> xr.DataArra
 
     `obs` has dims `(init_time, lead_time, station_id)`, `tail_threshold` has `(station_id, month)`
     and must list every station of `obs`. The threshold used is the one for the station and the
-    calendar month of the valid time. The result depends on truth and training data only, so it is
+    calendar month of the valid time. A NaN threshold masks the point; an infinite one raises
+    `ValueError`. The result depends on truth and training data only, so it is
     the same for every forecast scored against them. Dims `(init_time, lead_time, station_id)`.
     """
     if set(obs.dims) != set(POINT_DIMS):

@@ -1,7 +1,8 @@
 """Data-contract validators and the scorecard model.
 
 The validators raise `SchemaError` (a `ValueError`) on the first violation and return `None` otherwise.
-They read coordinates and metadata only, never the full data arrays, so they are cheap on lazy datasets.
+The forecast and truth validators read coordinates and metadata only, never the full data arrays, so
+they are cheap on lazy datasets. The thresholds validator also reads the (small) threshold values.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ THRESHOLD_DIMS = ("station_id", "month")
 STATION_COORDS = ("latitude", "longitude", "elevation_m")
 STATION_ID_LENGTH = 11
 MIN_ENS_MEMBERS = 2
+THRESHOLD_DTYPES = ("float32", "float64")  # nothing wider than what scoring computes in
 GATE_NAMES = ("skill", "tail", "spread_skill", "dm", "min_members")
 
 
@@ -114,7 +116,7 @@ def _check_variables(
     kind: str,
     dims: tuple[str, ...],
     required: Iterable[str] | None,
-    dtype: str | None,
+    dtypes: tuple[str, ...],
     *,
     offset_companions: bool = False,
 ) -> None:
@@ -134,12 +136,10 @@ def _check_variables(
             set(var.dims) == set(dims) and len(var.dims) == len(dims),
             f"{kind}: variable '{name}' has dims {tuple(var.dims)}, expected {dims}",
         )
-        if dtype is None:
-            _require(var.dtype.kind == "f", f"{kind}: variable '{name}' must be floating point")
-        else:
-            _require(
-                var.dtype == np.dtype(dtype), f"{kind}: variable '{name}' is {var.dtype}, expected {dtype}"
-            )
+        _require(
+            var.dtype in tuple(np.dtype(d) for d in dtypes),
+            f"{kind}: variable '{name}' is {var.dtype}, expected {' or '.join(dtypes)}",
+        )
         units = var.attrs.get("units")
         if units is not None:
             _require(
@@ -196,7 +196,7 @@ def validate_forecast_dataset(
     )
     _check_station_ids(ds, kind)
     _check_station_coords(ds, kind)
-    _check_variables(ds, kind, FORECAST_DIMS, variables, "float32")
+    _check_variables(ds, kind, FORECAST_DIMS, variables, ("float32",))
     for attr in ("model_id", "model_version"):
         value = ds.attrs.get(attr)
         _require(isinstance(value, str) and value.strip() != "", f"{kind}: attribute '{attr}' is missing")
@@ -231,7 +231,7 @@ def validate_truth_dataset(
     )
     _check_station_ids(ds, kind)
     _check_station_coords(ds, kind)
-    _check_variables(ds, kind, TRUTH_DIMS, variables, "float32", offset_companions=True)
+    _check_variables(ds, kind, TRUTH_DIMS, variables, ("float32",), offset_companions=True)
     _check_not_sealed(times.max(), kind, cfg, allow_sealed)
 
 
@@ -239,8 +239,12 @@ def validate_thresholds(ds: xr.Dataset, *, variables: Iterable[str] | None = Non
     """Check tail thresholds: dims `(station_id, month)`, month exactly 1..12.
 
     `variables` should be the forecast variables being scored; each needs a threshold variable.
-    NaN thresholds (a station with no training data in a month) are legal here; scoring refuses to
-    use one at a point that has a valid observation.
+    A NaN threshold is legal and has one meaning: the station has no training data in that month.
+    Scoring leaves such points out for every model alike and counts them (`n_masked_no_threshold`,
+    see `wrfcomp.harness.metrics.scoring_mask`). An infinite threshold is refused: it cannot come
+    from training data and would otherwise be masked as if it were a missing one. Threshold
+    variables must be float32 or float64: scoring works in float64, and a wider type (long double)
+    can hold a finite value that turns into infinity there. This validator reads the threshold values.
     """
     kind = "thresholds"
     ds = _check_dataset(ds, kind)
@@ -248,7 +252,14 @@ def validate_thresholds(ds: xr.Dataset, *, variables: Iterable[str] | None = Non
     _require(months.dtype.kind in "iu", f"{kind}: month must be an integer coordinate")
     _require(months.tolist() == list(range(1, 13)), f"{kind}: month must be exactly 1..12 in order")
     _check_station_ids(ds, kind)
-    _check_variables(ds, kind, THRESHOLD_DIMS, variables, None)
+    _check_variables(ds, kind, THRESHOLD_DIMS, variables, THRESHOLD_DTYPES)
+    for name in sorted(str(n) for n in ds.data_vars):
+        infinite = int(np.isinf(np.asarray(ds[name].values)).sum())
+        _require(
+            infinite == 0,
+            f"{kind}: variable '{name}' has {infinite} infinite value(s); "
+            "only NaN may mark a missing threshold",
+        )
 
 
 # --- Scorecard ---------------------------------------------------------------------------------
