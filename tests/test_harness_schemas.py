@@ -282,6 +282,24 @@ def test_valid_thresholds_pass() -> None:
     validate_thresholds(make_thresholds(), variables=VARIABLES)
 
 
+def test_thresholds_nan_means_no_training_data_and_inf_is_refused() -> None:
+    # NaN is the one legal marker for "no training data for this station and month".
+    with_nan = make_thresholds()
+    with_nan["t2m"].values[1, 6] = np.nan
+    with_nan["msl"].values[:] = np.nan
+    validate_thresholds(with_nan, variables=VARIABLES)
+    validate_thresholds(with_nan.chunk({"station_id": 1}), variables=VARIABLES)  # lazy data too
+    # Plus or minus infinity is not a quantile of anything and must not pass as a missing threshold.
+    for value in (np.inf, -np.inf):
+        bad = make_thresholds()
+        bad["u10"].values[2, 0] = value
+        bad["u10"].values[0, 11] = value
+        with pytest.raises(SchemaError, match="'u10' has 2 infinite value"):
+            validate_thresholds(bad, variables=VARIABLES)
+        with pytest.raises(SchemaError, match="infinite"):
+            validate_thresholds(bad.chunk({"station_id": 1}))
+
+
 def _break_thresholds(case: str) -> xr.Dataset:
     ds = make_thresholds()
     if case == "eleven_months":
