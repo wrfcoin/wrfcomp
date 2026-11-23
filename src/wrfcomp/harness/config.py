@@ -75,6 +75,9 @@ class LossWeights(_Frozen):
         return self
 
 
+REQUIRED_GATE_KEYS = ("min_crpss_vs_baseline", "min_members_for_gate")
+
+
 class PromotionGateConfig(_Frozen):
     alpha_dm: float = Field(gt=0.0, lt=1.0)
     min_crpss_vs_baseline: float
@@ -83,8 +86,22 @@ class PromotionGateConfig(_Frozen):
     tail_quantile: float = Field(gt=0.0, lt=1.0)
     tail_threshold_source: Literal["train"]
     # Smaller ensembles are scored but can never pass the gate.
-    min_members_for_gate: int = Field(default=8, ge=2)
+    min_members_for_gate: int = Field(ge=2)
     loss_weights: LossWeights
+
+    @model_validator(mode="before")
+    @classmethod
+    def _require_gate_decisions(cls, data: object) -> object:
+        # The member floor and the minimum skill are owner decisions. Neither has a default: a config
+        # that leaves one out is refused, it does not fall back to a weaker gate.
+        if isinstance(data, dict):
+            missing = [key for key in REQUIRED_GATE_KEYS if data.get(key) is None]
+            if missing:
+                raise ValueError(
+                    f"promotion_gate must set {' and '.join(missing)}: "
+                    "the gate's member floor and minimum skill have no default"
+                )
+        return data
 
     @model_validator(mode="after")
     def _check(self) -> PromotionGateConfig:

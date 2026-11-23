@@ -26,7 +26,7 @@ Rules this module follows (see docs/VERIFICATION_PROTOCOL.md and configs/splits.
   Every CRPS is also computed with the plain ensemble ("ecdf") estimator, which has no such hole
   (it is biased high for small sampled ensembles instead), both are reported, and the skill gate
   needs skill above the minimum under BOTH estimators. And an ensemble with fewer than
-  `min_members_for_gate` members (config, default 8) is scored but can never pass the gate.
+  `min_members_for_gate` members (a required config value) is scored but can never pass the gate.
   The tail gate and the Diebold-Mariano test use the fair estimator.
 * **Averages.** `crps`, `twcrps_p95` and the spread-skill terms are plain means over the scored points
   of a lead, or of every lead for `"all"`. Nothing is weighted.

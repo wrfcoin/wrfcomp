@@ -26,7 +26,7 @@ Both models use the same member rule. For `M` members, member `i` uses the empir
 quantile at `(i + 0.5) / M`, for `i = 0, …, M − 1`. This selects the smallest sampled
 value whose cumulative frequency reaches that probability (NumPy's `inverted_cdf`).
 Values can repeat. The default ensemble size is the larger of 30 and
-`min_members_for_gate` in `configs/splits.yaml` (currently 8). Explicit member counts
+`min_members_for_gate` in `configs/splits.yaml` (currently 20). Explicit member counts
 must meet that floor.
 
 **Climatology** builds a sample for each station, variable and forecast valid time.

@@ -293,6 +293,14 @@ def test_runner_writes_three_scorecards_per_period_and_rerun_is_identical(
         assert cards["persistence"].leads_scored == [1, 3, 6, 12, 24, 48]
         assert cards["gefs"].model_id == "noaa-gefs" and cards["gefs"].baseline_id == "climatology"
         assert cards["gefs"].leads_scored == list(GEFS_LEADS)  # the leads the model has
+        # Every model's ensemble, as written to disk, scored and serialised, meets the configured
+        # member floor, and the scorecard's min_members gate says so.
+        floor = load_config().gate.min_members_for_gate
+        for model, card in cards.items():
+            for variable in VARIABLES:
+                assert card.metrics[variable]["all"].n_members >= floor, (model, variable)
+                assert card.gates[variable]["min_members"] is True, (model, variable)
+        assert all(cards["gefs"].metrics[v]["all"].n_members == GEFS_MEMBERS for v in VARIABLES)
         # all three were scored against the same truth and thresholds, the last two against one baseline
         assert len({c.truth_sha256 for c in cards.values()}) == 1
         assert len({c.thresholds_sha256 for c in cards.values()}) == 1

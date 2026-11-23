@@ -130,11 +130,41 @@ def test_config_rejects_bad_values(path: tuple[str, ...], value: object) -> None
         HarnessConfig.model_validate(_mutated(path, value))
 
 
-def test_min_members_for_gate_default_and_bounds() -> None:
+PATH_MIN_SKILL = ("evaluation", "promotion_gate", "min_crpss_vs_baseline")
+
+
+@pytest.mark.parametrize("path", [PATH_MIN_MEMBERS, PATH_MIN_SKILL])
+@pytest.mark.parametrize("how", ["absent", "null"])
+def test_gate_floor_and_minimum_skill_are_required(tmp_path: Path, path: tuple[str, ...], how: str) -> None:
+    # Regression: a config without min_members_for_gate used to load with a floor of 8, so an
+    # 8-member candidate passed every gate. There is no fallback any more, for either value.
     raw = copy.deepcopy(yaml.safe_load(DEFAULT_CONFIG_PATH.read_text()))
-    raw["evaluation"]["promotion_gate"].pop("min_members_for_gate")
-    assert HarnessConfig.model_validate(raw).gate.min_members_for_gate == 8  # default when absent
+    HarnessConfig.model_validate(raw)  # the repository config itself is complete
+    if how == "absent":
+        raw["evaluation"]["promotion_gate"].pop(path[-1])
+    else:
+        raw["evaluation"]["promotion_gate"][path[-1]] = None
+    message = f"promotion_gate must set {path[-1]}: .* have no default"
+    with pytest.raises(ValidationError, match=message):
+        HarnessConfig.model_validate(raw)
+    # the loader behind `wrfcomp-eval --config` refuses the file the same way
+    config = tmp_path / "splits.yaml"
+    config.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match=message):
+        load_config(config)
+
+
+def test_gate_floor_and_minimum_skill_both_missing_are_both_named() -> None:
+    raw = copy.deepcopy(yaml.safe_load(DEFAULT_CONFIG_PATH.read_text()))
+    for path in (PATH_MIN_MEMBERS, PATH_MIN_SKILL):
+        raw["evaluation"]["promotion_gate"].pop(path[-1])
+    with pytest.raises(ValidationError, match="min_crpss_vs_baseline and min_members_for_gate"):
+        HarnessConfig.model_validate(raw)
+
+
+def test_min_members_for_gate_bounds() -> None:
     assert HarnessConfig.model_validate(_mutated(PATH_MIN_MEMBERS, 16)).gate.min_members_for_gate == 16
+    assert HarnessConfig.model_validate(_mutated(PATH_MIN_SKILL, 0.0)).gate.min_crpss_vs_baseline == 0.0
     with pytest.raises(ValidationError):
         HarnessConfig.model_validate(_mutated(PATH_MIN_MEMBERS, 1))
 
