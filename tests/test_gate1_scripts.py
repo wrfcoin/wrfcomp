@@ -31,6 +31,8 @@ N_STATIONS = 6
 PERIODS = ("2024-01", "2024-07")
 GEFS_LEADS = (3, 6, 12, 24, 48)
 MODELS = ("climatology", "persistence", "gefs")
+# One more than the gate's member floor, so the synthetic GEFS is always eligible for the gate.
+GEFS_MEMBERS = load_config().gate.min_members_for_gate + 1
 
 
 def load_script(name: str):
@@ -96,7 +98,6 @@ def make_truth(start: str, end: str, seed: int) -> tuple[xr.Dataset, dict[str, n
 def write_gefs_cycles(root: Path, truth: xr.Dataset, clean: dict[str, np.ndarray], seed: int) -> None:
     """One store per cycle, laid out like the real extractor's output (Zarr v2, one init time)."""
     rng = np.random.default_rng(seed)
-    cfg = load_config()
     times = truth["valid_time"].values
     leads = np.array(GEFS_LEADS, dtype="timedelta64[h]").astype("timedelta64[ns]")
     for label in PERIODS:
@@ -108,22 +109,20 @@ def write_gefs_cycles(root: Path, truth: xr.Dataset, clean: dict[str, np.ndarray
             for name, (_, _, _, sd) in VARIABLES.items():
                 error_sd = 0.25 * sd * np.sqrt(np.array(GEFS_LEADS) / 12.0)[:, None]
                 centre = clean[name][rows] + rng.normal(0, 1, (len(leads), N_STATIONS)) * error_sd
-                members = (
-                    centre[..., None] + rng.normal(0, 1, (len(leads), N_STATIONS, 9)) * error_sd[..., None]
-                )
+                noise = rng.normal(0, 1, (len(leads), N_STATIONS, GEFS_MEMBERS))
+                members = centre[..., None] + noise * error_sd[..., None]
                 dims = ("init_time", "lead_time", "station_id", "ens_member")
                 data[name] = (dims, members[None].astype("float32"), {"units": UNITS[name]})
             coords = {
                 "init_time": np.array([init], dtype="datetime64[ns]"),
                 "lead_time": leads,
                 "station_id": station_ids(N_STATIONS).astype(str),
-                "ens_member": np.arange(9),
+                "ens_member": np.arange(GEFS_MEMBERS),
                 **_station_coords(),
             }
             ds = xr.Dataset(data, coords=coords, attrs={"model_id": "noaa-gefs", "model_version": "1"})
             store = root / f"{pd.Timestamp(init):%Y%m%d%H}.zarr"
             ds.to_zarr(store, mode="w", consolidated=True, zarr_format=2)
-    assert cfg.gate.min_members_for_gate <= 9
 
 
 def build_world(root: Path) -> dict[str, Path]:

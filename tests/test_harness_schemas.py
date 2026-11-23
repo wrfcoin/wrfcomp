@@ -85,7 +85,9 @@ def test_load_config_matches_yaml() -> None:
     assert cfg.gate.spread_skill_min == gate["spread_skill_min"]
     assert cfg.gate.spread_skill_max == gate["spread_skill_max"]
     assert cfg.gate.tail_quantile == gate["tail_quantile"]
-    assert cfg.gate.min_members_for_gate == gate["min_members_for_gate"] == 8
+    assert cfg.gate.min_members_for_gate == gate["min_members_for_gate"]
+    assert cfg.gate.min_crpss_vs_baseline == gate["min_crpss_vs_baseline"]
+    assert cfg.gate.min_members_for_gate >= 2 and cfg.gate.min_crpss_vs_baseline >= 0.0
     assert cfg.gate.loss_weights.crps_fair == gate["loss_weights"]["crps_fair"]
     assert cfg.gate.loss_weights.twcrps_p95 == gate["loss_weights"]["twcrps_p95"]
 

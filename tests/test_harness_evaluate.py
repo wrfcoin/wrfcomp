@@ -8,6 +8,7 @@ import pytest
 import xarray as xr
 import zarr
 from conftest import (
+    GATE_MEMBERS,
     PRIMARY,
     Synthetic,
     make_synthetic,
@@ -165,7 +166,7 @@ def test_end_to_end_scorecard_validates_and_is_byte_identical(tmp_path, syntheti
         assert per_lead["all"]["n_pairs"] == sum(per_lead[k]["n_pairs"] for k in ("6", "12", "24"))
         assert per_lead["all"]["crps"] > 0
         for entry in per_lead.values():  # final kernel API: ecdf cross-check values and the member count
-            assert entry["n_members"] == 8
+            assert entry["n_members"] == GATE_MEMBERS
             assert entry["crps_ecdf"] > 0 and entry["loss_ecdf"] > 0
             assert entry["crpss_vs_baseline_ecdf"] is not None
     assert all("min_members" in per_gate for per_gate in card["gates"].values())

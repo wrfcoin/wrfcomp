@@ -15,6 +15,9 @@ from wrfcomp.harness.config import load_config
 from wrfcomp.harness.schemas import GATE_NAMES, LeadMetrics, validate_thresholds
 
 CFG = load_config()
+FLOOR = CFG.gate.min_members_for_gate  # smallest ensemble that may pass the gate
+MIN_SKILL = CFG.gate.min_crpss_vs_baseline  # skill must be strictly above this
+N_MEM = max(20, FLOOR)  # default synthetic ensemble: always eligible for the gate
 POINT_DIMS = ("init_time", "lead_time", "station_id")
 FCST_DIMS = (*POINT_DIMS, "ens_member")
 
@@ -102,7 +105,7 @@ def brute_pointwise(
 
 
 def synthetic(
-    seed: int, *, n_init: int = 120, leads: tuple[int, ...] = (6, 24), n_sta: int = 8, n_mem: int = 20
+    seed: int, *, n_init: int = 120, leads: tuple[int, ...] = (6, 24), n_sta: int = 8, n_mem: int = N_MEM
 ) -> dict:
     """Obs = 280 + 3*mu1 + 2*mu2 + 0.5*eps.
 
@@ -456,23 +459,32 @@ def test_gate_boundaries() -> None:
     def gates(**changes: float | None) -> dict[str, bool]:
         entry = {
             **base,
-            "crpss_vs_baseline": 0.1,
-            "crpss_vs_baseline_ecdf": 0.1,
+            "crpss_vs_baseline": MIN_SKILL + 0.1,
+            "crpss_vs_baseline_ecdf": MIN_SKILL + 0.1,
             "spread_skill_ratio": 1.0,
             "dm_pvalue": 0.01,
-            "n_members": 8,
+            "n_members": FLOOR,
             **changes,
         }
         return M.evaluate_gates({"all": entry}, CFG)
 
+    just_above = float(np.nextafter(MIN_SKILL, 1.0))
     assert all(gates().values())
-    assert gates(crpss_vs_baseline=0.0)["skill"] is False  # strictly greater than the minimum
-    assert gates(crpss_vs_baseline_ecdf=0.0)["skill"] is False  # under BOTH estimators
+    # skill: strictly greater than the configured minimum, under BOTH estimators
+    assert gates(crpss_vs_baseline=MIN_SKILL)["skill"] is False
+    assert gates(crpss_vs_baseline_ecdf=MIN_SKILL)["skill"] is False
+    assert gates(crpss_vs_baseline=MIN_SKILL, crpss_vs_baseline_ecdf=MIN_SKILL)["skill"] is False
+    assert gates(crpss_vs_baseline=just_above, crpss_vs_baseline_ecdf=just_above)["skill"] is True
+    assert gates(crpss_vs_baseline=just_above, crpss_vs_baseline_ecdf=MIN_SKILL)["skill"] is False
+    assert gates(crpss_vs_baseline=MIN_SKILL, crpss_vs_baseline_ecdf=just_above)["skill"] is False
+    assert gates(crpss_vs_baseline=MIN_SKILL - 1e-9)["skill"] is False
     assert gates(crpss_vs_baseline_ecdf=-0.2, crpss_vs_baseline=0.9)["skill"] is False
     assert gates(crpss_vs_baseline_ecdf=None)["skill"] is False
-    assert gates(n_members=7)["min_members"] is False
+    # members: at least the configured floor
+    assert gates(n_members=FLOOR)["min_members"] is True
+    assert gates(n_members=FLOOR - 1)["min_members"] is False
     assert gates(n_members=None)["min_members"] is False
-    assert gates(n_members=50)["min_members"] is True
+    assert gates(n_members=FLOOR + 30)["min_members"] is True
     assert gates(twcrps_p95=0.2)["tail"] is True  # equal tail is "not worse"
     assert gates(twcrps_p95=0.2000001)["tail"] is False
     assert gates(spread_skill_ratio=0.85)["spread_skill"] is True
@@ -483,6 +495,67 @@ def test_gate_boundaries() -> None:
     assert gates(dm_pvalue=0.0499)["dm"] is True
     for key in ("crpss_vs_baseline", "spread_skill_ratio", "dm_pvalue", "twcrps_p95", "baseline_twcrps_p95"):
         assert not all(gates(**{key: None}).values())
+
+
+def gate_config(**gate_values: float) -> object:
+    """The repository config with some promotion-gate values replaced."""
+    raw = CFG.model_dump(mode="json")
+    raw["evaluation"]["promotion_gate"].update(gate_values)
+    return type(CFG).model_validate(raw)
+
+
+def test_skill_gate_boundary_at_exactly_five_percent() -> None:
+    # Owner decision of 2026-11-23: skill must be ABOVE 5 percent, under both estimators, with at
+    # least 20 members. Pinned here with explicit values, whatever configs/splits.yaml says later.
+    cfg = gate_config(min_crpss_vs_baseline=0.05, min_members_for_gate=20)
+
+    def gates(fair: float, ecdf: float, members: int = 20) -> dict[str, bool]:
+        entry = {
+            "crps": 1.0, "twcrps_p95": 0.2, "loss": 0.76, "n_pairs": 10, "baseline_twcrps_p95": 0.2,
+            "spread_skill_ratio": 1.0, "dm_pvalue": 0.01, "n_members": members,
+            "crpss_vs_baseline": fair, "crpss_vs_baseline_ecdf": ecdf,
+        }  # fmt: skip
+        return M.evaluate_gates({"all": entry}, cfg)
+
+    above = float(np.nextafter(0.05, 1.0))
+    below = float(np.nextafter(0.05, 0.0))
+    assert gates(0.05, 0.05)["skill"] is False  # exactly 5 percent is not enough
+    assert gates(above, above)["skill"] is True  # the next float64 above it is
+    assert gates(below, 0.9)["skill"] is False
+    assert gates(0.05, above)["skill"] is False  # fair at the boundary
+    assert gates(above, 0.05)["skill"] is False  # ecdf at the boundary
+    assert gates(0.9, 0.05)["skill"] is False
+    assert gates(0.0501, 0.0501)["skill"] is True
+    assert gates(0.04, 0.04)["skill"] is False  # passed the old rule (above 0), fails this one
+    assert all(gates(above, above).values())
+    # the member floor: 20 passes, 19 does not, and it does not depend on skill
+    assert gates(0.9, 0.9, members=20)["min_members"] is True
+    assert gates(0.9, 0.9, members=19)["min_members"] is False
+    assert not all(gates(0.9, 0.9, members=19).values())
+    # and the repository config carries exactly these values
+    assert (CFG.gate.min_crpss_vs_baseline, CFG.gate.min_members_for_gate) == (0.05, 20)
+
+
+def test_modest_gain_passes_or_fails_with_the_configured_minimum_skill() -> None:
+    # A real scoring run: the same forecasts judged with a 0 and with a 5 percent minimum.
+    rng = np.random.default_rng(41)
+    c = coords(200, (6, 24), 6)
+    shape = (200, 2, 6)
+    centre = 280 + 3 * rng.normal(size=shape)
+    obs = as_obs(centre + rng.normal(size=shape), c)
+    thr = flat_threshold(6, 283.0)
+    base = as_fcst(centre[..., None] + rng.normal(size=(*shape, N_MEM)), c)
+    # A candidate that knows a little of what the baseline does not: a real but modest gain.
+    partly_known = 0.85 * centre + 0.15 * obs.values
+    marginal = as_fcst(partly_known[..., None] + 0.86 * rng.normal(size=(*shape, N_MEM)), c)
+    result = score(marginal, obs, thr, base)
+    fair, ecdf = result["all"]["crpss_vs_baseline"], result["all"]["crpss_vs_baseline_ecdf"]
+    assert 0.0 < min(fair, ecdf) and max(fair, ecdf) < 0.30
+    for minimum in (0.0, min(fair, ecdf), max(fair, ecdf), 0.5):
+        expected = fair > minimum and ecdf > minimum
+        assert M.evaluate_gates(result, gate_config(min_crpss_vs_baseline=minimum))["skill"] is expected
+    assert M.evaluate_gates(result, gate_config(min_crpss_vs_baseline=min(fair, ecdf)))["skill"] is False
+    assert M.evaluate_gates(result, gate_config(min_crpss_vs_baseline=0.0))["skill"] is True
 
 
 # --- masking -----------------------------------------------------------------------------------
@@ -707,7 +780,7 @@ def test_lead_with_no_observations_is_undefined_not_zero() -> None:
         "spread_skill_ratio": None,
         "n_pairs": 0,
         "n_masked_no_threshold": 0,
-        "n_members": 20,
+        "n_members": N_MEM,
         "crpss_vs_baseline": None,
         "crpss_vs_baseline_ecdf": None,
         "baseline_twcrps_p95": None,
@@ -829,7 +902,7 @@ def test_placed_members_cannot_pass_the_gate() -> None:
     shape = (200, 2, 5)
     centre = 280 + 3 * rng.normal(size=shape)
     obs = as_obs(centre + rng.normal(size=shape), c)
-    honest = as_fcst(centre[..., None] + rng.normal(size=(*shape, 20)), c)  # calibrated, sampled
+    honest = as_fcst(centre[..., None] + rng.normal(size=(*shape, N_MEM)), c)  # calibrated, sampled
     thr = flat_threshold(5, 283.0)
 
     def placed(half_width: float) -> xr.DataArray:
@@ -858,14 +931,14 @@ def test_placed_members_cannot_pass_the_gate() -> None:
     assert tuned_gates["spread_skill"] is True  # the calibration band alone does not catch it
     assert (tuned_gates["skill"], tuned_gates["min_members"]) == (False, False)
 
-    # The member floor works on its own: an honest, better 7-member candidate is not eligible, 8 is.
+    # The member floor works on its own: an honest, better candidate with one member fewer than the
+    # floor is not eligible; with exactly the floor it is.
     weak_centre = centre + rng.normal(size=shape)
-    weak = as_fcst(weak_centre[..., None] + 2 * rng.normal(size=(*shape, 20)), c)
-    for n_mem, eligible in ((7, False), (8, True)):
+    weak = as_fcst(weak_centre[..., None] + 2 * rng.normal(size=(*shape, N_MEM)), c)
+    for n_mem, eligible in ((FLOOR - 1, False), (FLOOR, True)):
         gates = M.evaluate_gates(score(honest.isel(ens_member=slice(n_mem)), obs, thr, weak), CFG)
         assert gates["min_members"] is eligible
         assert (gates["skill"], gates["tail"], gates["dm"]) == (True, True, True)
-    assert CFG.gate.min_members_for_gate == 8
 
 
 # --- determinism -------------------------------------------------------------------------------
