@@ -315,7 +315,10 @@ def test_non_v1_lead_is_not_scored(tmp_path) -> None:
     assert "[9]" in result.output
 
 
-@pytest.mark.parametrize("case", ["missing", "model_id", "baseline_id", "variable", "members", "init_hour"])
+CASES = ["missing", "model_id", "baseline_id", "variable", "members", "init_hour", "nan_threshold"]
+
+
+@pytest.mark.parametrize("case", CASES)
 def test_bad_input_exits_2(tmp_path, case: str) -> None:
     syn = make_synthetic(n_init=6)
     extra: tuple[str, ...] = ()
@@ -326,6 +329,8 @@ def test_bad_input_exits_2(tmp_path, case: str) -> None:
         syn.candidate = syn.candidate.isel(ens_member=[0])
     elif case == "init_hour":
         syn.candidate = syn.candidate.assign_coords(init_time=syn.candidate["init_time"].values + HOUR * 3)
+    elif case == "nan_threshold":
+        syn.thresholds["t2m"].values[2, :] = np.nan
     stores = _stores(tmp_path, syn)
     if case == "missing":
         stores["forecast"] = tmp_path / "nope.zarr"

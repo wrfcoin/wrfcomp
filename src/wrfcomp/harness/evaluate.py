@@ -99,7 +99,11 @@ def _open(path: Path, what: str) -> xr.Dataset:
         raise BadInputError(f"{what}: no such file or directory: {path.name}")
     try:
         if path.is_dir():
-            return xr.open_zarr(path, chunks=None)
+            # Stores with and without consolidated metadata are both fine; try the cheap one first.
+            try:
+                return xr.open_zarr(path, chunks=None, consolidated=True)
+            except (KeyError, ValueError, FileNotFoundError):
+                return xr.open_zarr(path, chunks=None, consolidated=False)
         return xr.open_dataset(path)
     except Exception as exc:
         raise BadInputError(f"{what}: cannot open {path.name}: {exc}") from exc
@@ -242,7 +246,10 @@ def run_evaluation(
         fc = forecast[name].transpose(*POINT_DIMS, ENS_DIM)
         bl = baseline[name].transpose(*POINT_DIMS, ENS_DIM) if baseline is not None else None
         tail = thresholds[name].sel(station_id=forecast["station_id"].values).load()
-        metrics[name] = score_variable(fc, obs[name], tail, bl, cfg=cfg)
+        try:
+            metrics[name] = score_variable(fc, obs[name], tail, bl, cfg=cfg)
+        except ValueError as exc:  # for example a NaN threshold at a point with valid truth
+            raise BadInputError(f"{name}: {exc}") from exc
         gates[name] = evaluate_gates(metrics[name], cfg)
         n_pairs[name] = int(metrics[name]["all"]["n_pairs"])
 
@@ -297,6 +304,9 @@ def evaluate(
                 allow_sealed=allow_sealed,
             )
         sealed = [str(w.message) for w in caught if "SEALED SPLIT IN USE" in str(w.message)]
+        for line in sorted({f"{w.category.__name__}: {w.message}" for w in caught}):
+            if "SEALED SPLIT IN USE" not in line:
+                typer.echo(f"warning: {line}", err=True)
         if sealed:
             bar = "!" * 78
             typer.echo(f"{bar}\nWARNING: --allow-sealed is set and sealed-split data was scored.", err=True)
