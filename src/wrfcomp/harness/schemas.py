@@ -33,7 +33,7 @@ THRESHOLD_DIMS = ("station_id", "month")
 STATION_COORDS = ("latitude", "longitude", "elevation_m")
 STATION_ID_LENGTH = 11
 MIN_ENS_MEMBERS = 2
-GATE_NAMES = ("skill", "tail", "spread_skill", "dm")
+GATE_NAMES = ("skill", "tail", "spread_skill", "dm", "min_members")
 
 
 class SchemaError(ValueError):
@@ -237,13 +237,21 @@ def current_harness_version() -> HarnessVersion:
 class LeadMetrics(_Strict):
     """Metrics for one variable at one lead (or `"all"`). `None` means not defined, never zero."""
 
+    # fair estimator (headline)
     crps: float | None
     twcrps_p95: float | None
     loss: float | None
+    # plain ensemble (ecdf) estimator of the same three
+    crps_ecdf: float | None
+    twcrps_p95_ecdf: float | None
+    loss_ecdf: float | None
     spread_skill_ratio: float | None
     n_pairs: int = Field(ge=0)
+    n_members: int = Field(ge=MIN_ENS_MEMBERS)
     crpss_vs_baseline: float | None = None
+    crpss_vs_baseline_ecdf: float | None = None
     baseline_twcrps_p95: float | None = None
+    baseline_twcrps_p95_ecdf: float | None = None
     dm_pvalue: float | None = Field(default=None, ge=0.0, le=1.0)
 
 

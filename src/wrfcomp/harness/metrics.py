@@ -2,9 +2,10 @@
 
 Rules this module follows (see docs/VERIFICATION_PROTOCOL.md and configs/splits.yaml):
 
-* **Evaluation grid.** The caller names the init times and stations to be scored (`init_times`,
-  `station_ids`). They must come from the protocol (configured init hours over the scored period, the
-  stations file), never from the forecast being scored. Observations must sit on exactly that grid;
+* **Evaluation grid.** The caller names the init times and stations to be scored
+  (`expected_init_times`, `expected_station_ids`). They must come from the protocol (configured init
+  hours over the scored period, the stations file), never from the forecast being scored.
+  Observations must sit on exactly that grid;
   the candidate and the baseline must cover all of it, so a forecast cannot drop a station or a date.
   Whole leads are the one exception: the leads scored are the candidate's leads.
 * **Mask.** A grid point `(init_time, lead_time, station_id)` is scored when its observation is finite.
@@ -15,7 +16,12 @@ Rules this module follows (see docs/VERIFICATION_PROTOCOL.md and configs/splits.
   members placed deliberately: two fixed members score exactly 0 whenever the observation falls
   between them, and members fixed at inflated quantiles beat the true distribution while staying
   inside the spread-skill band (by about 45 % with 2 members, 21 % with 5, 10 % with 10, 5 % with 20,
-  3 % with 32). This module cannot tell sampled members from placed ones; that is a protocol matter.
+  3 % with 32). The kernel cannot tell sampled members from placed ones, so it has two defences.
+  Every CRPS is also computed with the plain ensemble ("ecdf") estimator, which has no such hole
+  (it is biased high for small sampled ensembles instead), both are reported, and the skill gate
+  needs skill above the minimum under BOTH estimators. And an ensemble with fewer than
+  `min_members_for_gate` members (config, default 8) is scored but can never pass the gate.
+  The tail gate and the Diebold-Mariano test use the fair estimator.
 * **Averages.** `crps`, `twcrps_p95` and the spread-skill terms are plain means over the scored points
   of a lead, or of every lead for `"all"`. Nothing is weighted.
 * **Undefined is `None`.** A metric that cannot be computed (no scored points, a zero baseline loss,
@@ -59,6 +65,7 @@ from __future__ import annotations
 import math
 import warnings
 from collections.abc import Sequence
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -101,6 +108,16 @@ def fair_crps(fcst: xr.DataArray, obs: xr.DataArray) -> xr.DataArray:
     )
 
 
+def ecdf_crps(fcst: xr.DataArray, obs: xr.DataArray) -> xr.DataArray:
+    """Pointwise CRPS of the ensemble's empirical distribution (no averaging). NaN where obs is NaN.
+
+    Proper for any member set, sampled or placed, but biased high for a small sampled ensemble.
+    """
+    return crps_for_ensemble(
+        _prepare_ensemble(fcst), _as_float64(obs), ENS_DIM, method="ecdf", preserve_dims="all"
+    )
+
+
 def broadcast_threshold(
     threshold: xr.DataArray, init_time: xr.DataArray, lead_time: xr.DataArray
 ) -> xr.DataArray:
@@ -117,8 +134,16 @@ def broadcast_threshold(
     return out.transpose("init_time", "lead_time", "station_id")
 
 
-def tail_crps(fcst: xr.DataArray, obs: xr.DataArray, threshold: xr.DataArray | float) -> xr.DataArray:
-    """Pointwise threshold-weighted fair CRPS for the upper tail (weight 1 at or above the threshold).
+def tail_crps(
+    fcst: xr.DataArray,
+    obs: xr.DataArray,
+    threshold: xr.DataArray | float,
+    *,
+    method: Literal["fair", "ecdf"] = "fair",
+) -> xr.DataArray:
+    """Pointwise threshold-weighted CRPS for the upper tail (weight 1 at or above the threshold).
+
+    `method` picks the estimator: "fair" (default, the headline score) or "ecdf".
 
     Uses `scores.probability.tw_crps_for_ensemble` with the chaining function `v(x) = max(x, t)`,
     which is the same as clipping forecast and observation from below at `t`. A `threshold` with a
@@ -138,7 +163,7 @@ def tail_crps(fcst: xr.DataArray, obs: xr.DataArray, threshold: xr.DataArray | f
         return np.maximum(values, threshold)  # NaN stays NaN
 
     return tw_crps_for_ensemble(
-        fcst, _as_float64(obs), ENS_DIM, _clip_below, method="fair", preserve_dims="all"
+        fcst, _as_float64(obs), ENS_DIM, _clip_below, method=method, preserve_dims="all"
     )
 
 
@@ -345,12 +370,17 @@ def _require_finite_at(fcst: xr.DataArray, mask: np.ndarray, name: str) -> None:
         )
 
 
-def _pointwise(
-    fcst: xr.DataArray, obs: xr.DataArray, threshold: xr.DataArray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _pointwise(fcst: xr.DataArray, obs: xr.DataArray, threshold: xr.DataArray) -> dict[str, np.ndarray]:
     variance, sq_error = _spread_terms(fcst, obs)
-    arrays = (fair_crps(fcst, obs), tail_crps(fcst, obs, threshold), variance, sq_error)
-    return tuple(np.asarray(a.transpose(*POINT_DIMS).values, dtype=np.float64) for a in arrays)  # type: ignore[return-value]
+    arrays = {
+        "crps": fair_crps(fcst, obs),
+        "twcrps": tail_crps(fcst, obs, threshold),
+        "crps_ecdf": ecdf_crps(fcst, obs),
+        "twcrps_ecdf": tail_crps(fcst, obs, threshold, method="ecdf"),
+        "variance": variance,
+        "sq_error": sq_error,
+    }
+    return {k: np.asarray(a.transpose(*POINT_DIMS).values, dtype=np.float64) for k, a in arrays.items()}
 
 
 def _finite_or_none(value: float) -> float | None:
@@ -362,19 +392,39 @@ def _masked_mean(values: np.ndarray, mask: np.ndarray) -> float:
     return float(np.mean(values[mask]))
 
 
+_SUMMARY_KEYS = (
+    "crps", "twcrps_p95", "loss", "crps_ecdf", "twcrps_p95_ecdf", "loss_ecdf", "spread_skill_ratio"
+)  # fmt: skip
+
+
 def _summary(
-    crps: np.ndarray, twcrps: np.ndarray, variance: np.ndarray, sq_error: np.ndarray, mask: np.ndarray,
-    cfg: HarnessConfig,
+    arrays: dict[str, np.ndarray], index: slice, mask: np.ndarray, cfg: HarnessConfig
 ) -> dict[str, float | None]:
-    crps_mean, tw_mean = _masked_mean(crps, mask), _masked_mean(twcrps, mask)
-    mean_sq_error = _masked_mean(sq_error, mask)
-    ratio = math.sqrt(_masked_mean(variance, mask) / mean_sq_error) if mean_sq_error > 0 else math.nan
-    return {
-        "crps": _finite_or_none(crps_mean),
-        "twcrps_p95": _finite_or_none(tw_mean),
-        "loss": _finite_or_none(composite_loss(crps_mean, tw_mean, cfg)),
-        "spread_skill_ratio": _finite_or_none(ratio),
+    """Means over the scored points of the leads in `index`. `mask` is already cut to `index`."""
+    mean = {key: _masked_mean(values[:, index, :], mask) for key, values in arrays.items()}
+    ratio = math.sqrt(mean["variance"] / mean["sq_error"]) if mean["sq_error"] > 0 else math.nan
+    values = {
+        "crps": mean["crps"],
+        "twcrps_p95": mean["twcrps"],
+        "loss": composite_loss(mean["crps"], mean["twcrps"], cfg),
+        "crps_ecdf": mean["crps_ecdf"],
+        "twcrps_p95_ecdf": mean["twcrps_ecdf"],
+        "loss_ecdf": composite_loss(mean["crps_ecdf"], mean["twcrps_ecdf"], cfg),
+        "spread_skill_ratio": ratio,
     }
+    return {key: _finite_or_none(values[key]) for key in _SUMMARY_KEYS}
+
+
+_BASELINE_KEYS = (
+    "crpss_vs_baseline", "crpss_vs_baseline_ecdf", "baseline_twcrps_p95", "baseline_twcrps_p95_ecdf",
+    "dm_pvalue",
+)  # fmt: skip
+
+
+def _skill(loss: float | None, base_loss: float | None) -> float | None:
+    if loss is None or base_loss is None or not base_loss > 0:
+        return None
+    return _finite_or_none(1.0 - loss / base_loss)
 
 
 def _per_init_mean(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -395,14 +445,14 @@ def score_variable(
     baseline: xr.DataArray | None = None,
     *,
     cfg: HarnessConfig,
-    init_times: Sequence[np.datetime64] | np.ndarray,
-    station_ids: Sequence[str] | np.ndarray,
+    expected_init_times: Sequence[np.datetime64] | np.ndarray,
+    expected_station_ids: Sequence[str] | np.ndarray,
 ) -> dict[str, MetricValues]:
     """Score one variable. Keys are `"all"` and each lead in whole hours as a string.
 
-    `init_times` and `station_ids` are the evaluation grid. Build them from the protocol
-    (`evaluation_init_times`, the stations file), NOT from the forecast: they are what stops a
-    forecast from leaving out a station or a date.
+    `expected_init_times` and `expected_station_ids` are the evaluation grid. Build them from the
+    protocol (`evaluation_init_times`, the configured stations file), NOT from the forecast: they are
+    what stops a forecast from leaving out a station or a date.
 
     `obs` has dims `(init_time, lead_time, station_id)`, exactly the grid's init times and stations,
     and at least the forecast's leads. `fcst` and `baseline` have dims
@@ -411,12 +461,14 @@ def score_variable(
     must have all of them. `tail_threshold` has dims `(station_id, month)` and must be finite wherever
     it is needed.
 
-    Each entry has `crps`, `twcrps_p95`, `loss`, `spread_skill_ratio`, `n_pairs`, and with a baseline
-    also `crpss_vs_baseline`, `baseline_twcrps_p95`, `dm_pvalue`. See the module docstring for the rules.
+    Each entry has `crps`, `twcrps_p95`, `loss` (fair estimator), `crps_ecdf`, `twcrps_p95_ecdf`,
+    `loss_ecdf` (ecdf estimator), `spread_skill_ratio`, `n_pairs`, `n_members`, and with a baseline
+    also `crpss_vs_baseline`, `crpss_vs_baseline_ecdf`, `baseline_twcrps_p95`,
+    `baseline_twcrps_p95_ecdf`, `dm_pvalue`. See the module docstring for the rules.
     """
     grid = {
-        "init_time": pd.Index(np.asarray(init_times).astype("datetime64[ns]")),
-        "station_id": pd.Index(np.asarray(station_ids, dtype=object)),
+        "init_time": pd.Index(np.asarray(expected_init_times).astype("datetime64[ns]")),
+        "station_id": pd.Index(np.asarray(expected_station_ids, dtype=object)),
     }
     for dim, index in grid.items():
         if index.size == 0 or index.hasnans or not index.is_unique:
@@ -473,26 +525,30 @@ def score_variable(
         _require_finite_at(baseline, mask, "baseline")
         base = _pointwise(baseline, obs, threshold)
         weights = cfg.gate.loss_weights
-        loss_diff = weights.crps_fair * (base[0] - cand[0]) + weights.twcrps_p95 * (base[1] - cand[1])
+        loss_diff = weights.crps_fair * (base["crps"] - cand["crps"]) + weights.twcrps_p95 * (
+            base["twcrps"] - cand["twcrps"]
+        )
     scored_init_times = fcst["init_time"].values
+    n_members = int(fcst.sizes[ENS_DIM])
 
     def entry(index: slice, lead_for_lag: int) -> MetricValues:
         sub_mask = mask[:, index, :]
         n_pairs = int(np.count_nonzero(sub_mask))
-        out: MetricValues = {"crps": None, "twcrps_p95": None, "loss": None, "spread_skill_ratio": None}
+        out: MetricValues = dict.fromkeys(_SUMMARY_KEYS)
         if n_pairs:
-            out.update(_summary(*(a[:, index, :] for a in cand), sub_mask, cfg))
+            out.update(_summary(cand, index, sub_mask, cfg))
         out["n_pairs"] = n_pairs
+        out["n_members"] = n_members
         if base is None or loss_diff is None:
             return out
-        out.update({"crpss_vs_baseline": None, "baseline_twcrps_p95": None, "dm_pvalue": None})
+        out.update(dict.fromkeys(_BASELINE_KEYS))
         if not n_pairs:
             return out
-        base_summary = _summary(*(a[:, index, :] for a in base), sub_mask, cfg)
+        base_summary = _summary(base, index, sub_mask, cfg)
+        out["crpss_vs_baseline"] = _skill(out["loss"], base_summary["loss"])
+        out["crpss_vs_baseline_ecdf"] = _skill(out["loss_ecdf"], base_summary["loss_ecdf"])
         out["baseline_twcrps_p95"] = base_summary["twcrps_p95"]
-        loss, base_loss = out["loss"], base_summary["loss"]
-        if loss is not None and base_loss is not None and base_loss > 0:
-            out["crpss_vs_baseline"] = _finite_or_none(1.0 - loss / base_loss)
+        out["baseline_twcrps_p95_ecdf"] = base_summary["twcrps_p95_ecdf"]
         series = xr.DataArray(
             _per_init_mean(loss_diff[:, index, :], sub_mask),
             dims="init_time",
@@ -508,23 +564,31 @@ def score_variable(
 
 
 def evaluate_gates(metrics: dict[str, MetricValues], cfg: HarnessConfig) -> dict[str, bool]:
-    """The four protocol gates for one variable, judged on its `"all"` entry.
+    """The promotion gates for one variable, judged on its `"all"` entry.
 
-    Keys: `skill` (`crpss_vs_baseline` above the configured minimum), `tail` (`twcrps_p95` not above
-    the baseline's), `spread_skill` (ratio inside the configured band) and `dm` (p-value below alpha).
+    Keys: `skill` (`crpss_vs_baseline` AND `crpss_vs_baseline_ecdf` above the configured minimum),
+    `tail` (`twcrps_p95` not above the baseline's), `spread_skill` (ratio inside the configured band),
+    `dm` (p-value below alpha) and `min_members` (at least `min_members_for_gate` members).
     A missing or `None` value fails its gate, so without a baseline `skill`, `tail` and `dm` are False.
     """
     if "all" not in metrics:
         raise ValueError("metrics has no 'all' entry")
     entry = metrics["all"]
     gate = cfg.gate
-    crpss = entry.get("crpss_vs_baseline")
+    crpss, crpss_ecdf = entry.get("crpss_vs_baseline"), entry.get("crpss_vs_baseline_ecdf")
     twcrps, base_twcrps = entry.get("twcrps_p95"), entry.get("baseline_twcrps_p95")
     ratio = entry.get("spread_skill_ratio")
     pvalue = entry.get("dm_pvalue")
+    n_members = entry.get("n_members")
     return {
-        "skill": crpss is not None and crpss > gate.min_crpss_vs_baseline,
+        "skill": (
+            crpss is not None
+            and crpss_ecdf is not None
+            and crpss > gate.min_crpss_vs_baseline
+            and crpss_ecdf > gate.min_crpss_vs_baseline
+        ),
         "tail": twcrps is not None and base_twcrps is not None and twcrps <= base_twcrps,
         "spread_skill": ratio is not None and gate.spread_skill_min <= ratio <= gate.spread_skill_max,
         "dm": pvalue is not None and pvalue < gate.alpha_dm,
+        "min_members": n_members is not None and n_members >= gate.min_members_for_gate,
     }

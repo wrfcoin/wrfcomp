@@ -85,6 +85,7 @@ def test_load_config_matches_yaml() -> None:
     assert cfg.gate.spread_skill_min == gate["spread_skill_min"]
     assert cfg.gate.spread_skill_max == gate["spread_skill_max"]
     assert cfg.gate.tail_quantile == gate["tail_quantile"]
+    assert cfg.gate.min_members_for_gate == gate["min_members_for_gate"] == 8
     assert cfg.gate.loss_weights.crps_fair == gate["loss_weights"]["crps_fair"]
     assert cfg.gate.loss_weights.twcrps_p95 == gate["loss_weights"]["twcrps_p95"]
 
@@ -96,6 +97,9 @@ def test_config_is_frozen() -> None:
     with pytest.raises(ValidationError):
         cfg.gate.alpha_dm = 0.5  # type: ignore[misc]
     assert isinstance(cfg.evaluation.lead_hours, tuple)
+
+
+PATH_MIN_MEMBERS = ("evaluation", "promotion_gate", "min_members_for_gate")
 
 
 def _mutated(path: tuple[str, ...], value: object) -> dict:
@@ -122,6 +126,15 @@ def _mutated(path: tuple[str, ...], value: object) -> dict:
 def test_config_rejects_bad_values(path: tuple[str, ...], value: object) -> None:
     with pytest.raises(ValidationError):
         HarnessConfig.model_validate(_mutated(path, value))
+
+
+def test_min_members_for_gate_default_and_bounds() -> None:
+    raw = copy.deepcopy(yaml.safe_load(DEFAULT_CONFIG_PATH.read_text()))
+    raw["evaluation"]["promotion_gate"].pop("min_members_for_gate")
+    assert HarnessConfig.model_validate(raw).gate.min_members_for_gate == 8  # default when absent
+    assert HarnessConfig.model_validate(_mutated(PATH_MIN_MEMBERS, 16)).gate.min_members_for_gate == 16
+    with pytest.raises(ValidationError):
+        HarnessConfig.model_validate(_mutated(PATH_MIN_MEMBERS, 1))
 
 
 def test_load_config_missing_file(tmp_path: Path) -> None:
@@ -302,10 +315,16 @@ def _lead_metrics(n_pairs: int) -> dict:
         "crps": 0.8,
         "twcrps_p95": 0.1,
         "loss": 0.59,
+        "crps_ecdf": 0.83,
+        "twcrps_p95_ecdf": 0.11,
+        "loss_ecdf": 0.614,
         "spread_skill_ratio": 0.97,
         "n_pairs": n_pairs,
+        "n_members": 20,
         "crpss_vs_baseline": 0.12,
+        "crpss_vs_baseline_ecdf": 0.1,
         "baseline_twcrps_p95": 0.11,
+        "baseline_twcrps_p95_ecdf": 0.12,
         "dm_pvalue": 0.001,
     }
 
@@ -356,11 +375,14 @@ def test_scorecard_without_baseline() -> None:
     payload["baseline_id"] = None
     payload["baseline_sha256"] = None
     for entry in payload["metrics"]["t2m"].values():
-        for key in ("crpss_vs_baseline", "baseline_twcrps_p95", "dm_pvalue"):
-            entry.pop(key)
+        for key in list(entry):
+            if "baseline" in key or key == "dm_pvalue":
+                entry.pop(key)
     with pytest.raises(ValidationError, match="baseline"):
         Scorecard.model_validate(payload)  # still claims passed_gate
-    payload["gates"] = {"t2m": {"skill": False, "tail": False, "spread_skill": True, "dm": False}}
+    payload["gates"] = {
+        "t2m": {"skill": False, "tail": False, "spread_skill": True, "dm": False, "min_members": True}
+    }
     payload["passed_gate"] = False
     card = Scorecard.model_validate(payload)
     assert card.metrics["t2m"]["all"].dm_pvalue is None
@@ -394,6 +416,10 @@ def _break_scorecard(case: str) -> dict:
         p["metrics"]["t2m"]["1"]["dm_pvalue"] = 1.5
     elif case == "baseline_id_without_sha":
         p["baseline_sha256"] = None
+    elif case == "one_member":
+        p["metrics"]["t2m"]["1"]["n_members"] = 1
+    elif case == "missing_ecdf":
+        p["metrics"]["t2m"]["1"].pop("crps_ecdf")
     elif case == "period_with_offset":
         p["period_start"] = "2024-03-01T00:00:00Z"
     elif case == "period_reversed":
@@ -427,6 +453,8 @@ def _break_scorecard(case: str) -> dict:
         "nan_metric",
         "pvalue_above_one",
         "baseline_id_without_sha",
+        "one_member",
+        "missing_ecdf",
         "period_with_offset",
         "period_reversed",
         "period_missing",

@@ -65,8 +65,8 @@ def score(
         threshold,
         baseline,
         cfg=cfg,
-        init_times=obs["init_time"].values,
-        station_ids=obs["station_id"].values.tolist(),
+        expected_init_times=obs["init_time"].values,
+        expected_station_ids=obs["station_id"].values.tolist(),
     )
 
 
@@ -77,7 +77,16 @@ def brute_fair_crps(members: np.ndarray, y: float) -> float:
     return term1 - term2
 
 
-def brute_pointwise(fcst: xr.DataArray, obs: xr.DataArray, clip: np.ndarray | None = None) -> np.ndarray:
+def brute_ecdf_crps(members: np.ndarray, y: float) -> float:
+    m = len(members)
+    term1 = sum(abs(float(x) - y) for x in members) / m
+    term2 = sum(abs(float(a) - float(b)) for a in members for b in members) / (2 * m * m)
+    return term1 - term2
+
+
+def brute_pointwise(
+    fcst: xr.DataArray, obs: xr.DataArray, clip: np.ndarray | None = None, *, kernel: object = None
+) -> np.ndarray:
     f = fcst.transpose(*FCST_DIMS).values.astype(np.float64)
     o = obs.transpose(*POINT_DIMS).values.astype(np.float64)
     out = np.full(o.shape, np.nan)
@@ -87,7 +96,7 @@ def brute_pointwise(fcst: xr.DataArray, obs: xr.DataArray, clip: np.ndarray | No
         members, y = f[idx], o[idx]
         if clip is not None:
             members, y = np.maximum(members, clip[idx]), max(y, clip[idx])
-        out[idx] = brute_fair_crps(members, y)
+        out[idx] = (kernel or brute_fair_crps)(members, y)
     return out
 
 
@@ -135,6 +144,10 @@ def test_fair_crps_matches_brute_force() -> None:
     got = M.fair_crps(fcst, obs).transpose(*POINT_DIMS).values
     np.testing.assert_allclose(got, brute_pointwise(fcst, obs), rtol=1e-12, atol=1e-12)
     assert (got > 0).all()
+    ecdf = M.ecdf_crps(fcst, obs).transpose(*POINT_DIMS).values
+    brute_ecdf = brute_pointwise(fcst, obs, kernel=brute_ecdf_crps)
+    np.testing.assert_allclose(ecdf, brute_ecdf, rtol=1e-12, atol=1e-12)
+    assert (ecdf > got).all()  # the ecdf estimator is the fair one plus a positive spread term
 
 
 def test_fair_crps_two_members_by_hand() -> None:
@@ -167,6 +180,10 @@ def test_tail_crps_matches_brute_force_with_station_month_thresholds() -> None:
     got = M.tail_crps(fcst, obs, threshold).transpose(*POINT_DIMS).values
     np.testing.assert_allclose(got, brute_pointwise(fcst, obs, clip), rtol=1e-12, atol=1e-12)
     assert (got >= -1e-12).all()
+    got_ecdf = M.tail_crps(fcst, obs, threshold, method="ecdf").transpose(*POINT_DIMS).values
+    np.testing.assert_allclose(
+        got_ecdf, brute_pointwise(fcst, obs, clip, kernel=brute_ecdf_crps), rtol=1e-12, atol=1e-12
+    )
     # a threshold far below everything gives back the plain fair CRPS
     np.testing.assert_allclose(
         M.tail_crps(fcst, obs, -1e6).transpose(*POINT_DIMS).values, brute_pointwise(fcst, obs), rtol=1e-9
@@ -180,6 +197,7 @@ def test_tail_crps_is_zero_below_threshold() -> None:
     np.testing.assert_array_equal(M.tail_crps(fcst, obs, flat_threshold(4, above_everything)).values, 0.0)
     result = score(fcst, obs, flat_threshold(4, above_everything), cfg=CFG)
     assert result["all"]["twcrps_p95"] == 0.0
+    assert result["all"]["twcrps_p95_ecdf"] == 0.0
     assert result["all"]["loss"] == pytest.approx(0.70 * result["all"]["crps"])
 
 
@@ -340,6 +358,24 @@ def test_score_variable_matches_brute_force_and_schema() -> None:
         assert entry["twcrps_p95"] == pytest.approx(tw, rel=1e-10)
         assert entry["loss"] == pytest.approx(0.7 * crps + 0.3 * tw, rel=1e-10)
         assert entry["baseline_twcrps_p95"] == pytest.approx(base_tw, rel=1e-10)
+        assert entry["n_members"] == 6
+        ecdf = {
+            name: brute_pointwise(s[who], obs, c_, kernel=brute_ecdf_crps)[:, sel, :][m].mean()
+            for name, who, c_ in (
+                ("crps", "good", None),
+                ("tw", "good", clip),
+                ("base_crps", "base", None),
+                ("base_tw", "base", clip),
+            )
+        }
+        assert entry["crps_ecdf"] == pytest.approx(ecdf["crps"], rel=1e-10)
+        assert entry["twcrps_p95_ecdf"] == pytest.approx(ecdf["tw"], rel=1e-10)
+        assert entry["loss_ecdf"] == pytest.approx(0.7 * ecdf["crps"] + 0.3 * ecdf["tw"], rel=1e-10)
+        assert entry["baseline_twcrps_p95_ecdf"] == pytest.approx(ecdf["base_tw"], rel=1e-10)
+        assert entry["crpss_vs_baseline_ecdf"] == pytest.approx(
+            1 - (0.7 * ecdf["crps"] + 0.3 * ecdf["tw"]) / (0.7 * ecdf["base_crps"] + 0.3 * ecdf["base_tw"]),
+            rel=1e-9,
+        )
         assert entry["crpss_vs_baseline"] == pytest.approx(
             1 - (0.7 * crps + 0.3 * tw) / (0.7 * base_crps + 0.3 * base_tw), rel=1e-9
         )
@@ -352,6 +388,7 @@ def test_identical_baseline_has_zero_skill_and_fails() -> None:
     result = score(s["good"], s["obs"], s["threshold"], s["good"].copy(), cfg=CFG)
     for entry in result.values():
         assert entry["crpss_vs_baseline"] == 0.0
+        assert entry["crpss_vs_baseline_ecdf"] == 0.0
         assert entry["baseline_twcrps_p95"] == entry["twcrps_p95"]
         assert entry["dm_pvalue"] is None  # all differences are exactly zero: the test is undefined
     gates = M.evaluate_gates(result, CFG)
@@ -402,9 +439,12 @@ def test_better_on_average_but_worse_in_tail_fails() -> None:
 def test_no_baseline_means_gate_not_passed() -> None:
     s = synthetic(25, n_init=20)
     result = score(s["good"], s["obs"], s["threshold"], cfg=CFG)
-    assert set(result["all"]) == {"crps", "twcrps_p95", "loss", "spread_skill_ratio", "n_pairs"}
+    assert set(result["all"]) == {
+        "crps", "twcrps_p95", "loss", "crps_ecdf", "twcrps_p95_ecdf", "loss_ecdf",
+        "spread_skill_ratio", "n_pairs", "n_members",
+    }  # fmt: skip
     gates = M.evaluate_gates(result, CFG)
-    assert gates == {"skill": False, "tail": False, "spread_skill": True, "dm": False}
+    assert gates == {"skill": False, "tail": False, "spread_skill": True, "dm": False, "min_members": True}
     with pytest.raises(ValueError, match="'all'"):
         M.evaluate_gates({"6": result["6"]}, CFG)
 
@@ -413,11 +453,25 @@ def test_gate_boundaries() -> None:
     base = {"crps": 1.0, "twcrps_p95": 0.2, "loss": 0.76, "n_pairs": 10, "baseline_twcrps_p95": 0.2}
 
     def gates(**changes: float | None) -> dict[str, bool]:
-        entry = {**base, "crpss_vs_baseline": 0.1, "spread_skill_ratio": 1.0, "dm_pvalue": 0.01, **changes}
+        entry = {
+            **base,
+            "crpss_vs_baseline": 0.1,
+            "crpss_vs_baseline_ecdf": 0.1,
+            "spread_skill_ratio": 1.0,
+            "dm_pvalue": 0.01,
+            "n_members": 8,
+            **changes,
+        }
         return M.evaluate_gates({"all": entry}, CFG)
 
     assert all(gates().values())
     assert gates(crpss_vs_baseline=0.0)["skill"] is False  # strictly greater than the minimum
+    assert gates(crpss_vs_baseline_ecdf=0.0)["skill"] is False  # under BOTH estimators
+    assert gates(crpss_vs_baseline_ecdf=-0.2, crpss_vs_baseline=0.9)["skill"] is False
+    assert gates(crpss_vs_baseline_ecdf=None)["skill"] is False
+    assert gates(n_members=7)["min_members"] is False
+    assert gates(n_members=None)["min_members"] is False
+    assert gates(n_members=50)["min_members"] is True
     assert gates(twcrps_p95=0.2)["tail"] is True  # equal tail is "not worse"
     assert gates(twcrps_p95=0.2000001)["tail"] is False
     assert gates(spread_skill_ratio=0.85)["spread_skill"] is True
@@ -485,10 +539,16 @@ def test_lead_with_no_observations_is_undefined_not_zero() -> None:
         "crps": None,
         "twcrps_p95": None,
         "loss": None,
+        "crps_ecdf": None,
+        "twcrps_p95_ecdf": None,
+        "loss_ecdf": None,
         "spread_skill_ratio": None,
         "n_pairs": 0,
+        "n_members": 20,
         "crpss_vs_baseline": None,
+        "crpss_vs_baseline_ecdf": None,
         "baseline_twcrps_p95": None,
+        "baseline_twcrps_p95_ecdf": None,
         "dm_pvalue": None,
     }
     assert result["all"]["n_pairs"] == result["24"]["n_pairs"] > 0
@@ -535,7 +595,7 @@ def test_forecast_cannot_drop_a_station_or_a_date() -> None:
     cand = as_fcst(centre[..., None] + rng.normal(size=(*shape, 6)), c)
     base = as_fcst(centre[..., None] + 2 * rng.normal(size=(*shape, 6)), c)
     thr = flat_threshold(5, 285.0)
-    grid = {"init_times": grid_times, "station_ids": station_ids(5)}
+    grid = {"expected_init_times": grid_times, "expected_station_ids": station_ids(5)}
 
     def run(fcst: xr.DataArray, truth: xr.DataArray, baseline: xr.DataArray | None = base) -> dict:
         return M.score_variable(fcst, truth, thr, baseline, cfg=CFG, **grid)
@@ -572,12 +632,13 @@ def test_forecast_cannot_drop_a_station_or_a_date() -> None:
     big.loc[{"init_time": grid_times, "station_id": station_ids(5)}] = cand.values
     assert run(big, obs) == full
 
-    for bad in ({**grid, "station_ids": []}, {**grid, "station_ids": [*station_ids(5), station_ids(5)[0]]}):
+    duplicate = [*station_ids(5), station_ids(5)[0]]
+    for bad in ({**grid, "expected_station_ids": []}, {**grid, "expected_station_ids": duplicate}):
         with pytest.raises(ValueError, match="evaluation grid"):
             M.score_variable(cand, obs, thr, base, cfg=CFG, **bad)
     nat_grid = np.array([*grid_times, "NaT"], dtype="datetime64[ns]")
     with pytest.raises(ValueError, match="evaluation grid"):
-        M.score_variable(cand, obs, thr, base, cfg=CFG, init_times=nat_grid, station_ids=station_ids(5))
+        M.score_variable(cand, obs, thr, base, cfg=CFG, **{**grid, "expected_init_times": nat_grid})
 
 
 def test_evaluation_init_times() -> None:
@@ -601,25 +662,51 @@ def test_evaluation_init_times() -> None:
             M.evaluation_init_times(*args)
 
 
-def test_fixed_members_break_fair_crps_known_limit() -> None:
+def test_placed_members_cannot_pass_the_gate() -> None:
     # Fair CRPS assumes members are random draws. Two members placed on purpose score exactly 0
-    # whenever the observation lies between them. This pins the known limit (see the module docstring);
-    # the kernel does not defend against it.
+    # whenever the observation lies between them, so "wide" members look perfect under fair CRPS.
     rng = np.random.default_rng(32)
-    c = coords(200, (6,), 5)
-    shape = (200, 1, 5)
+    c = coords(200, (6, 24), 5)
+    shape = (200, 2, 5)
     centre = 280 + 3 * rng.normal(size=shape)
     obs = as_obs(centre + rng.normal(size=shape), c)
-    honest = as_fcst(centre[..., None] + rng.normal(size=(*shape, 2)), c)
-    placed = as_fcst(np.stack([centre - 0.97 * 0.6745, centre + 0.97 * 0.6745], axis=-1), c)
-    inside = np.abs(obs.values - centre.astype(np.float32)) < 0.6
-    assert inside.sum() > 300
-    np.testing.assert_allclose(M.fair_crps(placed, obs).values[inside], 0.0, atol=1e-4)
-    thr = flat_threshold(5, 400.0)
-    honest_score, placed_score = score(honest, obs, thr), score(placed, obs, thr)
-    assert honest_score["all"]["crps"] == pytest.approx(1 / math.sqrt(math.pi), rel=0.1)  # the true CRPS
-    assert placed_score["all"]["crps"] < 0.65 * honest_score["all"]["crps"]
-    assert M.evaluate_gates(placed_score, CFG)["spread_skill"] is True  # and the band does not catch it
+    honest = as_fcst(centre[..., None] + rng.normal(size=(*shape, 20)), c)  # calibrated, sampled
+    thr = flat_threshold(5, 283.0)
+
+    def placed(half_width: float) -> xr.DataArray:
+        return as_fcst(np.stack([centre - half_width, centre + half_width], axis=-1), c)
+
+    wide = placed(6.0)  # six error standard deviations either side: truth is always in between
+    np.testing.assert_allclose(M.fair_crps(wide, obs).values, 0.0, atol=1e-4)
+    result = score(wide, obs, thr, honest)
+    entry = result["all"]
+    assert entry["n_members"] == 2
+    assert entry["crpss_vs_baseline"] > 0.99  # the hole: "perfect" skill under the fair estimator
+    assert entry["crps_ecdf"] == pytest.approx(3.0, rel=1e-3)  # ecdf CRPS here is half the half-width
+    assert entry["crpss_vs_baseline_ecdf"] < -3  # and far worse than the honest ensemble
+    gates = M.evaluate_gates(result, CFG)
+    assert gates["skill"] is False
+    assert gates["min_members"] is False
+    assert gates["spread_skill"] is False
+    assert not all(gates.values())
+
+    # Tuned to sit inside the spread-skill band: still beats the true CRPS under fair, still refused.
+    tuned = score(placed(0.97 * 0.6745), obs, thr, honest)
+    assert tuned["all"]["crps"] < 0.65 / math.sqrt(math.pi)  # true CRPS of the unit-variance error
+    assert tuned["all"]["crpss_vs_baseline"] > 0.3
+    assert tuned["all"]["crpss_vs_baseline_ecdf"] < 0
+    tuned_gates = M.evaluate_gates(tuned, CFG)
+    assert tuned_gates["spread_skill"] is True  # the calibration band alone does not catch it
+    assert (tuned_gates["skill"], tuned_gates["min_members"]) == (False, False)
+
+    # The member floor works on its own: an honest, better 7-member candidate is not eligible, 8 is.
+    weak_centre = centre + rng.normal(size=shape)
+    weak = as_fcst(weak_centre[..., None] + 2 * rng.normal(size=(*shape, 20)), c)
+    for n_mem, eligible in ((7, False), (8, True)):
+        gates = M.evaluate_gates(score(honest.isel(ens_member=slice(n_mem)), obs, thr, weak), CFG)
+        assert gates["min_members"] is eligible
+        assert (gates["skill"], gates["tail"], gates["dm"]) == (True, True, True)
+    assert CFG.gate.min_members_for_gate == 8
 
 
 # --- determinism -------------------------------------------------------------------------------

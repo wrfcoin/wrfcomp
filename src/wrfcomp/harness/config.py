@@ -82,6 +82,8 @@ class PromotionGateConfig(_Frozen):
     spread_skill_max: float = Field(gt=0.0)
     tail_quantile: float = Field(gt=0.0, lt=1.0)
     tail_threshold_source: Literal["train"]
+    # Smaller ensembles are scored but can never pass the gate.
+    min_members_for_gate: int = Field(default=8, ge=2)
     loss_weights: LossWeights
 
     @model_validator(mode="after")
