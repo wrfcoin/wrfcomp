@@ -32,10 +32,10 @@ evaluation:
   stations_file: "configs/stations_conus.csv"
   promotion_gate:
     alpha_dm: 0.05
-    min_crpss_vs_baseline: 0.0
+    min_crpss_vs_baseline: 0.05     # owner decision 2026-11-23: evenly spaced members alone give ~5% at 20 members
     spread_skill_min: 0.85
     spread_skill_max: 1.15
-    min_members_for_gate: 8          # smaller ensembles are scored but can never pass the gate
+    min_members_for_gate: 20         # owner decision 2026-11-23; smaller ensembles are scored but can never pass
     tail_quantile: 0.95
     tail_threshold_source: "train"   # per station and calendar month, from the train split only
     loss_weights:
