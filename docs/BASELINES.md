@@ -16,21 +16,34 @@ UTC times. A run refuses windows that would reach the sealed period.
 
 ## Historical baselines
 
-Both baselines use 2014 through the inclusive training end in `configs/splits.yaml`.
-Climatology selects finite observations at the station and UTC valid hour within seven
-calendar days of the target on a circular leap-year calendar. Per variable it takes
-30 evenly spaced ranks in chronological order, rounding to the nearest index. Short
-samples repeat members. An empty sample yields NaN.
+Climatology and persistence write `model_version="2"` and cover leads of 1, 3, 6, 12,
+24 and 48 hours. Both use observations from 2014 onward for calibration. The inclusive
+cutoff is the earlier of the configured training end and the earliest initialization in
+the request. A report's measurement time is its hourly label plus its variable-specific
+`X_offset_min`, which must lie within ±15 minutes.
 
-Persistence checks hourly slots from initialization back through three hours, independently
-for each station and variable. The first finite observation with a valid offset and
-`valid_time + X_offset_min <= init_time` supplies the starting value. Without an eligible
-slot the forecast is NaN and the point is excluded for persistence only. At historical
-initializations with the same UTC hour, compute the verifying value minus the historical
-starting value for the same station, variable and lead. Both ends use training data. Add
-the linearly interpolated error quantiles at probabilities `(i + 0.5) / 30`,
-`i = 0..29`, to the current starting value. Missing calibration pairs drop out. An empty
-calibration sample yields NaN. Both models cover 1, 3, 6, 12, 24 and 48 hours.
+Both models use the same member rule. For `M` members, member `i` uses the empirical
+quantile at `(i + 0.5) / M`, for `i = 0, …, M − 1`. This selects the smallest sampled
+value whose cumulative frequency reaches that probability (NumPy's `inverted_cdf`).
+Values can repeat. The default ensemble size is the larger of 30 and
+`min_members_for_gate` in `configs/splits.yaml` (currently 8). Explicit member counts
+must meet that floor.
+
+**Climatology** builds a sample for each station, variable and forecast valid time.
+It selects finite observations at the same UTC hour within seven calendar days of the
+target date, wrapping across New Year on a common leap-year calendar. Each report's
+measurement time must be at or before the cutoff. Members are quantiles of the sampled
+values. An empty sample yields NaN for every member.
+
+**Persistence** checks the hourly slots from initialization back through three hours.
+For each station and variable, it takes the latest slot with a finite observation
+measured by initialization. Historical starting values use the same rule. For each
+station, variable, lead and UTC initialization hour, the calibration sample contains
+the verifying observation minus the historical starting value for each eligible pair.
+Both ends come from training data, and the verifying report must have been measured
+by the cutoff. Each forecast member adds one empirical error quantile to the current
+starting value. A missing starting value or an empty error sample yields NaN for
+every member. Points without an eligible starting value are excluded for persistence only.
 
 ## NOAA GEFS
 
