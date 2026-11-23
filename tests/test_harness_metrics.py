@@ -441,7 +441,7 @@ def test_no_baseline_means_gate_not_passed() -> None:
     result = score(s["good"], s["obs"], s["threshold"], cfg=CFG)
     assert set(result["all"]) == {
         "crps", "twcrps_p95", "loss", "crps_ecdf", "twcrps_p95_ecdf", "loss_ecdf",
-        "spread_skill_ratio", "n_pairs", "n_members",
+        "spread_skill_ratio", "n_pairs", "n_masked_no_threshold", "n_members",
     }  # fmt: skip
     gates = M.evaluate_gates(result, CFG)
     assert gates == {"skill": False, "tail": False, "spread_skill": True, "dm": False, "min_members": True}
@@ -530,6 +530,77 @@ def test_nan_obs_masked_identically_for_candidate_and_baseline() -> None:
         score(s["good"], obs, s["threshold"], broken_base, cfg=CFG)
 
 
+def test_missing_threshold_masks_the_point_for_every_model() -> None:
+    # 30 days of 6-hourly runs from 1 February: valid times fall in February and March.
+    s = synthetic(33, n_init=120, n_sta=6)
+    obs = s["obs"].copy()
+    obs.values[np.random.default_rng(34).random(obs.shape) < 0.1] = np.nan
+    thr = s["threshold"].copy()
+    thr.values[0, 2] = np.nan  # station 0 has no training data in March
+    thr.values[3, :] = np.nan  # station 3 has no training data at all
+    valid = s["coords"]["init_time"][:, None] + s["coords"]["lead_time"][None, :]
+    march = (pd.DatetimeIndex(valid.ravel()).month.values == 3).reshape(valid.shape)
+    assert march.any() and not march.all()
+    no_threshold = np.zeros(obs.shape, dtype=bool)
+    no_threshold[:, :, 0] = march
+    no_threshold[:, :, 3] = True
+    finite = np.isfinite(obs.values)
+    expected_mask = finite & ~no_threshold
+
+    mask = M.scoring_mask(obs, thr)
+    assert mask.dims == POINT_DIMS
+    np.testing.assert_array_equal(mask.values, expected_mask)
+    np.testing.assert_array_equal(
+        M.scoring_mask(obs.transpose("station_id", "init_time", "lead_time"), thr).values, expected_mask
+    )
+    np.testing.assert_array_equal(M.scoring_mask(obs, s["threshold"]).values, finite)
+
+    result = score(s["good"], obs, thr, s["base"])
+    for key, sel in (("all", slice(None)), ("6", slice(0, 1)), ("24", slice(1, 2))):
+        assert result[key]["n_pairs"] == int(expected_mask[:, sel, :].sum())
+        assert result[key]["n_masked_no_threshold"] == int((finite & no_threshold)[:, sel, :].sum())
+        assert result[key]["n_pairs"] + result[key]["n_masked_no_threshold"] == int(finite[:, sel, :].sum())
+    assert result["all"]["n_masked_no_threshold"] > 0
+
+    # Same numbers as if truth itself were missing at those points; only the bookkeeping differs.
+    cut = obs.where(~no_threshold)
+    as_if_missing = score(s["good"], cut, s["threshold"], s["base"])
+    for key in result:
+        got = {k: v for k, v in result[key].items() if k != "n_masked_no_threshold"}
+        want = {k: v for k, v in as_if_missing[key].items() if k != "n_masked_no_threshold"}
+        assert got == want
+        assert as_if_missing[key]["n_masked_no_threshold"] == 0
+
+    # The mask does not depend on the forecast: the baseline alone is scored on the same points, and
+    # what either forecast holds at a masked point (even NaN) changes nothing.
+    base_alone = score(s["base"], obs, thr)
+    for key in result:
+        assert base_alone[key]["n_pairs"] == result[key]["n_pairs"]
+        assert base_alone[key]["twcrps_p95"] == result[key]["baseline_twcrps_p95"]
+    cand2, base2 = s["good"].copy(), s["base"].copy()
+    cand2.values[no_threshold] = np.nan
+    base2.values[no_threshold] = np.inf
+    assert score(cand2, obs, thr, base2) == result
+
+    # The NaN rule still holds on every scored point, for both.
+    i, j, k = np.argwhere(expected_mask)[0]
+    broken = s["good"].copy()
+    broken.values[i, j, k, 0] = np.nan
+    with pytest.raises(ValueError, match="forecast has missing"):
+        score(broken, obs, thr, s["base"])
+    broken_base = s["base"].copy()
+    broken_base.values[i, j, k, 0] = np.nan
+    with pytest.raises(ValueError, match="baseline has missing"):
+        score(s["good"], obs, thr, broken_base)
+
+    # No threshold anywhere: nothing is scored, nothing is defined, no gate passes.
+    empty = score(s["good"], obs, thr.where(False), s["base"])
+    assert empty["all"]["n_pairs"] == 0 and empty["all"]["crps"] is None
+    assert empty["all"]["n_masked_no_threshold"] == int(finite.sum())
+    gates = M.evaluate_gates(empty, CFG)
+    assert (gates["skill"], gates["tail"], gates["spread_skill"], gates["dm"]) == (False,) * 4
+
+
 def test_lead_with_no_observations_is_undefined_not_zero() -> None:
     s = synthetic(27, n_init=30)
     obs = s["obs"].copy()
@@ -544,6 +615,7 @@ def test_lead_with_no_observations_is_undefined_not_zero() -> None:
         "loss_ecdf": None,
         "spread_skill_ratio": None,
         "n_pairs": 0,
+        "n_masked_no_threshold": 0,
         "n_members": 20,
         "crpss_vs_baseline": None,
         "crpss_vs_baseline_ecdf": None,
@@ -562,10 +634,6 @@ def test_score_variable_refuses_bad_inputs() -> None:
         score(good, obs, thr, base.isel(lead_time=[0]), cfg=CFG)
     with pytest.raises(ValueError, match="does not cover every station"):
         score(good, obs, thr.isel(station_id=slice(1, None)), cfg=CFG)
-    nan_thr = thr.copy()
-    nan_thr.values[0, 1] = np.nan  # February: every valid time of this case
-    with pytest.raises(ValueError, match="tail_threshold is not finite"):
-        score(good, obs, nan_thr, cfg=CFG)
     with pytest.raises(ValueError, match="must have dims"):
         score(good.isel(ens_member=0, drop=True), obs, thr, cfg=CFG)
     half_hour = good.assign_coords(lead_time=good["lead_time"].values + np.timedelta64(30, "m"))

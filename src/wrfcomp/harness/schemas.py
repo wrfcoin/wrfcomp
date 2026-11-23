@@ -284,6 +284,8 @@ class LeadMetrics(_Strict):
     loss_ecdf: float | None
     spread_skill_ratio: float | None
     n_pairs: int = Field(ge=0)
+    # points with a valid observation that were not scored because the tail threshold is missing
+    n_masked_no_threshold: int = Field(ge=0)
     n_members: int = Field(ge=MIN_ENS_MEMBERS)
     crpss_vs_baseline: float | None = None
     crpss_vs_baseline_ecdf: float | None = None

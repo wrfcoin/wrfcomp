@@ -16,7 +16,9 @@ What is scored
     Every primary variable (``configs/splits.yaml``) that the forecast has (the ones it lacks are listed
     in ``variables_missing``, and any entry there means ``passed_gate`` is false), at every v1 lead
     (``evaluation.lead_hours``) that the forecast has. Leads outside that list are not scored and are
-    named on stderr.
+    named on stderr. A point is scored when truth is finite there and the tail threshold of its
+    station, variable and month of the valid time is finite; the rest is masked for every model, and
+    each metrics entry counts the points lost to a missing threshold as ``n_masked_no_threshold``.
 
 Coverage
     The forecast must have every station in the config's ``stations_file`` (stations it has beyond that
@@ -59,7 +61,7 @@ from wrfcomp.harness.align import (
 )
 from wrfcomp.harness.config import HarnessConfig, load_config
 from wrfcomp.harness.hashing import content_sha256
-from wrfcomp.harness.metrics import evaluate_gates, evaluation_init_times, score_variable
+from wrfcomp.harness.metrics import evaluate_gates, evaluation_init_times, score_variable, scoring_mask
 from wrfcomp.harness.schemas import (
     SchemaError,
     Scorecard,
@@ -354,10 +356,16 @@ def _score_opened(
 
     obs = align_truth(forecast, truth, **seal).load()
     forecast = forecast.load()
-    check_nan_rule(forecast, obs, role="candidate")
+    # The NaN rule applies to the points that are scored: valid truth AND a tail threshold for that
+    # station and month. The mask comes from truth and training data only, the same for every model.
+    scored_obs = obs.copy()
+    for name in variables:
+        tail = thresholds[name].sel(station_id=forecast["station_id"].values).load()
+        scored_obs[name] = obs[name].where(scoring_mask(obs[name], tail))
+    check_nan_rule(forecast, scored_obs, role="candidate")
     if baseline is not None:
         baseline = baseline.load()
-        check_nan_rule(baseline, obs, role="baseline")
+        check_nan_rule(baseline, scored_obs, role="baseline")
 
     # The evaluation grid handed to the kernel: the stations file, and every init time of the scored
     # period at the hours of day this run uses. The checks above already refused a forecast that does
@@ -384,7 +392,7 @@ def _score_opened(
                 expected_init_times=grid_init,
                 expected_station_ids=grid_stations,
             )
-        except ValueError as exc:  # for example a NaN threshold at a point with valid truth
+        except ValueError as exc:  # anything the kernel refuses that the checks above did not catch
             raise BadInputError(f"{name}: {exc}") from exc
         gates[name] = evaluate_gates(metrics[name], cfg)
         n_pairs[name] = int(metrics[name]["all"]["n_pairs"])
