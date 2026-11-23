@@ -2,19 +2,31 @@
 
 Rules this module follows (see docs/VERIFICATION_PROTOCOL.md and configs/splits.yaml):
 
-* **Mask.** A point `(init_time, lead_time, station_id)` is scored when its observation is finite.
+* **Evaluation grid.** The caller names the init times and stations to be scored (`init_times`,
+  `station_ids`). They must come from the protocol (configured init hours over the scored period, the
+  stations file), never from the forecast being scored. Observations must sit on exactly that grid;
+  the candidate and the baseline must cover all of it, so a forecast cannot drop a station or a date.
+  Whole leads are the one exception: the leads scored are the candidate's leads.
+* **Mask.** A grid point `(init_time, lead_time, station_id)` is scored when its observation is finite.
   That one mask is used for the candidate and for the baseline. A forecast (candidate or baseline)
   that is not finite at a scored point is an error, never a silently skipped point.
+* **Members are a sample.** Fair CRPS and the spread-skill correction assume the members are
+  exchangeable random draws from the forecast distribution. Fair CRPS is not a proper score for
+  members placed deliberately: two fixed members score exactly 0 whenever the observation falls
+  between them, and members fixed at inflated quantiles beat the true distribution while staying
+  inside the spread-skill band (by about 45 % with 2 members, 21 % with 5, 10 % with 10, 5 % with 20,
+  3 % with 32). This module cannot tell sampled members from placed ones; that is a protocol matter.
 * **Averages.** `crps`, `twcrps_p95` and the spread-skill terms are plain means over the scored points
   of a lead, or of every lead for `"all"`. Nothing is weighted.
 * **Undefined is `None`.** A metric that cannot be computed (no scored points, a zero baseline loss,
   a Diebold-Mariano series that is too short or all zero) is `None`, and a `None` never passes a gate.
 * **Diebold-Mariano.** The series is, per init time, the mean over the scored stations of
   `baseline loss - candidate loss`, with the composite loss taken point by point. Init times with no
-  scored station are NaN. NaNs are dropped and the remaining values are treated as consecutive (this
-  is also what `scores` does); a gap therefore shortens the series and is not interpolated. The lag is
-  `h = max(1, ceil(lead / spacing))`, where spacing is the smallest gap between init times, so an
-  uneven series gets the larger (more cautious) lag. `"all"` averages the leads per init time and
+  scored station are NaN. The test needs an evenly spaced series, because the autocovariance is
+  estimated by position: leading and trailing NaNs are trimmed, and if what remains has a NaN inside
+  it, or the init times are not evenly spaced, the p-value is undefined (`None`). Nothing is dropped
+  from the middle or interpolated. The lag is `h = max(1, ceil(lead / spacing))` with spacing the
+  step between init times. `"all"` averages the leads per init time and
   uses the lag of the longest lead. The test statistic is the Hering-Genton ("HG") form from
   `scores`, compared against Student's t with `n - 1` degrees of freedom; the p-value is one-sided
   (small when the candidate is better). HG fits an exponential model to the autocovariances of the
@@ -46,8 +58,10 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Sequence
 
 import numpy as np
+import pandas as pd
 import scipy.stats
 import xarray as xr
 from scores.probability import crps_for_ensemble, tw_crps_for_ensemble
@@ -136,11 +150,15 @@ def _thresholds_one(da: xr.DataArray, quantile: float, train_end: np.datetime64)
         raise ValueError("train truth is empty")
     if not np.issubdtype(times.dtype, np.datetime64):
         raise ValueError("train truth valid_time must be datetime64")
-    latest = times.max()
-    if latest > train_end:
+    # Checked on every timestamp, before any value is read. NaT compares false to everything and
+    # poisons max(), so it is refused on its own.
+    if np.isnat(times).any():
+        raise ValueError("refusing to compute tail thresholds: truth has invalid (NaT) times")
+    late = times > train_end
+    if late.any():
         raise ValueError(
-            f"refusing to compute tail thresholds: truth has times after the train split end "
-            f"({latest} > {train_end})"
+            f"refusing to compute tail thresholds: truth has {int(late.sum())} time(s) after the train "
+            f"split end (latest {times[late].max()} > {train_end})"
         )
     data = _as_float64(da).load()
     with warnings.catch_warnings():
@@ -219,14 +237,6 @@ def dm_lag(lead_hours: float, init_spacing_hours: float) -> int:
     return max(1, math.ceil(lead_hours / init_spacing_hours))
 
 
-def _init_spacing_hours(init_times: np.ndarray) -> float | None:
-    """Smallest gap between distinct init times in hours, or None with fewer than two."""
-    unique = np.unique(init_times.astype("datetime64[ns]"))
-    if unique.size < 2:
-        return None
-    return float(np.diff(unique).min() / np.timedelta64(1, "ns")) / _HOUR_NS
-
-
 def diebold_mariano_pvalue(
     loss_diff: xr.DataArray,
     lead_hours: float,
@@ -237,23 +247,33 @@ def diebold_mariano_pvalue(
     """One-sided p-value that the candidate is better than the baseline.
 
     `loss_diff` is the per-`init_time` series of station-mean `baseline loss - candidate loss`
-    (positive = candidate better). `init_spacing_hours` defaults to the smallest gap in the
-    `init_time` coordinate. NaNs are dropped (see the module docstring). Returns `None` when the test
-    is not defined: fewer than two init times, a series not longer than the lag, or all differences
-    exactly zero.
+    (positive = candidate better). The spacing is the step of the `init_time` coordinate;
+    `init_spacing_hours`, if given, must equal it. Leading and trailing NaNs are trimmed. Returns
+    `None` when the test is not defined: a NaN inside the series, unevenly spaced init times, fewer
+    than two init times, a series not longer than the lag, or all differences exactly zero.
     """
     if loss_diff.dims != ("init_time",):
         raise ValueError(f"loss_diff must have dims (init_time,), got {tuple(loss_diff.dims)}")
     series = loss_diff.sortby("init_time")
-    if init_spacing_hours is None:
-        init_spacing_hours = _init_spacing_hours(series["init_time"].values)
-        if init_spacing_hours is None:
-            return None
-    lag = dm_lag(lead_hours, init_spacing_hours)
+    times = series["init_time"].values.astype("datetime64[ns]")
+    if np.isnat(times).any() or np.unique(times).size != times.size:
+        raise ValueError("loss_diff init_time has NaT or duplicate values")
     values = np.asarray(series.values, dtype=np.float64)
     if np.isinf(values).any():
         raise ValueError("loss_diff has infinite values")
-    values = values[~np.isnan(values)]
+    present = np.flatnonzero(~np.isnan(values))
+    if present.size == 0:
+        return None
+    values, times = values[present[0] : present[-1] + 1], times[present[0] : present[-1] + 1]
+    if np.isnan(values).any() or times.size < 2:
+        return None  # a gap inside the series, or a single init time
+    steps = np.diff(times)
+    if (steps != steps[0]).any():
+        return None  # unevenly spaced init times
+    spacing = float(steps[0] / np.timedelta64(1, "ns")) / _HOUR_NS
+    if init_spacing_hours is not None and float(init_spacing_hours) != spacing:
+        raise ValueError(f"init_spacing_hours={init_spacing_hours} but the init times are {spacing} h apart")
+    lag = dm_lag(lead_hours, spacing)
     n = values.size
     if n <= lag or n < 3 or not np.any(values != 0.0):
         return None
@@ -271,6 +291,29 @@ def diebold_mariano_pvalue(
     return float(scipy.stats.t.sf(statistic, n - 1))
 
 
+def evaluation_init_times(
+    period_start: np.datetime64 | str, period_end: np.datetime64 | str, init_hours: Sequence[int]
+) -> np.ndarray:
+    """Every init time from `period_start` to `period_end` (both included) at the given UTC hours.
+
+    This is the date half of the evaluation grid for `score_variable`. `init_hours` is the set a run
+    covers (all of, or a subset of, the configured `init_hours_utc`).
+    """
+    start = np.datetime64(period_start, "ns")
+    end = np.datetime64(period_end, "ns")
+    hours = sorted({int(h) for h in init_hours})
+    if np.isnat(start) or np.isnat(end) or end < start:
+        raise ValueError("period_start and period_end must be valid times with start <= end")
+    if not hours or any(not 0 <= h <= 23 for h in hours):
+        raise ValueError("init_hours must be a non-empty set of hours within 0..23")
+    first_hour = start.astype("datetime64[h]")
+    if first_hour < start:
+        first_hour += np.timedelta64(1, "h")
+    every_hour = np.arange(first_hour, end.astype("datetime64[h]") + np.timedelta64(1, "h"))
+    hour_of_day = (every_hour - every_hour.astype("datetime64[D]")).astype(np.int64)
+    return every_hour[np.isin(hour_of_day, hours)].astype("datetime64[ns]")
+
+
 def _canonical(da: xr.DataArray, name: str, *, ensemble: bool) -> xr.DataArray:
     expected = (*POINT_DIMS, ENS_DIM) if ensemble else POINT_DIMS
     if set(da.dims) != set(expected) or len(da.dims) != len(expected):
@@ -280,6 +323,8 @@ def _canonical(da: xr.DataArray, name: str, *, ensemble: bool) -> xr.DataArray:
             raise ValueError(f"{name} has no coordinate for '{dim}'")
         if not da.indexes[dim].is_unique:
             raise ValueError(f"{name} has duplicate '{dim}' values")
+        if da.indexes[dim].hasnans:
+            raise ValueError(f"{name} has missing (NaT/NaN) '{dim}' values")
     sort_dims = [*POINT_DIMS, ENS_DIM] if ensemble and ENS_DIM in da.coords else list(POINT_DIMS)
     return da.sortby(sort_dims).transpose(*expected)
 
@@ -350,28 +395,56 @@ def score_variable(
     baseline: xr.DataArray | None = None,
     *,
     cfg: HarnessConfig,
+    init_times: Sequence[np.datetime64] | np.ndarray,
+    station_ids: Sequence[str] | np.ndarray,
 ) -> dict[str, MetricValues]:
     """Score one variable. Keys are `"all"` and each lead in whole hours as a string.
 
-    `fcst` and `baseline` have dims `(init_time, lead_time, station_id, ens_member)`; `obs` is already
-    aligned to `(init_time, lead_time, station_id)` with exactly the forecast's coordinates.
-    `tail_threshold` has dims `(station_id, month)` and must be finite wherever it is needed.
-    The baseline must cover every init time, lead and station of the forecast (extra ones are ignored).
+    `init_times` and `station_ids` are the evaluation grid. Build them from the protocol
+    (`evaluation_init_times`, the stations file), NOT from the forecast: they are what stops a
+    forecast from leaving out a station or a date.
+
+    `obs` has dims `(init_time, lead_time, station_id)`, exactly the grid's init times and stations,
+    and at least the forecast's leads. `fcst` and `baseline` have dims
+    `(init_time, lead_time, station_id, ens_member)` and must cover every grid init time and station
+    (anything outside the grid is ignored). The leads scored are the forecast's leads; the baseline
+    must have all of them. `tail_threshold` has dims `(station_id, month)` and must be finite wherever
+    it is needed.
 
     Each entry has `crps`, `twcrps_p95`, `loss`, `spread_skill_ratio`, `n_pairs`, and with a baseline
     also `crpss_vs_baseline`, `baseline_twcrps_p95`, `dm_pvalue`. See the module docstring for the rules.
     """
+    grid = {
+        "init_time": pd.Index(np.asarray(init_times).astype("datetime64[ns]")),
+        "station_id": pd.Index(np.asarray(station_ids, dtype=object)),
+    }
+    for dim, index in grid.items():
+        if index.size == 0 or index.hasnans or not index.is_unique:
+            raise ValueError(f"evaluation grid '{dim}' is empty or has missing or duplicate values")
+        grid[dim] = index.sort_values()
+
     fcst = _canonical(fcst, "forecast", ensemble=True)
     obs = _canonical(obs, "obs", ensemble=False)
-    for dim in POINT_DIMS:
-        if not fcst.indexes[dim].equals(obs.indexes[dim]):
-            raise ValueError(f"obs and forecast differ on '{dim}'; align obs to the forecast first")
+    for dim, index in grid.items():
+        if not obs.indexes[dim].equals(index):
+            raise ValueError(f"obs '{dim}' values are not exactly the evaluation grid")
+    grid["lead_time"] = fcst.indexes["lead_time"]
+    if not grid["lead_time"].isin(obs.indexes["lead_time"]).all():
+        raise ValueError("obs does not cover every lead_time of the forecast")
+    obs = obs.sel(lead_time=grid["lead_time"])
+
+    def on_grid(da: xr.DataArray, name: str) -> xr.DataArray:
+        for dim, index in grid.items():
+            missing = int((~index.isin(da.indexes[dim])).sum())
+            if missing:
+                raise ValueError(
+                    f"{name} does not cover the evaluation grid: {missing} '{dim}' value(s) missing"
+                )
+        return da.sel({dim: index.values for dim, index in grid.items()})
+
+    fcst = on_grid(fcst, "forecast")
     if baseline is not None:
-        baseline = _canonical(baseline, "baseline", ensemble=True)
-        for dim in POINT_DIMS:
-            if not fcst.indexes[dim].isin(baseline.indexes[dim]).all():
-                raise ValueError(f"baseline does not cover every '{dim}' value of the forecast")
-        baseline = baseline.sel({dim: fcst[dim] for dim in POINT_DIMS})
+        baseline = on_grid(_canonical(baseline, "baseline", ensemble=True), "baseline")
 
     hours = _lead_hours(fcst["lead_time"].values)
     obs_values = np.asarray(obs.values, dtype=np.float64)
@@ -401,8 +474,7 @@ def score_variable(
         base = _pointwise(baseline, obs, threshold)
         weights = cfg.gate.loss_weights
         loss_diff = weights.crps_fair * (base[0] - cand[0]) + weights.twcrps_p95 * (base[1] - cand[1])
-    init_times = fcst["init_time"].values
-    spacing = _init_spacing_hours(init_times)
+    scored_init_times = fcst["init_time"].values
 
     def entry(index: slice, lead_for_lag: int) -> MetricValues:
         sub_mask = mask[:, index, :]
@@ -421,13 +493,12 @@ def score_variable(
         loss, base_loss = out["loss"], base_summary["loss"]
         if loss is not None and base_loss is not None and base_loss > 0:
             out["crpss_vs_baseline"] = _finite_or_none(1.0 - loss / base_loss)
-        if spacing is not None:
-            series = xr.DataArray(
-                _per_init_mean(loss_diff[:, index, :], sub_mask),
-                dims="init_time",
-                coords={"init_time": init_times},
-            )
-            out["dm_pvalue"] = diebold_mariano_pvalue(series, lead_for_lag, spacing)
+        series = xr.DataArray(
+            _per_init_mean(loss_diff[:, index, :], sub_mask),
+            dims="init_time",
+            coords={"init_time": scored_init_times},
+        )
+        out["dm_pvalue"] = diebold_mariano_pvalue(series, lead_for_lag)
         return out
 
     result: dict[str, MetricValues] = {"all": entry(slice(None), max(hours))}

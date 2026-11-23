@@ -50,6 +50,26 @@ def flat_threshold(n_sta: int, value: float) -> xr.DataArray:
     )
 
 
+def score(
+    fcst: xr.DataArray,
+    obs: xr.DataArray,
+    threshold: xr.DataArray,
+    baseline: xr.DataArray | None = None,
+    *,
+    cfg: object = CFG,
+) -> dict:
+    """score_variable on the grid of the observations (the grid never comes from the forecast)."""
+    return M.score_variable(
+        fcst,
+        obs,
+        threshold,
+        baseline,
+        cfg=cfg,
+        init_times=obs["init_time"].values,
+        station_ids=obs["station_id"].values.tolist(),
+    )
+
+
 def brute_fair_crps(members: np.ndarray, y: float) -> float:
     m = len(members)
     term1 = sum(abs(float(x) - y) for x in members) / m
@@ -158,7 +178,7 @@ def test_tail_crps_is_zero_below_threshold() -> None:
     above_everything = float(max(fcst.max(), obs.max())) + 1.0
     np.testing.assert_array_equal(M.tail_crps(fcst, obs, above_everything).values, 0.0)
     np.testing.assert_array_equal(M.tail_crps(fcst, obs, flat_threshold(4, above_everything)).values, 0.0)
-    result = M.score_variable(fcst, obs, flat_threshold(4, above_everything), cfg=CFG)
+    result = score(fcst, obs, flat_threshold(4, above_everything), cfg=CFG)
     assert result["all"]["twcrps_p95"] == 0.0
     assert result["all"]["loss"] == pytest.approx(0.70 * result["all"]["crps"])
 
@@ -198,6 +218,30 @@ def test_tail_thresholds_match_numpy_quantiles() -> None:
     np.testing.assert_array_equal(ds["t2m"].values, out.values)
 
 
+def test_tail_thresholds_refuse_mixed_dates_and_nat() -> None:
+    # Regression: a NaT made max() return NaT, the cutoff comparison was false, and a validation-year
+    # observation went into the January threshold.
+    def truth(times: list[str]) -> xr.DataArray:
+        stamps = np.array(times, dtype="datetime64[ns]")
+        values = np.random.default_rng(12).normal(280, 5, size=(len(times), 2)).astype(np.float32)
+        coords_ = {"valid_time": stamps, "station_id": station_ids(2)}
+        return xr.DataArray(values, dims=("valid_time", "station_id"), coords=coords_)
+
+    train_only = ["2023-01-05T00", "2023-01-06T00", "2022-01-07T00"]
+    M.compute_tail_thresholds(truth(train_only), 0.95, cfg=CFG)
+    with pytest.raises(ValueError, match="after the train split end"):
+        M.compute_tail_thresholds(truth([*train_only, "2024-01-05T00"]), 0.95, cfg=CFG)
+    with pytest.raises(ValueError, match="after the train split end"):
+        M.compute_tail_thresholds(truth(["2024-01-05T00", *train_only]), 0.95, cfg=CFG)  # unsorted
+    with pytest.raises(ValueError, match="NaT"):
+        M.compute_tail_thresholds(truth([*train_only, "2024-01-05T00", "NaT"]), 0.95, cfg=CFG)
+    with pytest.raises(ValueError, match="NaT"):
+        M.compute_tail_thresholds(truth([*train_only, "NaT"]), 0.95, cfg=CFG)
+    with pytest.raises(ValueError, match="NaT"):
+        as_dataset = truth(["NaT", "2024-01-05T00", *train_only]).to_dataset(name="t2m")
+        M.compute_tail_thresholds(as_dataset, 0.95, cfg=CFG)
+
+
 def test_tail_thresholds_refuse_post_train_data() -> None:
     M.compute_tail_thresholds(train_truth("2023-12-17T18:00", hours=48), 0.95, cfg=CFG)  # exactly the end
     with pytest.raises(ValueError, match="after the train split end"):
@@ -230,11 +274,11 @@ def test_spread_skill_calibrated_near_one_and_overconfident_fails() -> None:
     assert np.all(np.abs(per_lead.values - 1.0) < 0.05)
 
     threshold = flat_threshold(10, 285.0)
-    good = M.score_variable(calibrated, obs, threshold, cfg=CFG)
+    good = score(calibrated, obs, threshold, cfg=CFG)
     assert good["all"]["spread_skill_ratio"] == pytest.approx(ratio, rel=1e-12)
     assert M.evaluate_gates(good, CFG)["spread_skill"] is True
 
-    bad = M.score_variable(overconfident, obs, threshold, cfg=CFG)
+    bad = score(overconfident, obs, threshold, cfg=CFG)
     assert bad["all"]["spread_skill_ratio"] < CFG.gate.spread_skill_min
     assert bad["all"]["spread_skill_ratio"] == pytest.approx(0.3, abs=0.05)
     assert M.evaluate_gates(bad, CFG)["spread_skill"] is False
@@ -259,7 +303,7 @@ def test_spread_skill_is_one_for_a_calibrated_ensemble_of_any_size(n_mem: int) -
     assert ratio == pytest.approx(math.sqrt((n_mem + 1) / n_mem) * spread / rmse, rel=1e-12)
     assert spread / rmse == pytest.approx(math.sqrt(n_mem / (n_mem + 1)), abs=0.04)  # uncorrected value
 
-    result = M.score_variable(fcst, obs, flat_threshold(10, 285.0), cfg=CFG)
+    result = score(fcst, obs, flat_threshold(10, 285.0), cfg=CFG)
     assert result["all"]["spread_skill_ratio"] == pytest.approx(ratio, rel=1e-12)
     assert M.evaluate_gates(result, CFG)["spread_skill"] is True
 
@@ -279,7 +323,7 @@ def test_score_variable_matches_brute_force_and_schema() -> None:
     obs = s["obs"].copy()
     obs.values[2, 0, 1] = np.nan
     obs.values[5, 1, :] = np.nan
-    result = M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
+    result = score(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
     assert list(result) == ["all", "6", "24"]
 
     mask = np.isfinite(obs.values)
@@ -305,7 +349,7 @@ def test_score_variable_matches_brute_force_and_schema() -> None:
 
 def test_identical_baseline_has_zero_skill_and_fails() -> None:
     s = synthetic(22)
-    result = M.score_variable(s["good"], s["obs"], s["threshold"], s["good"].copy(), cfg=CFG)
+    result = score(s["good"], s["obs"], s["threshold"], s["good"].copy(), cfg=CFG)
     for entry in result.values():
         assert entry["crpss_vs_baseline"] == 0.0
         assert entry["baseline_twcrps_p95"] == entry["twcrps_p95"]
@@ -318,14 +362,14 @@ def test_identical_baseline_has_zero_skill_and_fails() -> None:
 
 def test_clearly_better_candidate_passes_all_gates() -> None:
     s = synthetic(23)
-    result = M.score_variable(s["good"], s["obs"], s["threshold"], s["base"], cfg=CFG)
+    result = score(s["good"], s["obs"], s["threshold"], s["base"], cfg=CFG)
     gates = M.evaluate_gates(result, CFG)
     assert tuple(gates) == GATE_NAMES
     assert gates == dict.fromkeys(GATE_NAMES, True)
     assert result["all"]["crpss_vs_baseline"] > 0.5
     assert result["all"]["dm_pvalue"] < 1e-6
     # and the reverse comparison fails skill, tail and significance
-    reverse = M.score_variable(s["base"], s["obs"], s["threshold"], s["good"], cfg=CFG)
+    reverse = score(s["base"], s["obs"], s["threshold"], s["good"], cfg=CFG)
     reverse_gates = M.evaluate_gates(reverse, CFG)
     assert reverse["all"]["crpss_vs_baseline"] < 0
     assert reverse["all"]["dm_pvalue"] > 0.999
@@ -345,7 +389,7 @@ def test_better_on_average_but_worse_in_tail_fails() -> None:
         s["known"][..., None] + 0.5 * rng.normal(size=(*shape, n_mem)),
     )
     candidate = as_fcst(members, s["coords"])
-    result = M.score_variable(candidate, s["obs"], s["threshold"], s["base"], cfg=CFG)
+    result = score(candidate, s["obs"], s["threshold"], s["base"], cfg=CFG)
     entry = result["all"]
     assert entry["crpss_vs_baseline"] > 0.1  # better on the headline loss
     assert entry["twcrps_p95"] > entry["baseline_twcrps_p95"]  # worse in the tail
@@ -357,7 +401,7 @@ def test_better_on_average_but_worse_in_tail_fails() -> None:
 
 def test_no_baseline_means_gate_not_passed() -> None:
     s = synthetic(25, n_init=20)
-    result = M.score_variable(s["good"], s["obs"], s["threshold"], cfg=CFG)
+    result = score(s["good"], s["obs"], s["threshold"], cfg=CFG)
     assert set(result["all"]) == {"crps", "twcrps_p95", "loss", "spread_skill_ratio", "n_pairs"}
     gates = M.evaluate_gates(result, CFG)
     assert gates == {"skill": False, "tail": False, "spread_skill": True, "dm": False}
@@ -398,11 +442,15 @@ def test_nan_obs_masked_identically_for_candidate_and_baseline() -> None:
     obs.values[7] = np.nan  # one init time with no observation at all
     n_valid = int(np.isfinite(obs.values).sum())
 
-    result = M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
+    result = score(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
     assert result["all"]["n_pairs"] == n_valid
 
+    # an init time with no observation at all leaves a hole in the DM series: undefined, gate fails
+    assert result["all"]["dm_pvalue"] is None
+    assert M.evaluate_gates(result, CFG)["dm"] is False
+
     # The baseline is scored on exactly the candidate's mask: scoring it alone gives the same numbers.
-    base_alone = M.score_variable(s["base"], obs, s["threshold"], cfg=CFG)
+    base_alone = score(s["base"], obs, s["threshold"], cfg=CFG)
     for key in result:
         assert result[key]["n_pairs"] == base_alone[key]["n_pairs"]
         assert result[key]["baseline_twcrps_p95"] == base_alone[key]["twcrps_p95"]
@@ -414,25 +462,25 @@ def test_nan_obs_masked_identically_for_candidate_and_baseline() -> None:
     cand2, base2 = s["good"].copy(), s["base"].copy()
     cand2.values[~np.isfinite(obs.values)] = np.nan
     base2.values[~np.isfinite(obs.values)] = 1e6
-    assert M.score_variable(cand2, obs, s["threshold"], base2, cfg=CFG) == result
+    assert score(cand2, obs, s["threshold"], base2, cfg=CFG) == result
 
     # A hole in either forecast at an observed point is refused (no cherry-picking).
     i, j, k = np.argwhere(np.isfinite(obs.values))[0]
     broken = s["good"].copy()
     broken.values[i, j, k, 0] = np.nan
     with pytest.raises(ValueError, match="forecast has missing"):
-        M.score_variable(broken, obs, s["threshold"], s["base"], cfg=CFG)
+        score(broken, obs, s["threshold"], s["base"], cfg=CFG)
     broken_base = s["base"].copy()
     broken_base.values[i, j, k, 3] = np.inf
     with pytest.raises(ValueError, match="baseline has missing"):
-        M.score_variable(s["good"], obs, s["threshold"], broken_base, cfg=CFG)
+        score(s["good"], obs, s["threshold"], broken_base, cfg=CFG)
 
 
 def test_lead_with_no_observations_is_undefined_not_zero() -> None:
     s = synthetic(27, n_init=30)
     obs = s["obs"].copy()
     obs.values[:, 0, :] = np.nan
-    result = M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
+    result = score(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
     assert result["6"] == {
         "crps": None,
         "twcrps_p95": None,
@@ -450,24 +498,128 @@ def test_lead_with_no_observations_is_undefined_not_zero() -> None:
 def test_score_variable_refuses_bad_inputs() -> None:
     s = synthetic(28, n_init=10, n_sta=4, n_mem=4)
     good, obs, thr, base = s["good"], s["obs"], s["threshold"], s["base"]
-    with pytest.raises(ValueError, match="align obs"):
-        M.score_variable(good, obs.isel(init_time=slice(1, None)), thr, cfg=CFG)
     with pytest.raises(ValueError, match="baseline does not cover"):
-        M.score_variable(good, obs, thr, base.isel(lead_time=[0]), cfg=CFG)
+        score(good, obs, thr, base.isel(lead_time=[0]), cfg=CFG)
     with pytest.raises(ValueError, match="does not cover every station"):
-        M.score_variable(good, obs, thr.isel(station_id=slice(1, None)), cfg=CFG)
+        score(good, obs, thr.isel(station_id=slice(1, None)), cfg=CFG)
     nan_thr = thr.copy()
     nan_thr.values[0, 1] = np.nan  # February: every valid time of this case
     with pytest.raises(ValueError, match="tail_threshold is not finite"):
-        M.score_variable(good, obs, nan_thr, cfg=CFG)
+        score(good, obs, nan_thr, cfg=CFG)
     with pytest.raises(ValueError, match="must have dims"):
-        M.score_variable(good.isel(ens_member=0, drop=True), obs, thr, cfg=CFG)
+        score(good.isel(ens_member=0, drop=True), obs, thr, cfg=CFG)
     half_hour = good.assign_coords(lead_time=good["lead_time"].values + np.timedelta64(30, "m"))
     with pytest.raises(ValueError, match="whole number of hours"):
-        M.score_variable(half_hour, obs.assign_coords(lead_time=half_hour["lead_time"].values), thr, cfg=CFG)
+        score(half_hour, obs.assign_coords(lead_time=half_hour["lead_time"].values), thr, cfg=CFG)
     # a baseline with extra leads, stations and a different ensemble size is fine
     extra = synthetic(28, n_init=10, leads=(6, 24, 48), n_sta=5, n_mem=7)["base"]
-    M.score_variable(good, obs, thr, extra, cfg=CFG)
+    score(good, obs, thr, extra, cfg=CFG)
+
+
+# --- evaluation grid ---------------------------------------------------------------------------
+
+
+def test_forecast_cannot_drop_a_station_or_a_date() -> None:
+    # 10 days at 00Z and 12Z; the grid comes from the protocol side, not from any forecast.
+    grid_times = M.evaluation_init_times("2024-02-01T00", "2024-02-10T12", [0, 12])
+    assert len(grid_times) == 20
+    rng = np.random.default_rng(31)
+    c = {
+        "init_time": grid_times,
+        "lead_time": np.array([6, 24], dtype="timedelta64[h]").astype("timedelta64[ns]"),
+        "station_id": station_ids(5),
+    }
+    shape = (20, 2, 5)
+    centre = 280 + 3 * rng.normal(size=shape)
+    obs = as_obs(centre + rng.normal(size=shape), c)
+    cand = as_fcst(centre[..., None] + rng.normal(size=(*shape, 6)), c)
+    base = as_fcst(centre[..., None] + 2 * rng.normal(size=(*shape, 6)), c)
+    thr = flat_threshold(5, 285.0)
+    grid = {"init_times": grid_times, "station_ids": station_ids(5)}
+
+    def run(fcst: xr.DataArray, truth: xr.DataArray, baseline: xr.DataArray | None = base) -> dict:
+        return M.score_variable(fcst, truth, thr, baseline, cfg=CFG, **grid)
+
+    full = run(cand, obs)
+    assert full["all"]["n_pairs"] == 200
+
+    no_station = cand.isel(station_id=[0, 1, 2, 4])
+    no_date = cand.isel(init_time=[i for i in range(20) if i != 7])  # one 12Z run of an evaluated hour
+    for dropped, dim in ((no_station, "station_id"), (no_date, "init_time")):
+        with pytest.raises(ValueError, match=f"forecast does not cover the evaluation grid: 1 '{dim}'"):
+            run(dropped, obs)
+        # the reported hole: truth aligned to the shrunken candidate no longer hides the gap
+        shrunk_obs = obs.sel({dim: dropped[dim]})
+        with pytest.raises(ValueError, match=f"obs '{dim}' values are not exactly the evaluation grid"):
+            run(dropped, shrunk_obs)
+        with pytest.raises(ValueError, match=f"baseline does not cover the evaluation grid: 1 '{dim}'"):
+            run(cand, obs, base.sel({dim: dropped[dim]}))
+
+    # obs wider than the grid is also refused: the grid, not the data, decides what is scored
+    wide = M.evaluation_init_times("2024-02-01T00", "2024-02-11T12", [0, 12])
+    with pytest.raises(ValueError, match="obs 'init_time' values are not exactly"):
+        run(cand, obs.reindex(init_time=wide))
+
+    # documented exception: a forecast without a whole lead is scored on the leads it has
+    one_lead = run(cand.isel(lead_time=[1]), obs)
+    assert list(one_lead) == ["all", "24"]
+    assert one_lead["24"] == full["24"]
+    with pytest.raises(ValueError, match="obs does not cover every lead_time"):
+        run(cand, obs.isel(lead_time=[0]))
+    # a forecast with extra stations and dates is cut to the grid
+    c_big = {**c, "init_time": wide, "station_id": station_ids(7)}
+    big = as_fcst(np.full((22, 2, 7, 6), np.nan), c_big)
+    big.loc[{"init_time": grid_times, "station_id": station_ids(5)}] = cand.values
+    assert run(big, obs) == full
+
+    for bad in ({**grid, "station_ids": []}, {**grid, "station_ids": [*station_ids(5), station_ids(5)[0]]}):
+        with pytest.raises(ValueError, match="evaluation grid"):
+            M.score_variable(cand, obs, thr, base, cfg=CFG, **bad)
+    nat_grid = np.array([*grid_times, "NaT"], dtype="datetime64[ns]")
+    with pytest.raises(ValueError, match="evaluation grid"):
+        M.score_variable(cand, obs, thr, base, cfg=CFG, init_times=nat_grid, station_ids=station_ids(5))
+
+
+def test_evaluation_init_times() -> None:
+    got = M.evaluation_init_times("2024-01-01T00", "2024-01-02T18", CFG.evaluation.init_hours_utc)
+    expected = pd.date_range("2024-01-01", periods=8, freq="6h").values.astype("datetime64[ns]")
+    np.testing.assert_array_equal(got, expected)
+    assert got.dtype == np.dtype("datetime64[ns]")
+    # start and end are inclusive and need not sit on an init hour
+    got = M.evaluation_init_times("2024-01-01T01", "2024-01-03T11:59", [12, 0, 12])
+    assert [str(t)[:13] for t in got] == ["2024-01-01T12", "2024-01-02T00", "2024-01-02T12", "2024-01-03T00"]
+    validation = CFG.splits.validation
+    hours = CFG.evaluation.init_hours_utc
+    assert len(M.evaluation_init_times(validation.start, validation.end, hours)) == 352 * 4
+    bad_args = (
+        ("2024-01-02", "2024-01-01", [0]),
+        ("2024-01-01", "2024-01-02", []),
+        ("2024-01-01", "2024-01-02", [24]),
+    )
+    for args in bad_args:
+        with pytest.raises(ValueError):
+            M.evaluation_init_times(*args)
+
+
+def test_fixed_members_break_fair_crps_known_limit() -> None:
+    # Fair CRPS assumes members are random draws. Two members placed on purpose score exactly 0
+    # whenever the observation lies between them. This pins the known limit (see the module docstring);
+    # the kernel does not defend against it.
+    rng = np.random.default_rng(32)
+    c = coords(200, (6,), 5)
+    shape = (200, 1, 5)
+    centre = 280 + 3 * rng.normal(size=shape)
+    obs = as_obs(centre + rng.normal(size=shape), c)
+    honest = as_fcst(centre[..., None] + rng.normal(size=(*shape, 2)), c)
+    placed = as_fcst(np.stack([centre - 0.97 * 0.6745, centre + 0.97 * 0.6745], axis=-1), c)
+    inside = np.abs(obs.values - centre.astype(np.float32)) < 0.6
+    assert inside.sum() > 300
+    np.testing.assert_allclose(M.fair_crps(placed, obs).values[inside], 0.0, atol=1e-4)
+    thr = flat_threshold(5, 400.0)
+    honest_score, placed_score = score(honest, obs, thr), score(placed, obs, thr)
+    assert honest_score["all"]["crps"] == pytest.approx(1 / math.sqrt(math.pi), rel=0.1)  # the true CRPS
+    assert placed_score["all"]["crps"] < 0.65 * honest_score["all"]["crps"]
+    assert M.evaluate_gates(placed_score, CFG)["spread_skill"] is True  # and the band does not catch it
 
 
 # --- determinism -------------------------------------------------------------------------------
@@ -477,10 +629,10 @@ def test_result_independent_of_chunking_and_input_order() -> None:
     s = synthetic(29, n_init=30, n_sta=6, n_mem=8)
     obs = s["obs"].copy()
     obs.values[np.random.default_rng(5).random(obs.shape) < 0.15] = np.nan
-    reference = M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
-    assert M.score_variable(s["good"], obs, s["threshold"], s["base"], cfg=CFG) == reference
+    reference = score(s["good"], obs, s["threshold"], s["base"], cfg=CFG)
+    assert score(s["good"], obs, s["threshold"], s["base"], cfg=CFG) == reference
 
-    chunked = M.score_variable(
+    chunked = score(
         s["good"].chunk({"init_time": 7, "station_id": 4, "ens_member": 3}),
         obs.chunk({"init_time": 11}),
         s["threshold"],
@@ -491,7 +643,7 @@ def test_result_independent_of_chunking_and_input_order() -> None:
 
     rng = np.random.default_rng(6)
     order = {dim: rng.permutation(obs.sizes[dim]) for dim in POINT_DIMS}
-    shuffled = M.score_variable(
+    shuffled = score(
         s["good"].isel(order).isel(ens_member=rng.permutation(8)).transpose("ens_member", "station_id", ...),
         obs.isel(order).transpose("station_id", "lead_time", "init_time"),
         s["threshold"].isel(station_id=order["station_id"]).transpose("month", "station_id"),
@@ -541,13 +693,15 @@ def test_dm_passes_the_lead_based_lag_to_scores(monkeypatch: pytest.MonkeyPatch)
     M.diebold_mariano_pvalue(series(values), 6)  # spacing inferred from the 6-hourly init times
     M.diebold_mariano_pvalue(series(values), 48)
     M.diebold_mariano_pvalue(series(values, freq="24h"), 48)
-    M.diebold_mariano_pvalue(series(values), 48, 12.0)
+    M.diebold_mariano_pvalue(series(values, freq="12h"), 48, 12.0)
     assert seen == [1, 8, 2, 4]
+    with pytest.raises(ValueError, match="init_spacing_hours"):
+        M.diebold_mariano_pvalue(series(values), 48, 12.0)  # the init times are 6 h apart
 
     # score_variable: each lead gets its own lag, "all" gets the longest lead's
     seen.clear()
     s = synthetic(30, n_init=40, leads=(6, 24, 48))
-    M.score_variable(s["good"], s["obs"], s["threshold"], s["base"], cfg=CFG)
+    score(s["good"], s["obs"], s["threshold"], s["base"], cfg=CFG)
     assert seen == [8, 1, 4, 8]
 
 
@@ -578,19 +732,28 @@ def test_dm_is_one_sided_and_detects_a_real_gain() -> None:
 
 def test_dm_nan_gaps_and_short_series() -> None:
     values = ar1(np.random.default_rng(2), 120, 0.4) + 0.2
+    whole = M.diebold_mariano_pvalue(series(values), 24)
+    assert whole is not None
+    # a NaN inside the series, or a missing init time, would change the physical lag: undefined
     gappy = values.copy()
-    gappy[[5, 6, 40, 119]] = np.nan
-    # NaNs are dropped and the rest is treated as consecutive; the lag still comes from the full grid
-    expected = M.diebold_mariano_pvalue(series(values[~np.isnan(gappy)]), 24, 6.0)
-    assert M.diebold_mariano_pvalue(series(gappy), 24) == expected
-    # uneven init times: the smallest gap sets the spacing
+    gappy[40] = np.nan
+    assert M.diebold_mariano_pvalue(series(gappy), 24) is None
+    assert M.diebold_mariano_pvalue(series(values).isel(init_time=[*range(40), *range(41, 120)]), 24) is None
     uneven = series(values).isel(init_time=[*range(0, 60, 2), *range(60, 120)])
-    assert M.diebold_mariano_pvalue(uneven, 24) == M.diebold_mariano_pvalue(uneven, 24, 6.0)
+    assert M.diebold_mariano_pvalue(uneven, 24) is None
+    # leading and trailing NaNs are only trimmed: the rest is still evenly spaced
+    edges = values.copy()
+    edges[[0, 1, 119]] = np.nan
+    assert M.diebold_mariano_pvalue(series(edges), 24) == M.diebold_mariano_pvalue(series(values)[2:119], 24)
+    # the same values one cycle apart or a week apart: same statistic only because both are regular
+    # series; the lag follows the real spacing (24 h lead: h = 4 at 6 h, h = 1 at 168 h)
+    assert M.dm_lag(24, 6) == 4 and M.dm_lag(24, 168) == 1
     # HG models the autocovariance over max((n - 1) // 2, h) lags: on a long series the lag does not
     # change the answer, on a short one it does.
-    assert M.diebold_mariano_pvalue(uneven, 24) == M.diebold_mariano_pvalue(uneven, 24, 12.0)
-    short = series(values[:12])
-    assert M.diebold_mariano_pvalue(short, 48, 6.0) != M.diebold_mariano_pvalue(short, 48, 48.0)
+    assert M.diebold_mariano_pvalue(series(values, freq="12h"), 24) == whole
+    short = values[:12]
+    six_hourly, two_daily = series(short), series(short, freq="48h")
+    assert M.diebold_mariano_pvalue(six_hourly, 48) != M.diebold_mariano_pvalue(two_daily, 48)
     # order of the init_time coordinate does not matter
     assert M.diebold_mariano_pvalue(series(values).isel(init_time=slice(None, None, -1)), 24) == (
         M.diebold_mariano_pvalue(series(values), 24)
