@@ -5,6 +5,8 @@
   A valid time (or station) that truth does not have gives NaN: never an error, never a neighbour's value.
 - :func:`check_not_sealed` refuses anything that touches the sealed split.
 - :func:`check_nan_rule` refuses a forecast with a non-finite member where truth is finite.
+- :func:`check_stations`, :func:`check_init_times_contiguous` and :func:`check_baseline_covers` refuse a
+  forecast that leaves out whole stations or dates, which the NaN rule alone cannot see.
 """
 
 from __future__ import annotations
@@ -150,3 +152,61 @@ def check_nan_rule(forecast: xr.Dataset, obs: xr.Dataset, *, role: str = "candid
             )
     if total:
         raise ForecastNaNError(role, total, offenders)
+
+
+class CoverageError(ValueError):
+    """A forecast leaves out stations or init times it is required to have."""
+
+    def __init__(self, role: str, what: str, missing: list[str]) -> None:
+        self.role = role
+        self.what = what
+        self.missing = missing
+        shown = missing[:MAX_LISTED]
+        lines = [f"{role} forecast is missing {len(missing)} required {what}; first {len(shown)}:"]
+        lines += [f"  {item}" for item in shown]
+        super().__init__("\n".join(lines))
+
+
+def _stamp(values: np.ndarray) -> list[str]:
+    return [np.datetime_as_string(v, unit="s") + "Z" for v in np.asarray(values).astype("datetime64[s]")]
+
+
+def expected_init_times(init_times: np.ndarray) -> np.ndarray:
+    """Every time from the first to the last init time whose hour of day is one the forecast uses.
+
+    The forecast's cadence is the set of hours of day its init times fall on (for example 00 and 12).
+    Init times must be on whole hours; the caller checks that.
+    """
+    init = np.sort(np.asarray(init_times).astype("datetime64[ns]"))
+    hours = pd.DatetimeIndex(init).hour
+    every_hour = pd.date_range(init[0], init[-1], freq="1h")
+    return every_hour[every_hour.hour.isin(np.unique(hours))].values.astype("datetime64[ns]")
+
+
+def check_init_times_contiguous(forecast: xr.Dataset, *, role: str = "candidate") -> None:
+    """Raise :class:`CoverageError` if a date is missing between the first and the last init time."""
+    have = forecast["init_time"].values.astype("datetime64[ns]")
+    expected = expected_init_times(have)
+    missing = expected[~np.isin(expected, have)]
+    if missing.size:
+        raise CoverageError(role, "init time(s)", _stamp(missing))
+
+
+def check_stations(forecast: xr.Dataset, required: list[str], *, role: str = "candidate") -> None:
+    """Raise :class:`CoverageError` if the forecast lacks any required station."""
+    have = {str(s) for s in forecast["station_id"].values}
+    missing = sorted(s for s in set(required) if s not in have)
+    if missing:
+        raise CoverageError(role, "station(s)", missing)
+
+
+def check_baseline_covers(candidate: xr.Dataset, baseline: xr.Dataset) -> None:
+    """Raise :class:`CoverageError` if the baseline lacks an init time of the candidate.
+
+    Stations are checked separately against the required list, for both forecasts.
+    """
+    want = candidate["init_time"].values.astype("datetime64[ns]")
+    have = baseline["init_time"].values.astype("datetime64[ns]")
+    missing = np.sort(want[~np.isin(want, have)])
+    if missing.size:
+        raise CoverageError("baseline", "init time(s) of the candidate", _stamp(missing))

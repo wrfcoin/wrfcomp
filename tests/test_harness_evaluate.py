@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr
-from conftest import Synthetic, make_synthetic, open_zarr, write_netcdf, write_zarr
+from conftest import Synthetic, make_synthetic, open_zarr, station_ids, write_config, write_netcdf, write_zarr
 from typer.testing import CliRunner
 
 from wrfcomp.harness.align import align_truth
@@ -15,8 +15,8 @@ from wrfcomp.harness.evaluate import app, canonical_json
 from wrfcomp.harness.hashing import content_sha256
 from wrfcomp.harness.schemas import Scorecard
 
-CONFIG = Path(__file__).resolve().parents[1] / "configs" / "splits.yaml"
 HOUR = np.timedelta64(1, "h")
+N_REQUIRED = 20  # stations in the synthetic stations file
 
 # =================================================================== content hash
 
@@ -43,9 +43,10 @@ def test_same_data_different_chunking_same_hash(tmp_path, synthetic) -> None:
 def test_zarr_and_netcdf_of_the_same_truth_hash_the_same(tmp_path, synthetic) -> None:
     expected = content_sha256(synthetic.truth)
     z = write_zarr(synthetic.truth, tmp_path / "t.zarr", {"valid_time": 50, "station_id": 4})
-    n = write_netcdf(synthetic.truth, tmp_path / "t.nc")
     assert content_sha256(open_zarr(z)) == expected
-    assert content_sha256(xr.open_dataset(n)) == expected
+    for netcdf3 in (False, True):
+        n = write_netcdf(synthetic.truth, tmp_path / f"t{int(netcdf3)}.nc", netcdf3=netcdf3)
+        assert content_sha256(xr.open_dataset(n)) == expected
 
 
 def test_one_value_changed_changes_hash(synthetic) -> None:
@@ -119,13 +120,14 @@ def _stores(tmp_path: Path, syn: Synthetic, *, chunks: dict[str, int] | None = N
         "baseline": write_zarr(syn.baseline, tmp_path / "baseline.zarr", chunks),
         "truth": write_zarr(syn.truth, tmp_path / "truth.zarr"),
         "thresholds": write_netcdf(syn.thresholds, tmp_path / "thresholds.nc"),
+        "config": write_config(tmp_path, list(station_ids(N_REQUIRED))),
     }
 
 
 def _run(stores: dict[str, Path], out: Path, *extra: str, baseline: bool = True, model_id: str = "synth"):
     args = ["--forecast", str(stores["forecast"]), "--truth", str(stores["truth"])]
     args += ["--thresholds", str(stores["thresholds"]), "--out", str(out)]
-    args += ["--model-id", model_id, "--model-version", "1", "--config", str(CONFIG)]
+    args += ["--model-id", model_id, "--model-version", "1", "--config", str(stores["config"])]
     if baseline:
         args += ["--baseline", str(stores["baseline"]), "--baseline-id", "synth_base"]
     return CliRunner().invoke(app, [*args, *extra])
@@ -168,13 +170,18 @@ def test_end_to_end_scorecard_validates_and_is_byte_identical(tmp_path, syntheti
     assert text == canonical_json(json.loads(text))  # sorted keys, canonical floats
 
 
-def test_truth_as_netcdf_scores_the_same(tmp_path, synthetic) -> None:
+@pytest.mark.parametrize("netcdf3", [False, True], ids=["netcdf4", "netcdf3"])
+def test_truth_and_thresholds_as_netcdf_score_the_same(tmp_path, synthetic, netcdf3: bool) -> None:
     stores = _stores(tmp_path, synthetic)
     a = _scored(_run(stores, tmp_path / "a.json"), tmp_path / "a.json")
-    stores["truth"] = write_netcdf(synthetic.truth, tmp_path / "truth.nc")
+    stores["truth"] = write_netcdf(synthetic.truth, tmp_path / "truth.nc", netcdf3=netcdf3)
+    stores["thresholds"] = write_netcdf(synthetic.thresholds, tmp_path / "th.nc", netcdf3=netcdf3)
+    magic = stores["truth"].read_bytes()[:4]
+    assert magic.startswith(b"CDF") if netcdf3 else magic == b"\x89HDF"
     _scored(_run(stores, tmp_path / "b.json"), tmp_path / "b.json")
     assert (tmp_path / "b.json").read_bytes() == (tmp_path / "a.json").read_bytes()
     assert a["truth_sha256"] == content_sha256(synthetic.truth)
+    assert a["thresholds_sha256"] == content_sha256(synthetic.thresholds)
 
 
 def test_forecast_nan_at_valid_truth_point_exits_3(tmp_path, synthetic) -> None:
@@ -250,7 +257,10 @@ def test_allow_sealed_scores_with_a_loud_warning(tmp_path) -> None:
     syn = make_synthetic(start="2024-12-20T00:00")
     out = tmp_path / "s.json"
     result = _run(_stores(tmp_path, syn), out, "--allow-sealed")
-    Scorecard.model_validate(_scored(result, out))
+    card = _scored(result, out)
+    Scorecard.model_validate(card)
+    assert card["sealed_data_used"] is True
+    assert card["period_end"] == "2025-01-03T12:00:00"
     assert "WARNING" in result.output and "SEALED SPLIT IN USE" in result.output
 
 
@@ -295,15 +305,90 @@ def test_whole_missing_lead_is_allowed_and_recorded(tmp_path, synthetic) -> None
     assert set(card["metrics"]["t2m"]) == {"all", "6", "24"}
 
 
-def test_baseline_intersection_limits_what_is_scored(tmp_path, synthetic) -> None:
-    synthetic.baseline = synthetic.baseline.isel(init_time=slice(4, None), station_id=slice(0, 15))
+def test_dropped_station_is_refused(tmp_path, synthetic) -> None:
+    gone = [str(s) for s in synthetic.candidate["station_id"].values[[3, 17]]]
+    synthetic.candidate = synthetic.candidate.drop_sel(station_id=gone)
     out = tmp_path / "s.json"
     result = _run(_stores(tmp_path, synthetic), out)
+    assert result.exit_code == 3, f"{result.output}\n{result.exception!r}"
+    assert "candidate forecast is missing 2 required station(s)" in result.output
+    assert all(station in result.output for station in gone)
+    assert not out.exists()
+
+
+def test_dropped_date_is_refused(tmp_path, synthetic) -> None:
+    gone = synthetic.candidate["init_time"].values[[9, 10, 21]]
+    synthetic.candidate = synthetic.candidate.drop_sel(init_time=gone)
+    out = tmp_path / "s.json"
+    result = _run(_stores(tmp_path, synthetic), out)
+    assert result.exit_code == 3, f"{result.output}\n{result.exception!r}"
+    assert "candidate forecast is missing 3 required init time(s)" in result.output
+    for when in gone:
+        assert np.datetime_as_string(when, unit="s") + "Z" in result.output
+    assert not out.exists()
+
+
+def test_dropping_one_init_hour_on_one_day_is_refused(tmp_path, synthetic) -> None:
+    # 00Z and 12Z every day, except one 12Z: the cadence is still {00, 12}, so that 12Z is a missing date.
+    gone = synthetic.candidate["init_time"].values[5]
+    synthetic.candidate = synthetic.candidate.drop_sel(init_time=[gone])
+    result = _run(_stores(tmp_path, synthetic), tmp_path / "s.json")
+    assert result.exit_code == 3, result.output
+    assert np.datetime_as_string(gone, unit="s") + "Z" in result.output
+
+
+def test_more_than_ten_missing_items_lists_ten(tmp_path) -> None:
+    syn = make_synthetic(n_init=40)
+    syn.candidate = syn.candidate.isel(init_time=[0, 1, 2, 3, 36, 37, 38, 39])
+    result = _run(_stores(tmp_path, syn), tmp_path / "s.json", baseline=False)
+    assert result.exit_code == 3, result.output
+    assert "missing 32 required init time(s); first 10:" in result.output
+    assert result.output.count("T00:00:00Z") + result.output.count("T12:00:00Z") == 10
+
+
+@pytest.mark.parametrize("what", ["station", "date"])
+def test_baseline_that_lacks_a_candidate_point_is_refused(tmp_path, synthetic, what: str) -> None:
+    if what == "station":
+        synthetic.baseline = synthetic.baseline.isel(station_id=slice(0, 15))
+    else:
+        synthetic.baseline = synthetic.baseline.isel(init_time=slice(4, None))
+    out = tmp_path / "s.json"
+    result = _run(_stores(tmp_path, synthetic), out)
+    assert result.exit_code == 3, f"{result.output}\n{result.exception!r}"
+    assert "baseline forecast is missing" in result.output
+    assert not out.exists()
+
+
+def test_baseline_may_cover_more_than_the_candidate(tmp_path) -> None:
+    syn = make_synthetic(n_init=30)
+    reference = _scored(_run(_stores(tmp_path / "a", syn), tmp_path / "a.json"), tmp_path / "a.json")
+    # Candidate covers the last 20 init times only; the baseline still has all 30.
+    syn.candidate = syn.candidate.isel(init_time=slice(10, None))
+    out = tmp_path / "b.json"
+    card = _scored(_run(_stores(tmp_path / "b", syn), out), out)
+    assert card["n_init_times"] == 20 and reference["n_init_times"] == 30
+    assert card["period_start"] == "2024-03-06T00:00:00" and card["period_end"] == reference["period_end"]
+    assert card["baseline_sha256"] == reference["baseline_sha256"]
+
+
+def test_stations_outside_the_stations_file_are_not_scored(tmp_path) -> None:
+    syn = make_synthetic(n_stations=23, n_init=12)
+    out = tmp_path / "s.json"
+    result = _run(_stores(tmp_path, syn), out)
     card = _scored(result, out)
-    assert (card["n_stations"], card["n_init_times"]) == (15, 26)
-    assert "not in the baseline" in result.output
-    obs = align_truth(synthetic.baseline, synthetic.truth)
+    assert card["n_stations"] == N_REQUIRED
+    assert "3 forecast station(s) are not in the stations file" in result.output
+    obs = align_truth(syn.candidate.isel(station_id=slice(0, N_REQUIRED)), syn.truth)
     assert card["n_pairs"]["t2m"] == int(np.isfinite(obs["t2m"].values).sum())
+
+
+def test_period_and_sealed_flag_are_recorded(tmp_path, synthetic) -> None:
+    out = tmp_path / "s.json"
+    card = _scored(_run(_stores(tmp_path, synthetic), out), out)
+    assert card["period_start"] == "2024-03-01T00:00:00"
+    assert card["period_end"] == "2024-03-15T12:00:00"
+    assert card["init_hours_scored"] == [0, 12]
+    assert card["sealed_data_used"] is False
 
 
 def test_non_v1_lead_is_not_scored(tmp_path) -> None:

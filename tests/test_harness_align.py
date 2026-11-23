@@ -7,11 +7,16 @@ from conftest import open_zarr, write_zarr
 
 from wrfcomp.harness.align import (
     MAX_LISTED,
+    CoverageError,
     ForecastNaNError,
     SealedSplitError,
     align_truth,
+    check_baseline_covers,
     check_forecast_not_sealed,
+    check_init_times_contiguous,
     check_nan_rule,
+    check_stations,
+    expected_init_times,
 )
 from wrfcomp.harness.hashing import content_sha256
 
@@ -166,3 +171,46 @@ def test_nan_rule_lists_at_most_ten(synthetic) -> None:
         check_nan_rule(forecast, obs)
     assert len(info.value.offenders) == MAX_LISTED
     assert info.value.n_points == int(np.isfinite(obs["t2m"].values[0]).sum()) > MAX_LISTED
+
+
+# ------------------------------------------------------------------ coverage
+
+
+def test_expected_init_times_follow_the_forecast_cadence() -> None:
+    init = np.array(["2024-03-01T06", "2024-03-01T18", "2024-03-03T06"], dtype="datetime64[ns]")
+    expected = expected_init_times(init)
+    want = ["2024-03-01T06", "2024-03-01T18", "2024-03-02T06", "2024-03-02T18", "2024-03-03T06"]
+    np.testing.assert_array_equal(expected, np.array(want, dtype="datetime64[ns]"))
+
+
+def test_contiguous_init_times_pass_in_any_order(synthetic) -> None:
+    check_init_times_contiguous(synthetic.candidate)
+    check_init_times_contiguous(synthetic.candidate.isel(init_time=slice(None, None, -1)))
+    check_init_times_contiguous(synthetic.candidate.isel(init_time=[4]))
+
+
+def test_missing_date_is_named(synthetic) -> None:
+    gone = synthetic.candidate["init_time"].values[12]
+    with pytest.raises(CoverageError) as info:
+        check_init_times_contiguous(synthetic.candidate.drop_sel(init_time=[gone]))
+    assert info.value.missing == [np.datetime_as_string(gone, unit="s") + "Z"]
+
+
+def test_missing_station_is_named(synthetic) -> None:
+    required = [str(s) for s in synthetic.candidate["station_id"].values]
+    check_stations(synthetic.candidate, required)
+    check_stations(synthetic.candidate, required[:5])  # extra stations are not this check's business
+    with pytest.raises(CoverageError) as info:
+        check_stations(synthetic.candidate.isel(station_id=slice(2, None)), required, role="baseline")
+    assert info.value.missing == required[:2] and info.value.role == "baseline"
+
+
+def test_baseline_must_have_every_candidate_init_time(synthetic) -> None:
+    check_baseline_covers(synthetic.candidate.isel(init_time=slice(5, 9)), synthetic.baseline)
+    with pytest.raises(CoverageError, match="baseline forecast is missing 2 required init time"):
+        check_baseline_covers(synthetic.candidate, synthetic.baseline.isel(init_time=slice(2, None)))
+
+
+def test_coverage_error_lists_at_most_ten() -> None:
+    error = CoverageError("candidate", "station(s)", [f"S{i:02d}" for i in range(25)])
+    assert str(error).count("\n") == MAX_LISTED and "missing 25 required" in str(error)

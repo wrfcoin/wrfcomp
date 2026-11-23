@@ -104,9 +104,27 @@ def open_zarr(path: Path) -> xr.Dataset:
     return xr.open_zarr(path, chunks=None, consolidated=False)
 
 
-def write_netcdf(ds: xr.Dataset, path: Path) -> Path:
-    ds.to_netcdf(path)
+def write_netcdf(ds: xr.Dataset, path: Path, *, netcdf3: bool = False) -> Path:
+    """NetCDF4 (h5netcdf) by default; `netcdf3` writes the classic format with scipy."""
+    if netcdf3:
+        ds.to_netcdf(path, engine="scipy")
+    else:
+        ds.to_netcdf(path, engine="h5netcdf")
     return path
+
+
+REPO_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "splits.yaml"
+
+
+def write_config(root: Path, stations: list[str]) -> Path:
+    """A copy of the real splits.yaml next to a synthetic stations file. Returns the config path."""
+    cfg_dir = root / "configs"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "splits.yaml").write_bytes(REPO_CONFIG.read_bytes())
+    pd.DataFrame({"station_id": stations, "station_name": "SYNTHETIC"}).to_csv(
+        cfg_dir / "stations_conus.csv", index=False
+    )
+    return cfg_dir / "splits.yaml"
 
 
 @pytest.fixture

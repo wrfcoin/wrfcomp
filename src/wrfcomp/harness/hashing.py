@@ -2,8 +2,13 @@
 
 The hash covers, for every variable (data variables and coordinates alike) in sorted name order:
 the name, whether it is a coordinate, its dimension names, its shape, a canonical dtype label and its
-values in C order. It does not cover attributes, encodings, chunking, compression or file layout, so
-the same data written twice with different chunks hashes the same.
+values in C order. It does not cover encodings, chunking, compression or file layout, so the same data
+written twice with different chunks hashes the same.
+
+Attributes are deliberately NOT part of the hash (sprint manager decision, 2026-11-23): not the dataset
+attributes (``model_id``, ``model_version``) and not variable attributes (``units``). Two datasets that
+differ only in attributes have the same hash. The scorecard records the model id and version itself, and
+the schema validators check units, so the hash stands for the numbers and their labels only.
 
 Canonical forms (so that a store round trip cannot change the hash):
 

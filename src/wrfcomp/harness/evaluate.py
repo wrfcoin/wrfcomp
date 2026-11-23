@@ -3,7 +3,8 @@
 Exit codes
     0  scored. The gate result is in the JSON (``passed_gate``), not in the exit code.
     2  bad input or schema (also: sealed-split data without ``--allow-sealed``).
-    3  NaN rule: a forecast is not finite at a point where truth is valid.
+    3  cherry-picking rules: a forecast is not finite at a point where truth is valid, or it leaves out
+       a required station or a date (the first 10 offending items are listed).
 
 Scorecard bytes
     JSON with sorted keys, two-space indent, ASCII only, one trailing newline. Every float is rounded to
@@ -14,8 +15,16 @@ Scorecard bytes
 What is scored
     Every primary variable (``configs/splits.yaml``) that the forecast has, at every v1 lead
     (``evaluation.lead_hours``) that the forecast has. Leads outside that list are not scored and are
-    named on stderr. With a baseline, both are scored on the intersection of their
-    ``(init_time, lead_time, station_id)`` labels, and the NaN rule applies to the baseline on those points.
+    named on stderr.
+
+Coverage
+    The forecast must have every station in the config's ``stations_file`` (stations it has beyond that
+    list are not scored and are counted on stderr), and its init times must have no gap: every time
+    between the first and the last init time that falls on one of the hours of day the forecast uses
+    must be present. A baseline must have every required station and every init time of the candidate;
+    both are then scored on exactly those points, at the v1 leads both have. The NaN rule applies to
+    the baseline on those points too. ``period_start`` and ``period_end`` in the scorecard are the first
+    and last init time scored.
 """
 
 from __future__ import annotations
@@ -23,22 +32,28 @@ from __future__ import annotations
 import json
 import math
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import typer
 import xarray as xr
 
 from wrfcomp.harness.align import (
     ENS_DIM,
     POINT_DIMS,
+    CoverageError,
     ForecastNaNError,
     SealedSplitError,
     align_truth,
+    check_baseline_covers,
     check_forecast_not_sealed,
+    check_init_times_contiguous,
     check_nan_rule,
     check_not_sealed,
+    check_stations,
 )
 from wrfcomp.harness.config import load_config
 from wrfcomp.harness.hashing import content_sha256
@@ -134,6 +149,32 @@ def _init_hours(ds: xr.Dataset, allowed: list[int], what: str) -> list[int]:
     return sorted({int(h) for h in hours})
 
 
+def _required_stations(config_path: Path, stations_file: str) -> list[str]:
+    """Station ids from the config's ``stations_file``.
+
+    The path in the config is relative to the repository root, which is the parent of the directory
+    the config sits in (``configs/splits.yaml`` -> ``configs/stations_conus.csv``).
+    """
+    path = Path(stations_file)
+    if not path.is_absolute():
+        path = config_path.resolve().parent.parent / path
+    if not path.is_file():
+        raise BadInputError(f"config: stations_file not found: {stations_file}")
+    try:
+        ids = pd.read_csv(path, dtype=str, usecols=["station_id"])["station_id"]
+    except ValueError as exc:
+        raise BadInputError(f"config: stations_file {stations_file}: {exc}") from exc
+    stations = [str(s).strip() for s in ids.dropna()]
+    if not stations or len(set(stations)) != len(stations):
+        raise BadInputError(f"config: stations_file {stations_file} is empty or has duplicate station_id")
+    return stations
+
+
+def _naive_utc(value: np.datetime64) -> datetime:
+    """numpy time -> timezone-naive UTC datetime at whole-second resolution."""
+    return np.datetime64(value, "s").astype(datetime)
+
+
 # --------------------------------------------------------------------------- the run
 
 
@@ -149,7 +190,10 @@ def run_evaluation(
     config_path: Path,
     allow_sealed: bool,
 ) -> dict[str, Any]:
-    """Score and return the scorecard as plain data. Raises BadInputError or ForecastNaNError."""
+    """Score and return the scorecard as plain data.
+
+    Raises BadInputError (exit 2), or ForecastNaNError / CoverageError (exit 3).
+    """
     if not config_path.is_file():
         raise BadInputError(f"config: no such file: {config_path.name}")
     try:
@@ -157,6 +201,7 @@ def run_evaluation(
     except ValueError as exc:
         raise BadInputError(f"config: {exc}") from exc
     sealed_start = cfg.splits.sealed_test.start
+    required = _required_stations(config_path, cfg.evaluation.stations_file)
 
     forecast = _open(forecast_path, "forecast")
     truth = _open(truth_path, "truth")
@@ -169,11 +214,11 @@ def run_evaluation(
     _require_unique(forecast, "forecast", POINT_DIMS)
     _require_unique(truth, "truth", ("valid_time", "station_id"))
     seal = {"sealed_start": sealed_start, "allow_sealed": allow_sealed}
-    check_forecast_not_sealed(forecast, what="forecast", **seal)
-    check_not_sealed(truth["valid_time"], what="truth valid_time", **seal)
+    sealed_used = check_forecast_not_sealed(forecast, what="forecast", **seal)
+    sealed_used |= check_not_sealed(truth["valid_time"], what="truth valid_time", **seal)
     if baseline is not None:
         _require_unique(baseline, "baseline", POINT_DIMS)
-        check_forecast_not_sealed(baseline, what="baseline", **seal)
+        sealed_used |= check_forecast_not_sealed(baseline, what="baseline", **seal)
 
     validate_forecast_dataset(forecast, cfg=cfg, allow_sealed=allow_sealed)
     validate_truth_dataset(truth, cfg=cfg, allow_sealed=allow_sealed)
@@ -218,25 +263,37 @@ def run_evaluation(
     forecast = forecast[variables].isel(lead_time=np.flatnonzero(keep))
     _init_hours(forecast, list(cfg.evaluation.init_hours_utc), "forecast")
 
+    # Coverage: every required station, no missing date. Dropping hard points is refused like a NaN.
+    check_stations(forecast, required, role="candidate")
+    check_init_times_contiguous(forecast, role="candidate")
+    extra = forecast.sizes["station_id"] - len(required)
+    if extra:
+        typer.echo(
+            f"note: {extra} forecast station(s) are not in the stations file and are not scored", err=True
+        )
+    forecast = forecast.sel(station_id=forecast.indexes["station_id"].isin(required))
+
+    if baseline is not None:
+        check_stations(baseline, required, role="baseline")
+        check_baseline_covers(forecast, baseline)
+        shared = forecast.indexes["lead_time"].isin(baseline.indexes["lead_time"])
+        if not shared.any():
+            raise BadInputError("candidate and baseline share no v1 lead")
+        if not shared.all():
+            dropped = [h for h, ok in zip(_lead_hours(forecast, "forecast"), shared, strict=True) if not ok]
+            typer.echo(f"note: lead hour(s) {dropped} are not in the baseline and are not scored", err=True)
+            forecast = forecast.isel(lead_time=np.flatnonzero(shared))
+        baseline = baseline[variables].sel({d: forecast.indexes[d] for d in POINT_DIMS})
+
     missing_stations = forecast.indexes["station_id"].difference(thresholds.indexes["station_id"])
     if len(missing_stations):
-        raise BadInputError(f"thresholds lack {len(missing_stations)} forecast station(s)")
+        raise BadInputError(f"thresholds lack {len(missing_stations)} required station(s)")
 
     obs = align_truth(forecast, truth, **seal).load()
     forecast = forecast.load()
     check_nan_rule(forecast, obs, role="candidate")
-
     if baseline is not None:
-        common = {d: forecast.indexes[d][forecast.indexes[d].isin(baseline.indexes[d])] for d in POINT_DIMS}
-        for dim, index in common.items():
-            if len(index) == 0:
-                raise BadInputError(f"candidate and baseline share no {dim}")
-            dropped = forecast.sizes[dim] - len(index)
-            if dropped:
-                typer.echo(f"note: {dropped} candidate {dim} value(s) are not in the baseline", err=True)
-        forecast = forecast.sel(common)
-        obs = obs.sel(common)
-        baseline = baseline[variables].sel(common).load()
+        baseline = baseline.load()
         check_nan_rule(baseline, obs, role="baseline")
 
     metrics: dict[str, Any] = {}
@@ -263,6 +320,9 @@ def run_evaluation(
         n_stations=int(forecast.sizes["station_id"]),
         n_init_times=int(forecast.sizes["init_time"]),
         init_hours_scored=_init_hours(forecast, list(cfg.evaluation.init_hours_utc), "forecast"),
+        period_start=_naive_utc(forecast["init_time"].values.min()),
+        period_end=_naive_utc(forecast["init_time"].values.max()),
+        sealed_data_used=bool(sealed_used),
         leads_scored=_lead_hours(forecast, "forecast"),
         n_pairs=n_pairs,
         metrics=metrics,
@@ -313,8 +373,8 @@ def evaluate(
             for line in sorted(set(sealed)):
                 typer.echo(f"  {line}", err=True)
             typer.echo(f"This scorecard must not feed any automated loop.\n{bar}", err=True)
-    except ForecastNaNError as exc:
-        typer.echo(f"NaN rule: {exc}", err=True)
+    except (ForecastNaNError, CoverageError) as exc:
+        typer.echo(f"{'NaN rule' if isinstance(exc, ForecastNaNError) else 'coverage rule'}: {exc}", err=True)
         raise typer.Exit(code=EXIT_NAN_RULE) from exc
     except (BadInputError, SchemaError, SealedSplitError) as exc:
         typer.echo(f"bad input: {exc}", err=True)
