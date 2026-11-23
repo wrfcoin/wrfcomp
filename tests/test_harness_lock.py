@@ -24,6 +24,8 @@ def test_manifest_covers_the_kernel_and_the_config() -> None:
         "src/wrfcomp/harness/truth.py",
         "configs/splits.yaml",
         "configs/stations_conus.csv",
+        "docs/VERIFICATION_PROTOCOL.md",
+        "scripts/check_promotion.py",
     ):
         assert required in files
 
@@ -36,6 +38,7 @@ def test_a_changed_locked_file_is_detected(tmp_path, monkeypatch) -> None:
     (tmp_path / "configs/splits.yaml").write_text("x: 1\n")
     monkeypatch.setattr(tool, "ROOT", tmp_path)
     monkeypatch.setattr(tool, "MANIFEST", tmp_path / "HARNESS_LOCK.json")
+    monkeypatch.setattr(tool, "LOCKED_FILES", ())
     tool.update("test")
     assert tool.check() == []
     (tmp_path / "configs/splits.yaml").write_text("x: 2\n")

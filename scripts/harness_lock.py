@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "HARNESS_LOCK.json"
 LOCKED_DIRS = ("src/wrfcomp/harness", "configs")
+LOCKED_FILES = ("docs/VERIFICATION_PROTOCOL.md", "scripts/check_promotion.py")
 
 
 def locked_files() -> dict[str, str]:
@@ -23,6 +24,10 @@ def locked_files() -> dict[str, str]:
         for path in sorted((ROOT / rel).rglob("*")):
             if path.is_file() and "__pycache__" not in path.parts:
                 out[path.relative_to(ROOT).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for rel in LOCKED_FILES:
+        path = ROOT / rel
+        if path.is_file():
+            out[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
     return out
 
 
@@ -37,7 +42,12 @@ def check() -> list[str]:
 
 
 def update(harness_version: str) -> None:
-    body = {"harness_version": harness_version, "locked_dirs": list(LOCKED_DIRS), "files": locked_files()}
+    body = {
+        "harness_version": harness_version,
+        "locked_dirs": list(LOCKED_DIRS),
+        "locked_files": list(LOCKED_FILES),
+        "files": locked_files(),
+    }
     MANIFEST.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n")
 
 

@@ -7,6 +7,8 @@ after the Gate 1 reference run (`experiments/`).
 
 - `src/wrfcomp/harness/`: scoring rules, truth loader, alignment, content hash, the `wrfcomp-eval` command.
 - `configs/`: split boundaries, station list, gate thresholds.
+- `docs/VERIFICATION_PROTOCOL.md` and `scripts/check_promotion.py`: the written rules and the promotion check
+  (a candidate must pass the gate against both climatology and NOAA GEFS).
 - The lock itself: `HARNESS_LOCK.json`, `scripts/harness_lock.py`, `tests/test_harness_lock.py`, `.github/`.
 
 Everything else (baselines, assimilation, models, scripts, docs, experiments) is open as before.

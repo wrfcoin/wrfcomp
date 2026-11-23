@@ -120,6 +120,13 @@ autocorrelated score differences it held the nominal 5 % false-pass rate in simu
 Harvey-Leybourne-Newbold form at `h = 1` gave 15–31 %; with HG the lag `h` is a floor on the modelled
 autocorrelation and does not change the result on a long series (details in `wrfcomp.harness.metrics`).
 
+**Two reference baselines (owner decision 2026-11-23):** a candidate is promoted only if it passes the whole gate
+above against **both** reference baselines, climatology and NOAA GEFS, each in its own `wrfcomp-eval` scorecard
+for the same forecast, truth, thresholds and period (raw GEFS is the harder reference in winter, climatology in
+summer). `scripts/check_promotion.py <scorecard A> <scorecard B> experiments/` gives the verdict. It also
+refuses a baseline that is not one of the committed reference forecasts in `experiments/`, so a weakened
+stand-in baseline cannot be used. Against GEFS the scored leads are the ones GEFS has (3 h and longer).
+
 **Multiple-Testing Guard (Agentic Research Loops):** When an automated swarm tests `M` candidate architectures on the 2024 validation split within a single research sprint, apply a **Bonferroni-adjusted threshold (`alpha = 0.05 / M`)** or require the winning candidate to hold its gain across at least **3 of 4 calendar quarters** of 2024 before promoting it to a release candidate.
 
 ---

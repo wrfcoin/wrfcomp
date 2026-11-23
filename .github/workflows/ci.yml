@@ -33,7 +33,8 @@ jobs:
         run: |
           changed=$(git diff --name-only "origin/${BASE_REF}...HEAD" -- \
             src/wrfcomp/harness configs HARNESS_LOCK.json scripts/harness_lock.py \
-            tests/test_harness_lock.py .github)
+            tests/test_harness_lock.py .github docs/VERIFICATION_PROTOCOL.md \
+            scripts/check_promotion.py tests/test_check_promotion.py docs/HARNESS_LOCK.md)
           if [ -z "$changed" ]; then
             echo "No locked path touched."
             exit 0

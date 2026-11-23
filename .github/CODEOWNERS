@@ -5,3 +5,7 @@
 /scripts/harness_lock.py        @tonykoop
 /tests/test_harness_lock.py     @tonykoop
 /.github/                @tonykoop
+/docs/VERIFICATION_PROTOCOL.md  @tonykoop
+/docs/HARNESS_LOCK.md           @tonykoop
+/scripts/check_promotion.py     @tonykoop
+/tests/test_check_promotion.py  @tonykoop

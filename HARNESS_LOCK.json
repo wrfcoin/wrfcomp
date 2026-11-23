@@ -2,6 +2,8 @@
   "files": {
     "configs/splits.yaml": "5363b9dec556967e3913c316f471029cad73754761de793c887d8a67980d4244",
     "configs/stations_conus.csv": "a21832e211ab4232e844b0bba633223588cbd7964d7367d49284dd9bbd27a819",
+    "docs/VERIFICATION_PROTOCOL.md": "fb12164635b578410a4e7179bba5ba997daa8cf8e85c10afbbccf852fe708b4b",
+    "scripts/check_promotion.py": "e0772f61bf92405619679ed56c87e8919ccf3cda0e1e407b77fb16ca9a9ce939",
     "src/wrfcomp/harness/__init__.py": "ae51a905c745f257da1c1e26b34b8ff62473cc07b93a744cbdfbe692cf8eb205",
     "src/wrfcomp/harness/align.py": "26e45bf17ed71c507deaab2f6419aaae910121f5d1ecdbb3443d351fae2dcdb7",
     "src/wrfcomp/harness/config.py": "27bb2d9fc071ddff3d6abf88d1b09c4bf8b7e8daabc1383680a08c626555928e",
@@ -15,5 +17,9 @@
   "locked_dirs": [
     "src/wrfcomp/harness",
     "configs"
+  ],
+  "locked_files": [
+    "docs/VERIFICATION_PROTOCOL.md",
+    "scripts/check_promotion.py"
   ]
 }
