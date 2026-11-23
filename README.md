@@ -43,11 +43,11 @@ uv run pytest
 
 The `ai` extra (Earth2Studio, torch) needs an NVIDIA GPU and is not required for the harness or the tests.
 
-## Review rule
+## Harness lock
 
-Changes under `src/wrfcomp/harness/` or `configs/` need a review from a different model provider than the
-author before merge. After the Gate 1 sign-off those paths are locked: changing them needs the project
-owner's approval, a protocol version bump and a re-score of every baseline. Everything else merges on green CI.
+`src/wrfcomp/harness/` and `configs/` are **locked at harness version 0.1.0** (2026-11-23). A change there
+needs the project owner's approval, a version bump and a re-score of every baseline; CI refuses it otherwise.
+See [docs/HARNESS_LOCK.md](docs/HARNESS_LOCK.md). Everything else merges on green CI.
 
 ## Data
 

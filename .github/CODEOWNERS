@@ -1,0 +1,7 @@
+# The scoring kernel and its configuration are locked (docs/HARNESS_LOCK.md).
+/src/wrfcomp/harness/   @tonykoop
+/configs/               @tonykoop
+/HARNESS_LOCK.json      @tonykoop
+/scripts/harness_lock.py        @tonykoop
+/tests/test_harness_lock.py     @tonykoop
+/.github/                @tonykoop

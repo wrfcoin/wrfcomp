@@ -1,0 +1,19 @@
+{
+  "files": {
+    "configs/splits.yaml": "5363b9dec556967e3913c316f471029cad73754761de793c887d8a67980d4244",
+    "configs/stations_conus.csv": "a21832e211ab4232e844b0bba633223588cbd7964d7367d49284dd9bbd27a819",
+    "src/wrfcomp/harness/__init__.py": "ae51a905c745f257da1c1e26b34b8ff62473cc07b93a744cbdfbe692cf8eb205",
+    "src/wrfcomp/harness/align.py": "26e45bf17ed71c507deaab2f6419aaae910121f5d1ecdbb3443d351fae2dcdb7",
+    "src/wrfcomp/harness/config.py": "27bb2d9fc071ddff3d6abf88d1b09c4bf8b7e8daabc1383680a08c626555928e",
+    "src/wrfcomp/harness/evaluate.py": "165b301d351033546811691ba2d89e3939a47df0a5bc43425ad40367a804bf27",
+    "src/wrfcomp/harness/hashing.py": "9053a91e2815948752019ae8df435c96e346e19aa63abca4d59cf01c149f6703",
+    "src/wrfcomp/harness/metrics.py": "360e245fd92d671706a94c9025568bc54e1bdb8f65b0eb27df65b63f5aba32dd",
+    "src/wrfcomp/harness/schemas.py": "850de36a6574f92d5b14e199e0f47165c4b0319f8be1a95a373d79bfd860f4b3",
+    "src/wrfcomp/harness/truth.py": "b1e769728142ffe83bb60cbcb2b1e879dd63982db3426938162f9f0050f3b1ae"
+  },
+  "harness_version": "0.1.0",
+  "locked_dirs": [
+    "src/wrfcomp/harness",
+    "configs"
+  ]
+}

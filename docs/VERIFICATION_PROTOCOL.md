@@ -1,7 +1,7 @@
 # WRFComp Forecast Verification Protocol
 
 **Target path:** `docs/VERIFICATION_PROTOCOL.md` in [`wrfcoin/wrfcomp`](https://github.com/wrfcoin)  
-**Status:** Draft v0.1 (Immutable Grading Kernel Specification)
+**Status:** v0.1, LOCKED on 2026-11-23 at harness version 0.1.0 (see `docs/HARNESS_LOCK.md`)
 
 > `configs/splits.yaml` is the single source for split boundaries, initialisation hours, lead times,
 > variables and gate thresholds. If this document and that file disagree, the file wins and this document
