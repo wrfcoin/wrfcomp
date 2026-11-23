@@ -35,6 +35,7 @@ evaluation:
     min_crpss_vs_baseline: 0.0
     spread_skill_min: 0.85
     spread_skill_max: 1.15
+    min_members_for_gate: 8          # smaller ensembles are scored but can never pass the gate
     tail_quantile: 0.95
     tail_threshold_source: "train"   # per station and calendar month, from the train split only
     loss_weights:
