@@ -1,5 +1,7 @@
 """Shared forecast layout and split boundaries."""
+
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import xarray as xr
@@ -22,9 +24,17 @@ def layout(stations, inits, leads, members, model):
     times = np.asarray(inits, dtype="datetime64[ns]")
     hours = np.asarray(leads, dtype="timedelta64[h]").astype("timedelta64[ns]")
     _, sealed = boundaries()
-    if (times.ndim != 1 or not times.size or hours.ndim != 1 or not hours.size
-            or np.isnat(times).any() or np.isnat(hours).any() or (hours <= np.timedelta64(0)).any()
-            or (times[:, None] + hours >= sealed).any() or members < 2):
+    if (
+        times.ndim != 1
+        or not times.size
+        or hours.ndim != 1
+        or not hours.size
+        or np.isnat(times).any()
+        or np.isnat(hours).any()
+        or (hours <= np.timedelta64(0, "ns")).any()
+        or (times[:, None] + hours >= sealed).any()
+        or members < 2
+    ):
         raise ValueError("invalid or sealed forecast window/member count")
     coords = {name: stations[name] for name in ("station_id", *STATION)}
     coords.update(init_time=times, lead_time=hours, ens_member=np.arange(members))
@@ -44,7 +54,11 @@ def train_truth(truth, forecast):
 def validate(ds):
     if set(ds.dims) != set(DIMS) or ds.sizes["ens_member"] < 2:
         raise ValueError("forecast dimensions or ensemble size")
-    if ds.init_time.dtype != "M8[ns]" or ds.lead_time.dtype != "m8[ns]" or ds.ens_member.dtype.kind not in "iu":
+    if (
+        ds.init_time.dtype != "M8[ns]"
+        or ds.lead_time.dtype != "m8[ns]"
+        or ds.ens_member.dtype.kind not in "iu"
+    ):
         raise ValueError("forecast coordinate dtype")
     if any(not isinstance(s, str) or len(s) != 11 for s in ds.station_id.values):
         raise ValueError("station_id must contain 11-character strings")
@@ -66,4 +80,13 @@ def validate(ds):
 
 def write(ds, path):
     validate(ds)
-    ds.to_zarr(path, mode="w-", consolidated=True, zarr_format=2)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise FileExistsError(path)
+    with TemporaryDirectory(dir=path.parent) as staging:
+        store = Path(staging) / "forecast.zarr"
+        ds.to_zarr(store, mode="w-", consolidated=True, zarr_format=2)
+        with xr.open_zarr(store) as restored:
+            validate(restored)
+        store.rename(path)

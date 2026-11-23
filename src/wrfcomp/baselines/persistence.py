@@ -1,4 +1,5 @@
 """Offset-aware latest observations and empirical lead-specific error quantiles."""
+
 import numpy as np
 
 from .io import UNITS, boundaries, layout, train_truth
