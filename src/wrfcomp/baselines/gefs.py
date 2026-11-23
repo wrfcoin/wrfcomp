@@ -166,7 +166,7 @@ def extract(stations, init, cache, transfer):
             fields = {k: points(transfer.get(base, ranges[field]), stations) for k, field in FIELDS.items()}
             c = fields["t2m"] - 273.15
             rh = fields.pop("rh")
-            if np.any((rh <= 0) | (rh > 100)):
+            if np.any(~np.isfinite(rh) | (rh <= 0)):
                 raise ValueError("relative humidity outside dewpoint formula domain")
             gamma = np.log(rh / 100) + 17.625 * c / (243.04 + c)
             fields["t2m"] = lapse(fields["t2m"], height, stations.elevation_m.values)

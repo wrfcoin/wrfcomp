@@ -24,7 +24,8 @@ def test_bilinear_and_lapse():
     np.testing.assert_allclose(gefs.lapse(result, 500, np.array([1500, 0])), [278.5, 288.25])
 
 
-def test_extract_and_resume(monkeypatch, tmp_path):
+@pytest.mark.parametrize("humidity", [90.0, 100.04158782958984])
+def test_extract_and_resume(monkeypatch, tmp_path, humidity):
     fields = [gefs.HEIGHT, *gefs.FIELDS.values()]
     fixture = "\n".join(f"{i + 1}:{i}:d=2024010100:{v}:{level}:fcst" for i, (v, level) in enumerate(fields))
 
@@ -32,7 +33,7 @@ def test_extract_and_resume(monkeypatch, tmp_path):
         def get(self, url, interval=None):
             if url.endswith(".idx"):
                 return fixture.encode()
-            return [100.0, 280.0, 90.0, -2.0, 1.0, 99000.0][interval[0]]
+            return [100.0, 280.0, humidity, -2.0, 1.0, 99000.0][interval[0]]
 
     monkeypatch.setattr(gefs, "points", lambda value, stations: np.array([value]))
     stations = xr.Dataset(
