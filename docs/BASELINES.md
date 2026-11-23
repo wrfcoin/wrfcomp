@@ -73,6 +73,48 @@ The restart cache stores extracted station arrays per completed member and lead,
 cycle, algorithm version and station metadata. Rerun the command after interruption.
 A completed Zarr is published after schema checks. Existing output is protected.
 
+### Known limits on real data (January and July 2024)
+
+These are measured properties of the raw GEFS baseline at 500 vetted stations, using 62
+initializations per month (00Z and 12Z) and hourly ISD truth. **No lapse rate was tuned
+on validation data.** The comparison uses the same ensemble members and observed
+station-hours in both columns. “Raw” means bilinearly interpolated 2 m temperature
+before the height adjustment. “Corrected” includes the protocol's fixed 6.5 K/km
+adjustment. Bias is ensemble-mean forecast minus observation.
+
+| 24-hour t2m diagnostic | January raw | January corrected | July raw | July corrected |
+| --- | ---: | ---: | ---: | ---: |
+| Gate 1 skill over climatology (fair composite loss) | 51.40% | 54.70% | −3.01% | +3.68% |
+| Ensemble-mean RMSE (K) | 2.71 | 2.61 | 2.64 | 2.52 |
+| Station mean bias slope versus station minus model elevation (K/km) | +4.96 | −1.54 | +4.21 | −2.29 |
+
+The negative residual slopes show that the fixed adjustment was stronger than the
+observed cross-station gradient in both months, even as it improved skill. July's
++0.41 correlation (+0.09 in January) is between corrected station bias and **station
+elevation alone**. The correction acts on the **difference** between station and model
+elevation. Across all five leads, July skill averaged −2.54% raw and +3.76% corrected.
+[January scorecard](../experiments/gefs_2024-01.json) · [July scorecard](../experiments/gefs_2024-07.json)
+
+At 24 hours in July, 13 stations had absolute mean bias above 3 K (ten warm, three
+cold). The half-degree grid places terrain hundreds of metres above three coastal
+airports and close to sea level at Catalina. In each case the adjustment amplified
+an existing error.
+
+| Airport | Station / model elevation (m) | Applied adjustment (K) | Raw bias (K) | Corrected bias (K) |
+| --- | ---: | ---: | ---: | ---: |
+| Santa Barbara Municipal | 2.5 / 363.4 | +2.35 | +4.67 | +7.02 |
+| Oxnard | 11.9 / 356.1 | +2.24 | +3.77 | +6.00 |
+| Salinas Municipal | 22.3 / 332.9 | +2.02 | +3.77 | +5.79 |
+| Catalina | 477.0 / 4.6 | −3.07 | −2.52 | −5.59 |
+
+Across all five July leads, daytime RMSE fell from 2.37 K raw to 2.32 K corrected,
+and nighttime RMSE fell from 2.97 K to 2.71 K. Day and night use solar elevation at
+the station and forecast valid time (above 10° and below 0°, respectively), excluding
+twilight. Several inland airports still had a large nighttime warm bias. At 24 hours,
+corrected day and night biases were −0.21 and +7.18 K at Grand Canyon National Park,
++0.06 and +6.55 K at Bryce Canyon, and −0.45 and +6.86 K at Derby Field. The height
+adjustment is constant at each station, so it cannot account for the day–night swing.
+
 ## One-cycle sizing
 
 A cold run for 2024-01-01 00Z covered 500 stations, 31 members and five leads.
