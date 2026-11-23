@@ -178,10 +178,17 @@ def test_truth_and_thresholds_as_netcdf_score_the_same(tmp_path, synthetic, netc
     stores["thresholds"] = write_netcdf(synthetic.thresholds, tmp_path / "th.nc", netcdf3=netcdf3)
     magic = stores["truth"].read_bytes()[:4]
     assert magic.startswith(b"CDF") if netcdf3 else magic == b"\x89HDF"
-    _scored(_run(stores, tmp_path / "b.json"), tmp_path / "b.json")
-    assert (tmp_path / "b.json").read_bytes() == (tmp_path / "a.json").read_bytes()
-    assert a["truth_sha256"] == content_sha256(synthetic.truth)
+    b = _scored(_run(stores, tmp_path / "b.json"), tmp_path / "b.json")
+    assert a["truth_sha256"] == b["truth_sha256"] == content_sha256(synthetic.truth)
     assert a["thresholds_sha256"] == content_sha256(synthetic.thresholds)
+    if netcdf3:
+        # NetCDF3 has no 64-bit integers, so `month` comes back as int32. The hash covers dtypes, so the
+        # thresholds hash differs; nothing else in the scorecard does.
+        assert xr.open_dataset(stores["thresholds"])["month"].dtype == np.dtype("int32")
+        assert b.pop("thresholds_sha256") != a.pop("thresholds_sha256")
+        assert a == b
+    else:
+        assert (tmp_path / "b.json").read_bytes() == (tmp_path / "a.json").read_bytes()
 
 
 def test_forecast_nan_at_valid_truth_point_exits_3(tmp_path, synthetic) -> None:

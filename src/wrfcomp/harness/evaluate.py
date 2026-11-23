@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import math
 import warnings
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,7 @@ from wrfcomp.harness.align import (
     check_not_sealed,
     check_stations,
 )
-from wrfcomp.harness.config import load_config
+from wrfcomp.harness.config import HarnessConfig, load_config
 from wrfcomp.harness.hashing import content_sha256
 from wrfcomp.harness.metrics import evaluate_gates, score_variable
 from wrfcomp.harness.schemas import (
@@ -200,15 +201,46 @@ def run_evaluation(
         cfg = load_config(config_path)
     except ValueError as exc:
         raise BadInputError(f"config: {exc}") from exc
-    sealed_start = cfg.splits.sealed_test.start
     required = _required_stations(config_path, cfg.evaluation.stations_file)
 
-    forecast = _open(forecast_path, "forecast")
-    truth = _open(truth_path, "truth")
-    thresholds = _open(thresholds_path, "thresholds")
-    baseline = _open(baseline_path, "baseline") if baseline_path is not None else None
-    if baseline is None and baseline_id is not None:
+    if baseline_path is None and baseline_id is not None:
         raise BadInputError("--baseline-id was given without --baseline")
+
+    with ExitStack() as stack:  # every input file is closed again, also on a refusal
+
+        def opened(path: Path, what: str) -> xr.Dataset:
+            ds = _open(path, what)
+            stack.callback(ds.close)
+            return ds
+
+        return _score_opened(
+            cfg=cfg,
+            required=required,
+            forecast=opened(forecast_path, "forecast"),
+            truth=opened(truth_path, "truth"),
+            thresholds=opened(thresholds_path, "thresholds"),
+            baseline=opened(baseline_path, "baseline") if baseline_path is not None else None,
+            model_id=model_id,
+            model_version=model_version,
+            baseline_id=baseline_id,
+            allow_sealed=allow_sealed,
+        )
+
+
+def _score_opened(
+    *,
+    cfg: HarnessConfig,
+    required: list[str],
+    forecast: xr.Dataset,
+    truth: xr.Dataset,
+    thresholds: xr.Dataset,
+    baseline: xr.Dataset | None,
+    model_id: str,
+    model_version: str,
+    baseline_id: str | None,
+    allow_sealed: bool,
+) -> dict[str, Any]:
+    sealed_start = cfg.splits.sealed_test.start
 
     # Sealed split first: coordinates only, before any value is read or hashed.
     _require_unique(forecast, "forecast", POINT_DIMS)
