@@ -5,7 +5,9 @@ from tempfile import TemporaryDirectory
 
 import numpy as np
 import xarray as xr
-import yaml
+
+from wrfcomp.harness.config import load_config
+from wrfcomp.harness.schemas import validate_forecast_dataset
 
 UNITS = {"t2m": "K", "td2m": "K", "u10": "m/s", "v10": "m/s", "msl": "Pa"}
 DIMS = ("init_time", "lead_time", "station_id", "ens_member")
@@ -14,10 +16,8 @@ CONFIG = Path(__file__).resolve().parents[3] / "configs/splits.yaml"
 
 
 def boundaries():
-    splits = yaml.safe_load(CONFIG.read_text())["splits"]
-    end = np.datetime64(splits["train"]["end_utc"].removesuffix("Z"))
-    sealed = np.datetime64(splits["sealed_test"]["start_utc"].removesuffix("Z"))
-    return end, sealed
+    splits = load_config(CONFIG).splits
+    return splits.train.end, splits.sealed_test.start
 
 
 def layout(stations, inits, leads, members, model):
@@ -52,30 +52,7 @@ def train_truth(truth, forecast):
 
 
 def validate(ds):
-    if set(ds.dims) != set(DIMS) or ds.sizes["ens_member"] < 2:
-        raise ValueError("forecast dimensions or ensemble size")
-    if (
-        ds.init_time.dtype != "M8[ns]"
-        or ds.lead_time.dtype != "m8[ns]"
-        or ds.ens_member.dtype.kind not in "iu"
-    ):
-        raise ValueError("forecast coordinate dtype")
-    if any(not isinstance(s, str) or len(s) != 11 for s in ds.station_id.values):
-        raise ValueError("station_id must contain 11-character strings")
-    if any(ds[k].dims != ("station_id",) for k in STATION) or not all(
-        ds.attrs.get(k) for k in ("model_id", "model_version")
-    ):
-        raise ValueError("missing station coordinates or model identity")
-    for name, unit in UNITS.items():
-        if ds[name].dims != DIMS or ds[name].dtype != "float32" or ds[name].attrs.get("units") != unit:
-            raise ValueError(f"invalid forecast variable {name}")
-    try:
-        from wrfcomp.harness.schemas import validate_forecast_dataset
-    except ModuleNotFoundError as exc:
-        if exc.name != "wrfcomp.harness.schemas":
-            raise
-    else:
-        validate_forecast_dataset(ds, variables=list(UNITS))
+    validate_forecast_dataset(ds, variables=list(UNITS))
 
 
 def write(ds, path):
