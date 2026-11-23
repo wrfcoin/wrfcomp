@@ -58,7 +58,7 @@ from wrfcomp.harness.align import (
 )
 from wrfcomp.harness.config import HarnessConfig, load_config
 from wrfcomp.harness.hashing import content_sha256
-from wrfcomp.harness.metrics import evaluate_gates, score_variable
+from wrfcomp.harness.metrics import evaluate_gates, evaluation_init_times, score_variable
 from wrfcomp.harness.schemas import (
     SchemaError,
     Scorecard,
@@ -328,6 +328,14 @@ def _score_opened(
         baseline = baseline.load()
         check_nan_rule(baseline, obs, role="baseline")
 
+    # The evaluation grid handed to the kernel: the stations file, and every init time of the scored
+    # period at the hours of day this run uses. The checks above already refused a forecast that does
+    # not cover it; the kernel checks again.
+    init_hours = _init_hours(forecast, list(cfg.evaluation.init_hours_utc), "forecast")
+    period = (forecast["init_time"].values.min(), forecast["init_time"].values.max())
+    grid_init = evaluation_init_times(period[0], period[1], init_hours)
+    grid_stations = [s for s in required if s in set(forecast["station_id"].values.tolist())]
+
     metrics: dict[str, Any] = {}
     gates: dict[str, Any] = {}
     n_pairs: dict[str, int] = {}
@@ -336,7 +344,9 @@ def _score_opened(
         bl = baseline[name].transpose(*POINT_DIMS, ENS_DIM) if baseline is not None else None
         tail = thresholds[name].sel(station_id=forecast["station_id"].values).load()
         try:
-            metrics[name] = score_variable(fc, obs[name], tail, bl, cfg=cfg)
+            metrics[name] = score_variable(
+                fc, obs[name], tail, bl, cfg=cfg, init_times=grid_init, station_ids=grid_stations
+            )
         except ValueError as exc:  # for example a NaN threshold at a point with valid truth
             raise BadInputError(f"{name}: {exc}") from exc
         gates[name] = evaluate_gates(metrics[name], cfg)
@@ -351,9 +361,9 @@ def _score_opened(
         commit_sha256=None,
         n_stations=int(forecast.sizes["station_id"]),
         n_init_times=int(forecast.sizes["init_time"]),
-        init_hours_scored=_init_hours(forecast, list(cfg.evaluation.init_hours_utc), "forecast"),
-        period_start=_naive_utc(forecast["init_time"].values.min()),
-        period_end=_naive_utc(forecast["init_time"].values.max()),
+        init_hours_scored=init_hours,
+        period_start=_naive_utc(period[0]),
+        period_end=_naive_utc(period[1]),
         sealed_data_used=bool(sealed_used),
         leads_scored=_lead_hours(forecast, "forecast"),
         n_pairs=n_pairs,
