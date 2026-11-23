@@ -46,7 +46,9 @@ def test_persistence_observed_cutoff_and_last_slot(truth, tmp_path):
     out = persistence.forecast(truth, [init], [3])
     np.testing.assert_equal(out.t2m.values, np.full((1, 1, 1, 30), 803))
     assert (out.u10 == 503).all()
-    assert out.v10.isnull().all()
+    expected = climatology.forecast(truth, [init], [3])
+    assert np.isfinite(expected.v10).all()
+    xr.testing.assert_identical(out.v10, expected.v10)
     truth.t2m.loc[dict(valid_time=slice(init, None))] = -99999
     xr.testing.assert_identical(out, persistence.forecast(truth, [init], [3]))
     path = tmp_path / "forecast.zarr"
@@ -55,6 +57,20 @@ def test_persistence_observed_cutoff_and_last_slot(truth, tmp_path):
         validate(restored)
         xr.testing.assert_identical(restored, out)
     assert out.t2m.dims == DIMS
+
+
+def test_no_training_wind_or_recent_anchor_leaves_members_missing(truth):
+    init = np.datetime64("2024-01-01T00", "ns")
+    truth.v10.values[:] = np.nan
+    truth.v10_offset_min.values[:] = -32768
+    # Valid verifying truth exists, but arrives after initialization.
+    valid = init + np.timedelta64(3, "h")
+    truth.v10.loc[dict(valid_time=valid)] = 5
+    truth.v10_offset_min.loc[dict(valid_time=valid)] = 0
+    for model in (climatology, persistence):
+        out = model.forecast(truth, [init], [3])
+        assert out.v10.isnull().all()
+        assert np.isfinite(out.u10).all()
 
 
 def test_ai_stub():
