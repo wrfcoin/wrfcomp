@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from .climatology import fill_missing_members
 from .io import UNITS, boundaries, historical_layout, train_truth
 
 
@@ -25,7 +26,7 @@ def latest(truth, name, times):
 
 
 def forecast(truth, inits, leads, members=None):
-    """Add empirical error quantiles; missing starts or empty error pools leave all members NaN."""
+    """Add empirical error quantiles; use climatology where the start or error sample is missing."""
     out = historical_layout(truth, inits, leads, members, "persistence")
     archive = train_truth(truth, out)
     dates = archive.valid_time.to_index()
@@ -53,4 +54,5 @@ def forecast(truth, inits, leads, members=None):
                     if finite.size:
                         quantiles = np.quantile(finite, qs, method="inverted_cdf")
                         out[name].values[rows, j, k] = now[rows, k, None] + quantiles
+    fill_missing_members(out, archive, cutoff)
     return out

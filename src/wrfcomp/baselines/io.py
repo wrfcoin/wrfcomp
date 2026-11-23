@@ -27,7 +27,7 @@ def historical_layout(stations, inits, leads, members, model):
     if members < floor:
         raise ValueError(f"{model} requires at least {floor} ensemble members")
     forecast = layout(stations, inits, leads, members, model)
-    forecast.attrs["model_version"] = "2"
+    forecast.attrs["model_version"] = "3"
     return forecast
 
 

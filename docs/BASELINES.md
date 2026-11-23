@@ -16,7 +16,7 @@ UTC times. A run refuses windows that would reach the sealed period.
 
 ## Historical baselines
 
-Climatology and persistence write `model_version="2"` and cover leads of 1, 3, 6, 12,
+Climatology and persistence write `model_version="3"` and cover leads of 1, 3, 6, 12,
 24 and 48 hours. Both use observations from 2014 onward for calibration. The inclusive
 cutoff is the earlier of the configured training end and the earliest initialization in
 the request. A report's measurement time is its hourly label plus its variable-specific
@@ -30,10 +30,15 @@ Values can repeat. The default ensemble size is the larger of 30 and
 must meet that floor.
 
 **Climatology** builds a sample for each station, variable and forecast valid time.
-It selects finite observations at the same UTC hour within seven calendar days of the
-target date, wrapping across New Year on a common leap-year calendar. Each report's
-measurement time must be at or before the cutoff. Members are quantiles of the sampled
-values. An empty sample yields NaN for every member.
+Members come from the first pool with a finite observation whose measurement time is
+at or before the calibration cutoff. The search order is:
+
+1. The target UTC hour within seven calendar days of the target date.
+2. The same UTC hour within 30 calendar days.
+3. Any UTC hour in the target calendar month.
+
+Both day windows wrap across New Year on a common leap-year calendar. Each pool uses
+the same station and variable. If all three pools are empty, every member is NaN.
 
 **Persistence** checks the hourly slots from initialization back through three hours.
 For each station and variable, it takes the latest slot with a finite observation
@@ -42,8 +47,9 @@ station, variable, lead and UTC initialization hour, the calibration sample cont
 the verifying observation minus the historical starting value for each eligible pair.
 Both ends come from training data, and the verifying report must have been measured
 by the cutoff. Each forecast member adds one empirical error quantile to the current
-starting value. A missing starting value or an empty error sample yields NaN for
-every member. Points without an eligible starting value are excluded for persistence only.
+starting value. If the three-hour lookback yields no eligible starting value, or if the
+error sample is empty, persistence uses the climatology members for that station,
+variable and valid time. If climatology also exhausts its pools, the point remains NaN.
 
 ## NOAA GEFS
 

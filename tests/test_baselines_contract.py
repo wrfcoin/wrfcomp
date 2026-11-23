@@ -114,7 +114,7 @@ def test_climatology_represents_empirical_frequency_without_date_aliasing():
     np.testing.assert_array_equal(out.t2m.values[0, 0, 0], [280] * 4 + [290] * 4)
 
 
-def test_persistence_preserves_observed_error_mass_and_requires_calibration():
+def test_persistence_preserves_observed_error_mass_and_falls_back_without_calibration():
     truth = observations("2023-12-01", "2023-12-06", 72)
     truth.t2m.values[:] = np.nan
     truth.t2m_offset_min.values[:] = -32768
@@ -129,7 +129,7 @@ def test_persistence_preserves_observed_error_mass_and_requires_calibration():
             truth.t2m_offset_min.loc[row] = 0
     out = persistence.forecast(truth, [t], [1], members=8)
     np.testing.assert_array_equal(out.t2m.values[0, 0, 0], [275] * 4 + [285] * 4)
-    assert out.t2m.isel(station_id=1).isnull().all()
+    np.testing.assert_array_equal(out.t2m.values[0, 0, 1], [280] * 8)
     old = np.quantile([-5, 5], (np.arange(8) + 0.5) / 8)
     assert np.ptp(old) == 8.75
 
@@ -151,3 +151,60 @@ def test_staged_schema_failure_keeps_destination_unpublished(tmp_path, monkeypat
     with pytest.raises(SchemaError, match="model_id"):
         write(forecast, tmp_path / "forecast.zarr")
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("model", MODELS)
+@pytest.mark.parametrize("init", ["2023-12-16T18", "2024-12-16T18"])
+def test_ordered_pools_and_fallback_measurement_cutoffs(model, init):
+    truth = observations("2022-11-01", "2024-12-19", 91)
+    init = np.datetime64(init, "ns")
+    cutoff = min(init, END)
+    truth.t2m.values[:] = np.nan
+    truth.t2m_offset_min.values[:] = -32768
+
+    def report(time, station, value, offset=0):
+        row = dict(valid_time=np.datetime64(time, "ns"), station_id=truth.station_id.values[station])
+        truth.t2m.loc[row] = value
+        truth.t2m_offset_min.loc[row] = offset
+
+    # Target December 17 at 18Z. Each wider pool has a distinct empirical distribution.
+    for time, value in [
+        ("2022-12-10T18", 270),
+        ("2022-12-11T18", 272),
+        ("2022-11-17T18", 280),
+        ("2022-11-18T18", 282),
+        ("2022-12-01T03", 290),
+        ("2022-12-02T04", 292),
+    ]:
+        report(time, 0, value)
+    # A different variable/station cannot fill this station's December pool.
+    report("2022-11-16T18", 1, 299)
+    report("2022-11-30T04", 1, 299)
+
+    for stage, expected in enumerate(([270, 272], [280, 282], [290, 292])):
+        clean = model.forecast(truth, [init], [24], members=8)
+        assert clean.attrs["model_version"] == "3"
+        np.testing.assert_array_equal(clean.t2m.values[0, 0, 0], np.repeat(expected, 4))
+        assert clean.t2m.isel(station_id=1).isnull().all()
+
+        poisoned = truth.copy(deep=True)
+        for late, offset in [(cutoff, 1), (cutoff + 24 * HOUR, 0), (init, 1), (init + HOUR, 0)]:
+            poisoned.t2m.loc[dict(valid_time=late)] = 330
+            poisoned.t2m_offset_min.loc[dict(valid_time=late)] = offset
+        xr.testing.assert_identical(clean, model.forecast(poisoned, [init], [24], members=8))
+        if stage < 2:
+            removed = ["2022-12-10T18", "2022-12-11T18"] if stage == 0 else ["2022-11-17T18", "2022-11-18T18"]
+            for time in removed:
+                report(time, 0, np.nan, -32768)
+
+
+def test_wider_pool_wraps_across_new_year():
+    truth = observations("2022-12-01", "2023-01-05", 92)
+    truth.t2m.values[:] = np.nan
+    truth.t2m_offset_min.values[:] = -32768
+    truth.t2m.loc[dict(valid_time="2022-12-15T06")] = 277
+    truth.t2m_offset_min.loc[dict(valid_time="2022-12-15T06")] = 0
+    init = np.datetime64("2023-01-01T00")
+    for model in MODELS:
+        out = model.forecast(truth, [init], [6])
+        assert (out.t2m == 277).all()
