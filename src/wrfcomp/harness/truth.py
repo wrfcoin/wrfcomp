@@ -21,7 +21,11 @@ from typing import TextIO
 import numpy as np
 import pandas as pd
 import xarray as xr
-import yaml
+
+from wrfcomp.harness.config import HarnessConfig, load_config
+from wrfcomp.harness.schemas import validate_truth_dataset
+
+PARSER_VERSION: str = "2"
 
 PRIMARY_VARS: tuple[str, ...] = ("t2m", "td2m", "u10", "v10", "msl")
 OFFSET_VARS: tuple[str, ...] = tuple(f"{v}_offset_min" for v in PRIMARY_VARS)
@@ -35,42 +39,76 @@ VAR_UNITS: dict[str, str] = {
     "msl": "Pa",
 }
 
-# NOAA ISD Format Document (isd-format-document.pdf, pp. 7-12):
+# NOAA ISD Format Document (isd-format-document.pdf, pp. 8-12):
 #   0 = Passed gross limits check
 #   1 = Passed all quality control checks
 #   4 = Passed gross limits check, data originate from an NCEI data source
 #   5 = Passed all quality control checks, data originate from an NCEI data source
 #   9 = Passed gross limits check if element is present (only accepted for non-missing values)
-#   A = Data value flagged as suspect, but accepted as a good value (NCEI Interactive QC)
-#   C = AWOS temperature/dewpoint reported in whole degrees Celsius; automated QC flags but accepts as valid
-PASSING_QC_CODES: frozenset[str] = frozenset({"0", "1", "4", "5", "9", "A", "C"})
-PASSING_QC_CODES_NO_AWOS_C: frozenset[str] = frozenset({"0", "1", "4", "5", "9", "A"})
+#   A = Data value flagged as suspect, but accepted as a good value (listed on TMP/DEW, pp. 10-11)
+#   C = AWOS temperature/dewpoint reported in whole degrees Celsius; automated QC flags but accepts
+#       as valid (listed on TMP/DEW, pp. 10-11)
+PASSING_QC_CODES_TEMP_DEW: frozenset[str] = frozenset({"0", "1", "4", "5", "9", "A", "C"})
+PASSING_QC_CODES_WIND_SLP: frozenset[str] = frozenset({"0", "1", "4", "5", "9"})
+PASSING_QC_CODES: frozenset[str] = PASSING_QC_CODES_TEMP_DEW
+
+# Report-type filtering (see docs/TRUTH_SOURCES.md):
+# Use METAR-family reports (FM-15, FM-16) whenever a station-year has any, avoiding 3-hourly FM-12
+# synoptic copies of the preceding :53 routine METAR. Fall back to FM-12 / SY-MT only for
+# station-years with zero FM-15 / FM-16 rows.
+METAR_REPORT_TYPES: frozenset[str] = frozenset({"FM-15", "FM-16"})
+SYNOPTIC_FALLBACK_REPORT_TYPES: frozenset[str] = frozenset({"FM-12", "SY-MT"})
+
+# Documented ISD physical bounds (isd-format-document.pdf, p. 8):
+# Wind direction angle: MIN 001, MAX 360 (999 = missing).
+# Wind speed rate: MIN 0000, MAX 0900 tenths of m/s (0.0 to 90.0 m/s; 9999 = missing).
+WIND_DIR_MIN_DEG: int = 1
+WIND_DIR_MAX_DEG: int = 360
+WIND_SPEED_MAX_TENTHS_MS: int = 900
 
 # NCEI's legacy /data/global-hourly/access/ path redirects to an HTML S3 Explorer page;
 # the official NOAA Open Data Dissemination (NODD) S3 bucket serves station-year CSVs directly.
 AWS_GLOBAL_HOURLY_BASE_URL: str = "https://noaa-global-hourly-pds.s3.amazonaws.com"
 NCEI_GLOBAL_HOURLY_BASE_URL: str = "https://www.ncei.noaa.gov/data/global-hourly/access"
 
-SEALED_TEST_CUTOFF: pd.Timestamp = pd.Timestamp("2025-01-01T00:00:00")
 MAX_CONCURRENT_REQUESTS: int = 4
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_SPLITS_PATH = _REPO_ROOT / "configs" / "splits.yaml"
 _DEFAULT_STATIONS_PATH = _REPO_ROOT / "configs" / "stations_conus.csv"
-_REQUIRED_CSV_COLS = ["DATE", "TMP", "DEW", "SLP", "WND"]
+_REQUIRED_CSV_COLS = ("DATE", "TMP", "DEW", "SLP", "WND")
+_OPTIONAL_CSV_COLS = ("REPORT_TYPE",)
 _RETRYABLE_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
 
 
-def load_splits_config(splits_path: Path | None = None) -> dict:
-    """Load verification split and tolerance configuration from ``configs/splits.yaml``."""
-    path = splits_path or _DEFAULT_SPLITS_PATH
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+def get_harness_config(config_path: Path | None = None) -> HarnessConfig:
+    """Load the canonical harness configuration from ``configs/splits.yaml``."""
+    return load_config(config_path)
 
 
-def get_truth_tolerance_minutes(splits_path: Path | None = None) -> int:
+def get_sealed_test_cutoff(cfg: HarnessConfig | None = None) -> pd.Timestamp:
+    """Return the sealed-test start timestamp from ``configs/splits.yaml``."""
+    resolved = cfg or load_config()
+    return pd.Timestamp(resolved.splits.sealed_test.start)
+
+
+def get_truth_tolerance_minutes(cfg: HarnessConfig | None = None) -> int:
     """Return ``evaluation.truth_tolerance_minutes`` from ``configs/splits.yaml``."""
-    cfg = load_splits_config(splits_path)
-    return int(cfg["evaluation"]["truth_tolerance_minutes"])
+    resolved = cfg or load_config()
+    return int(resolved.evaluation.truth_tolerance_minutes)
+
+
+def get_train_split_end(cfg: HarnessConfig | None = None) -> pd.Timestamp:
+    """Return the train split end timestamp from ``configs/splits.yaml``."""
+    resolved = cfg or load_config()
+    assert resolved.splits.train.end is not None
+    return pd.Timestamp(resolved.splits.train.end)
+
+
+def passing_qc_signature() -> str:
+    """Canonical string representing the active passing QC code sets for cache validation."""
+    td = ",".join(sorted(PASSING_QC_CODES_TEMP_DEW))
+    ws = ",".join(sorted(PASSING_QC_CODES_WIND_SLP))
+    return f"temp_dew={td};wind_slp={ws}"
 
 
 def load_stations_metadata(stations_csv: Path | None = None) -> pd.DataFrame:
@@ -88,20 +126,55 @@ def _to_naive_utc_timestamp(value: str | pd.Timestamp) -> pd.Timestamp:
     return ts
 
 
-def _enforce_pre_sealed_cutoff(ts: pd.Timestamp, label: str = "timestamp") -> None:
-    if ts >= SEALED_TEST_CUTOFF:
+def _enforce_pre_sealed_cutoff(
+    ts: pd.Timestamp,
+    label: str = "timestamp",
+    cfg: HarnessConfig | None = None,
+) -> None:
+    cutoff = get_sealed_test_cutoff(cfg)
+    if ts >= cutoff:
         raise ValueError(
             f"Refusing {label} {ts.isoformat()}: sealed test split starts at "
-            f"{SEALED_TEST_CUTOFF.isoformat()} and is strictly off-limits."
+            f"{cutoff.isoformat()} and is strictly off-limits."
         )
 
 
-def _enforce_pre_sealed_year(year: int) -> None:
-    if year >= SEALED_TEST_CUTOFF.year:
+def _enforce_pre_sealed_year(year: int, cfg: HarnessConfig | None = None) -> None:
+    cutoff = get_sealed_test_cutoff(cfg)
+    if year >= cutoff.year:
         raise ValueError(
             f"Refusing year {year}: sealed test split starts at "
-            f"{SEALED_TEST_CUTOFF.year} and is strictly off-limits."
+            f"{cutoff.isoformat()} and is strictly off-limits."
         )
+
+
+def required_years_for_window(
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+    tolerance_minutes: int | None = None,
+    *,
+    cfg: HarnessConfig | None = None,
+) -> list[int]:
+    """Return all pre-sealed calendar years needed to match ``[start, end]`` within tolerance.
+
+    Includes the previous year when ``start - tolerance`` crosses into it, and the next year
+    when ``end + tolerance`` crosses into it, while never including the sealed-test year or later.
+    """
+    resolved_cfg = cfg or load_config()
+    cutoff = get_sealed_test_cutoff(resolved_cfg)
+    tol_min = (
+        get_truth_tolerance_minutes(resolved_cfg)
+        if tolerance_minutes is None
+        else int(tolerance_minutes)
+    )
+    start_ts = _to_naive_utc_timestamp(start)
+    end_ts = _to_naive_utc_timestamp(end)
+    _enforce_pre_sealed_cutoff(start_ts, "start", resolved_cfg)
+    _enforce_pre_sealed_cutoff(end_ts, "end", resolved_cfg)
+
+    lo = start_ts - pd.Timedelta(minutes=tol_min)
+    hi = min(end_ts + pd.Timedelta(minutes=tol_min), cutoff - pd.Timedelta(seconds=1))
+    return [yr for yr in range(lo.year, hi.year + 1) if yr < cutoff.year]
 
 
 def wind_to_uv(direction_deg: float, speed_ms: float) -> tuple[float, float]:
@@ -131,7 +204,7 @@ def parse_tmp_or_dew(raw: str) -> float:
     if len(parts) != 2:
         return math.nan
     val_str, qc = parts[0].strip(), parts[1].strip()
-    if qc not in PASSING_QC_CODES or not val_str:
+    if qc not in PASSING_QC_CODES_TEMP_DEW or not val_str:
         return math.nan
     try:
         raw_int = int(val_str)
@@ -150,7 +223,7 @@ def parse_slp(raw: str) -> float:
     if len(parts) != 2:
         return math.nan
     val_str, qc = parts[0].strip(), parts[1].strip()
-    if qc not in PASSING_QC_CODES_NO_AWOS_C or not val_str:
+    if qc not in PASSING_QC_CODES_WIND_SLP or not val_str:
         return math.nan
     try:
         raw_int = int(val_str)
@@ -165,12 +238,13 @@ def parse_wnd(raw: str) -> tuple[float, float]:
     """Parse an ISD ``WND`` field (``<dir>,<dir_qc>,<type>,<spd>,<spd_qc>``) to ``(u10, v10)``.
 
     Handling rules (per NOAA ISD Format Document, p. 8):
+    - Speed QC must be in ``{0, 1, 4, 5, 9}`` and speed in ``0..900`` tenths of m/s (0..90 m/s).
     - Calm wind: speed ``0000`` with passing speed QC and type ``C`` (or type ``9``, which the ISD
       specification explicitly notes indicates calm winds when speed is ``0000``) -> ``(0.0, 0.0)``
       even though direction is coded as ``999`` with direction QC ``9``.
-    - Variable wind: type ``V`` -> ``(nan, nan)`` because wind direction is undefined.
-    - All other types (e.g. ``N`` normal, ``H``, ``R``, ``Q``): require both passing direction QC
-      (``0 <= dir <= 360``) and passing speed QC (``speed != 9999``).
+    - Variable wind (type ``V``) and all directional types: use direction when present in
+      ``1..360`` with passing direction QC ``{0, 1, 4, 5, 9}``; return ``(nan, nan)`` when
+      direction is ``999`` (missing/variable without direction), outside ``1..360``, or fails QC.
     """
     if not raw:
         return (math.nan, math.nan)
@@ -178,30 +252,26 @@ def parse_wnd(raw: str) -> tuple[float, float]:
     if len(parts) != 5:
         return (math.nan, math.nan)
     dir_str, dir_qc, type_code, spd_str, spd_qc = (p.strip() for p in parts)
-    if spd_qc not in PASSING_QC_CODES_NO_AWOS_C or not spd_str:
+    if spd_qc not in PASSING_QC_CODES_WIND_SLP or not spd_str:
         return (math.nan, math.nan)
     try:
         spd_int = int(spd_str)
     except ValueError:
         return (math.nan, math.nan)
-    if spd_int == 9999 or spd_int < 0:
+    if spd_int == 9999 or spd_int < 0 or spd_int > WIND_SPEED_MAX_TENTHS_MS:
         return (math.nan, math.nan)
 
     # Calm wind
     if spd_int == 0 and type_code in {"C", "9"}:
         return (0.0, 0.0)
 
-    # Variable wind direction: vector components cannot be resolved
-    if type_code == "V":
-        return (math.nan, math.nan)
-
-    if dir_qc not in PASSING_QC_CODES_NO_AWOS_C or not dir_str:
+    if dir_qc not in PASSING_QC_CODES_WIND_SLP or not dir_str:
         return (math.nan, math.nan)
     try:
         dir_int = int(dir_str)
     except ValueError:
         return (math.nan, math.nan)
-    if dir_int == 999 or dir_int < 0 or dir_int > 360:
+    if dir_int == 999 or dir_int < WIND_DIR_MIN_DEG or dir_int > WIND_DIR_MAX_DEG:
         return (math.nan, math.nan)
 
     return wind_to_uv(float(dir_int), spd_int / 10.0)
@@ -218,7 +288,7 @@ def _parse_temp_series(series: pd.Series) -> np.ndarray:
         return out
     vals = pd.to_numeric(parts[0].str.strip(), errors="coerce")
     qcs = parts[1].str.strip()
-    valid = vals.notna() & (vals.abs() != 9999) & qcs.isin(PASSING_QC_CODES)
+    valid = vals.notna() & (vals.abs() != 9999) & qcs.isin(PASSING_QC_CODES_TEMP_DEW)
     if valid.any():
         out[valid.to_numpy()] = (vals[valid].to_numpy(dtype=np.float64) / 10.0 + 273.15).astype(np.float32)
     return out
@@ -235,7 +305,7 @@ def _parse_slp_series(series: pd.Series) -> np.ndarray:
         return out
     vals = pd.to_numeric(parts[0].str.strip(), errors="coerce")
     qcs = parts[1].str.strip()
-    valid = vals.notna() & (vals != 99999) & (vals > 0) & qcs.isin(PASSING_QC_CODES_NO_AWOS_C)
+    valid = vals.notna() & (vals != 99999) & (vals > 0) & qcs.isin(PASSING_QC_CODES_WIND_SLP)
     if valid.any():
         out[valid.to_numpy()] = (vals[valid].to_numpy(dtype=np.float64) * 10.0).astype(np.float32)
     return out
@@ -267,7 +337,8 @@ def _parse_wnd_series(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
         & spd_vals.notna()
         & (spd_vals != 9999)
         & (spd_vals >= 0)
-        & spd_qcs.isin(PASSING_QC_CODES_NO_AWOS_C)
+        & (spd_vals <= WIND_SPEED_MAX_TENTHS_MS)
+        & spd_qcs.isin(PASSING_QC_CODES_WIND_SLP)
     )
 
     calm_mask = (spd_valid & (spd_vals == 0) & type_codes.isin({"C", "9"})).to_numpy()
@@ -278,12 +349,11 @@ def _parse_wnd_series(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
     dir_valid = (
         spd_valid
         & (~calm_mask)
-        & (type_codes != "V")
         & dir_vals.notna()
         & (dir_vals != 999)
-        & (dir_vals >= 0)
-        & (dir_vals <= 360)
-        & dir_qcs.isin(PASSING_QC_CODES_NO_AWOS_C)
+        & (dir_vals >= WIND_DIR_MIN_DEG)
+        & (dir_vals <= WIND_DIR_MAX_DEG)
+        & dir_qcs.isin(PASSING_QC_CODES_WIND_SLP)
     ).to_numpy()
 
     if dir_valid.any():
@@ -294,7 +364,6 @@ def _parse_wnd_series(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
         v = -speed_ms * np.cos(rad)
         u = np.where(np.abs(u) < 1e-12, 0.0, u)
         v = np.where(np.abs(v) < 1e-12, 0.0, v)
-        # Zero speed with valid direction gives exact (0.0, 0.0)
         zero_spd = speed_ms == 0.0
         u = np.where(zero_spd, 0.0, u)
         v = np.where(zero_spd, 0.0, v)
@@ -304,36 +373,63 @@ def _parse_wnd_series(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
     return u_out, v_out
 
 
-def parse_isd_csv(source: Path | str | TextIO) -> pd.DataFrame:
+def _empty_parsed_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "obs_time": pd.Series(dtype="datetime64[ns]"),
+            **{v: pd.Series(dtype="float32") for v in PRIMARY_VARS},
+        }
+    )
+
+
+def parse_isd_csv(
+    source: Path | str | TextIO,
+    *,
+    cfg: HarnessConfig | None = None,
+) -> pd.DataFrame:
     """Parse a NOAA ISD global-hourly station-year CSV into canonical units.
 
-    Returns a DataFrame with columns ``obs_time`` (timezone-naive UTC ``datetime64[ns]``)
-    and ``t2m``, ``td2m``, ``u10``, ``v10``, ``msl`` (``float32``). Observations from
-    ``2025-01-01T00:00:00`` onward are unconditionally excluded.
+    Applies report-type selection (METAR-family ``FM-15``/``FM-16`` whenever the station-year
+    contains any; otherwise synoptic fallback ``FM-12``/``SY-MT``), NOAA quality filters, unit
+    conversions, physical ``td2m <= t2m`` guard, and the sealed-test cutoff from
+    ``configs/splits.yaml``.
     """
+    cutoff = get_sealed_test_cutoff(cfg)
+    allowed_cols = set(_REQUIRED_CSV_COLS) | set(_OPTIONAL_CSV_COLS)
     df = pd.read_csv(
         source,
-        usecols=_REQUIRED_CSV_COLS,
+        usecols=lambda c: c in allowed_cols,
         dtype=str,
         keep_default_na=False,
     )
+    missing = [c for c in _REQUIRED_CSV_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"ISD CSV missing required columns: {missing}")
     if df.empty:
-        return pd.DataFrame(
-            {
-                "obs_time": pd.Series(dtype="datetime64[ns]"),
-                **{v: pd.Series(dtype="float32") for v in PRIMARY_VARS},
-            }
-        )
+        return _empty_parsed_frame()
+
+    if "REPORT_TYPE" in df.columns:
+        rtypes = df["REPORT_TYPE"].str.strip()
+        is_metar = rtypes.isin(METAR_REPORT_TYPES)
+        if is_metar.any():
+            keep_rt = is_metar
+        else:
+            keep_rt = rtypes.isin(SYNOPTIC_FALLBACK_REPORT_TYPES)
+        df = df.loc[keep_rt].reset_index(drop=True)
+        if df.empty:
+            return _empty_parsed_frame()
 
     obs_time = pd.to_datetime(df["DATE"], format="ISO8601", errors="coerce", utc=False)
     if obs_time.dt.tz is not None:
         obs_time = obs_time.dt.tz_convert("UTC").dt.tz_localize(None)
     obs_time = obs_time.astype("datetime64[ns]")
 
-    valid_time_mask = obs_time.notna() & (obs_time < SEALED_TEST_CUTOFF)
+    valid_time_mask = obs_time.notna() & (obs_time < cutoff)
     if not valid_time_mask.all():
         df = df.loc[valid_time_mask].reset_index(drop=True)
         obs_time = obs_time.loc[valid_time_mask].reset_index(drop=True)
+    if df.empty:
+        return _empty_parsed_frame()
 
     t2m = _parse_temp_series(df["TMP"])
     td2m = _parse_temp_series(df["DEW"])
@@ -355,6 +451,94 @@ def parse_isd_csv(source: Path | str | TextIO) -> pd.DataFrame:
             "msl": msl,
         }
     )
+
+
+def save_parsed_station_year_npz(
+    obs_df: pd.DataFrame,
+    dest: Path,
+    *,
+    tolerance_minutes: int,
+) -> Path:
+    """Save parsed station-year observations and cache provenance metadata to a compressed ``.npz``."""
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    obs_ns = (
+        obs_df["obs_time"].astype("datetime64[ns]").to_numpy().view(np.int64)
+        if not obs_df.empty
+        else np.empty(0, dtype=np.int64)
+    )
+    payload: dict[str, np.ndarray] = {
+        "obs_time_ns": obs_ns,
+        "meta_parser_version": np.array(PARSER_VERSION),
+        "meta_tolerance_minutes": np.array(int(tolerance_minutes), dtype=np.int32),
+        "meta_passing_qc_codes": np.array(passing_qc_signature()),
+    }
+    for var in PRIMARY_VARS:
+        payload[var] = (
+            obs_df[var].to_numpy(dtype=np.float32) if not obs_df.empty else np.empty(0, dtype=np.float32)
+        )
+
+    tmp_path = dest_path.with_name(f".{dest_path.stem}.tmp.npz")
+    try:
+        np.savez_compressed(tmp_path, **payload)
+        tmp_path.replace(dest_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    return dest_path
+
+
+def load_parsed_station_year_npz(
+    path: Path,
+    *,
+    expected_tolerance_minutes: int,
+    cfg: HarnessConfig | None = None,
+) -> pd.DataFrame:
+    """Load a cached parsed station-year ``.npz`` after verifying parser/tolerance/QC metadata.
+
+    Raises ``ValueError`` if any metadata key is missing or does not match the current parser
+    version, tolerance, or passing QC code set.
+    """
+    cutoff = get_sealed_test_cutoff(cfg)
+    required_meta = ("meta_parser_version", "meta_tolerance_minutes", "meta_passing_qc_codes")
+    with np.load(path, allow_pickle=False) as z:
+        missing_meta = [k for k in required_meta if k not in z.files]
+        if missing_meta:
+            raise ValueError(
+                f"Parsed cache {path} is missing required metadata keys {missing_meta}; "
+                "refusing to reuse unversioned cache."
+            )
+        cached_ver = str(z["meta_parser_version"].item())
+        cached_tol = int(z["meta_tolerance_minutes"].item())
+        cached_qc = str(z["meta_passing_qc_codes"].item())
+        expected_qc = passing_qc_signature()
+
+        if cached_ver != PARSER_VERSION:
+            raise ValueError(
+                f"Parsed cache {path} parser_version mismatch: found {cached_ver!r}, "
+                f"expected {PARSER_VERSION!r}."
+            )
+        if cached_tol != int(expected_tolerance_minutes):
+            raise ValueError(
+                f"Parsed cache {path} tolerance_minutes mismatch: found {cached_tol}, "
+                f"expected {expected_tolerance_minutes}."
+            )
+        if cached_qc != expected_qc:
+            raise ValueError(
+                f"Parsed cache {path} passing_qc_codes mismatch: found {cached_qc!r}, "
+                f"expected {expected_qc!r}."
+            )
+
+        obs_ns = z["obs_time_ns"].astype(np.int64, copy=False)
+        obs_time = pd.to_datetime(obs_ns, unit="ns")
+        data: dict[str, object] = {"obs_time": obs_time}
+        for var in PRIMARY_VARS:
+            data[var] = z[var].astype(np.float32, copy=False)
+
+    df = pd.DataFrame(data)
+    if not df.empty:
+        df = df[df["obs_time"] < cutoff].reset_index(drop=True)
+    return df
 
 
 def match_station_to_hours(
@@ -475,9 +659,10 @@ def download_station_year(
     base_url: str = AWS_GLOBAL_HOURLY_BASE_URL,
     max_retries: int = 4,
     timeout: float = 60.0,
+    cfg: HarnessConfig | None = None,
 ) -> Path:
     """Download a single NOAA ISD global-hourly station-year CSV with retries and resumability."""
-    _enforce_pre_sealed_year(year)
+    _enforce_pre_sealed_year(year, cfg)
     year_dir = Path(cache_dir) / str(year)
     year_dir.mkdir(parents=True, exist_ok=True)
     dest = year_dir / f"{station_id}.csv"
@@ -490,7 +675,7 @@ def download_station_year(
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "wrfcomp-truth-loader/0.1"})
+            req = urllib.request.Request(url, headers={"User-Agent": "wrfcomp-truth-loader/0.2"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = resp.read()
             first_line = data[:2048].decode("utf-8", errors="replace").splitlines()[0] if data else ""
@@ -529,13 +714,14 @@ def download_stations(
     max_workers: int = MAX_CONCURRENT_REQUESTS,
     base_url: str = AWS_GLOBAL_HOURLY_BASE_URL,
     max_retries: int = 4,
+    cfg: HarnessConfig | None = None,
 ) -> tuple[list[tuple[str, int]], list[tuple[str, int, str]]]:
     """Download station-year CSVs with at most 4 concurrent requests and retries.
 
     Returns ``(succeeded, failed)`` where ``failed`` entries are ``(station_id, year, error_message)``.
     """
     for year in years:
-        _enforce_pre_sealed_year(year)
+        _enforce_pre_sealed_year(year, cfg)
     workers = min(max(1, int(max_workers)), MAX_CONCURRENT_REQUESTS)
 
     tasks = [(sid, yr) for yr in years for sid in station_ids]
@@ -551,6 +737,7 @@ def download_stations(
                 cache_dir,
                 base_url=base_url,
                 max_retries=max_retries,
+                cfg=cfg,
             ): (sid, yr)
             for sid, yr in tasks
         }
@@ -632,6 +819,57 @@ def _resolve_station_coords(
     return lats, lons, elevs
 
 
+def _load_station_observations_for_window(
+    station_id: str,
+    years: Sequence[int],
+    lo: pd.Timestamp,
+    hi: pd.Timestamp,
+    *,
+    cache_path: Path,
+    parsed_path: Path | None,
+    tolerance_minutes: int,
+    cfg: HarnessConfig,
+) -> tuple[pd.DataFrame, Path | None]:
+    """Load and concatenate trimmed station observations from parsed ``.npz`` or raw CSV cache.
+
+    Both paths consume the exact same year window ``[lo, hi]`` (including the last ``tol`` minutes
+    of the previous year and first ``tol`` minutes of the next year, clamped strictly below the
+    sealed-test cutoff) so they produce identical matched outputs.
+    """
+    frames: list[pd.DataFrame] = []
+    seen_csv_paths: set[Path] = set()
+    first_csv: Path | None = None
+
+    for yr in years:
+        parsed_df: pd.DataFrame | None = None
+        if parsed_path is not None:
+            npz_path = parsed_path / str(yr) / f"{station_id}.npz"
+            if npz_path.is_file():
+                parsed_df = load_parsed_station_year_npz(
+                    npz_path,
+                    expected_tolerance_minutes=tolerance_minutes,
+                    cfg=cfg,
+                )
+
+        if parsed_df is None:
+            fpath = _find_cached_station_file(cache_path, station_id, yr)
+            if fpath is not None and fpath not in seen_csv_paths:
+                seen_csv_paths.add(fpath)
+                if first_csv is None:
+                    first_csv = fpath
+                parsed_df = parse_isd_csv(fpath, cfg=cfg)
+
+        if parsed_df is not None and not parsed_df.empty:
+            sub = parsed_df[(parsed_df["obs_time"] >= lo) & (parsed_df["obs_time"] <= hi)]
+            if not sub.empty:
+                frames.append(sub)
+
+    if not frames:
+        return _empty_parsed_frame(), first_csv
+    obs_df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+    return obs_df, first_csv
+
+
 def build_truth(
     station_ids: Iterable[str],
     start: str | pd.Timestamp,
@@ -641,8 +879,9 @@ def build_truth(
     stations_metadata: pd.DataFrame | None = None,
     tolerance_minutes: int | None = None,
     parsed_cache_dir: Path | str | None = None,
+    cfg: HarnessConfig | None = None,
 ) -> xr.Dataset:
-    """Build a contract-compliant hourly truth ``xr.Dataset`` from cached NOAA ISD CSVs.
+    """Build a contract-compliant hourly truth ``xr.Dataset`` from cached NOAA ISD files.
 
     Parameters
     ----------
@@ -650,9 +889,10 @@ def build_truth(
         Sequence of 11-character ISD ``USAF+WBAN`` station identifiers.
     start, end:
         Inclusive UTC hourly bounds (timezone-naive or UTC-aware). Must be strictly
-        before ``2025-01-01T00:00:00``.
+        before the sealed-test start in ``configs/splits.yaml``.
     cache_dir:
-        Directory containing cached station-year CSV files (``<cache_dir>/<year>/<station_id>.csv``).
+        Directory containing cached raw station-year CSV files
+        (``<cache_dir>/<year>/<station_id>.csv``).
     stations_metadata:
         Optional DataFrame with ``station_id``, ``lat``/``latitude``, ``lon``/``longitude``,
         ``elevation_m``. Defaults to ``configs/stations_conus.csv``.
@@ -660,9 +900,14 @@ def build_truth(
         Matching half-window in minutes. Defaults to ``evaluation.truth_tolerance_minutes``
         from ``configs/splits.yaml`` (15).
     parsed_cache_dir:
-        Optional directory holding pre-parsed per-station-year ``.npz`` files (used by
-        ``scripts/build_truth.py --discard-raw``).
+        Optional directory holding versioned per-station-year parsed observation ``.npz`` files
+        (used by ``scripts/build_truth.py --discard-raw``).
+    cfg:
+        Optional pre-loaded :class:`HarnessConfig` (defaults to ``configs/splits.yaml``).
     """
+    resolved_cfg = cfg or load_config()
+    cutoff = get_sealed_test_cutoff(resolved_cfg)
+
     sids = [str(s).strip() for s in station_ids]
     if not sids:
         raise ValueError("station_ids must not be empty.")
@@ -674,19 +919,22 @@ def build_truth(
     end_ts = _to_naive_utc_timestamp(end)
     if end_ts < start_ts:
         raise ValueError(f"end ({end_ts}) must be >= start ({start_ts}).")
-    _enforce_pre_sealed_cutoff(start_ts, "start")
-    _enforce_pre_sealed_cutoff(end_ts, "end")
+    _enforce_pre_sealed_cutoff(start_ts, "start", resolved_cfg)
+    _enforce_pre_sealed_cutoff(end_ts, "end", resolved_cfg)
 
-    tol_min = get_truth_tolerance_minutes() if tolerance_minutes is None else int(tolerance_minutes)
+    tol_min = (
+        get_truth_tolerance_minutes(resolved_cfg)
+        if tolerance_minutes is None
+        else int(tolerance_minutes)
+    )
     valid_times = pd.date_range(start_ts, end_ts, freq="h")
 
     cache_path = Path(cache_dir)
     parsed_path = Path(parsed_cache_dir) if parsed_cache_dir is not None else None
 
-    years = list(range(start_ts.year, end_ts.year + 1))
-    # Include prior year if start is within tolerance of Jan 1 00:00 (e.g. Dec 31 23:53 -> Jan 1 00:00)
-    prev_year_needed = (start_ts - pd.Timedelta(minutes=tol_min)).year < start_ts.year
-    lookback_years = [start_ts.year - 1, *years] if prev_year_needed else years
+    lo = start_ts - pd.Timedelta(minutes=tol_min)
+    hi = min(end_ts + pd.Timedelta(minutes=tol_min), cutoff - pd.Timedelta(seconds=1))
+    years = required_years_for_window(start_ts, end_ts, tol_min, cfg=resolved_cfg)
 
     n_times = len(valid_times)
     n_stations = len(sids)
@@ -699,58 +947,26 @@ def build_truth(
     }
     fallback_files: dict[str, Path | None] = {}
 
-    # Fast path: assemble from pre-parsed per-station-year .npz files when exact full years match
-    can_use_parsed_npz = (
-        parsed_path is not None
-        and start_ts == pd.Timestamp(year=start_ts.year, month=1, day=1, hour=0)
-        and end_ts == pd.Timestamp(year=end_ts.year, month=12, day=31, hour=23)
-    )
-
     for j, sid in enumerate(sids):
-        used_npz = False
-        if can_use_parsed_npz and parsed_path is not None:
-            npz_files = [parsed_path / str(yr) / f"{sid}.npz" for yr in years]
-            if all(p.is_file() for p in npz_files):
-                cursor = 0
-                for p in npz_files:
-                    with np.load(p) as z:
-                        nt = len(z["t2m"])
-                        for var in PRIMARY_VARS:
-                            data_arrays[var][cursor : cursor + nt, j] = z[var]
-                            offset_arrays[var][cursor : cursor + nt, j] = z[f"{var}_offset_min"]
-                        cursor += nt
-                used_npz = cursor == n_times
+        # Always start each station's columns cleanly cleared before loading or fallback
+        for var in PRIMARY_VARS:
+            data_arrays[var][:, j] = np.nan
+            offset_arrays[var][:, j] = OFFSET_FILL_VALUE
 
-        if used_npz:
-            fallback_files[sid] = None
+        obs_df, first_csv = _load_station_observations_for_window(
+            sid,
+            years,
+            lo,
+            hi,
+            cache_path=cache_path,
+            parsed_path=parsed_path,
+            tolerance_minutes=tol_min,
+            cfg=resolved_cfg,
+        )
+        fallback_files[sid] = first_csv
+        if obs_df.empty:
             continue
 
-        frames: list[pd.DataFrame] = []
-        seen_paths: set[Path] = set()
-        first_file: Path | None = None
-        for yr in lookback_years:
-            fpath = _find_cached_station_file(cache_path, sid, yr)
-            if fpath is not None and fpath not in seen_paths:
-                seen_paths.add(fpath)
-                if first_file is None:
-                    first_file = fpath
-                parsed = parse_isd_csv(fpath)
-                if not parsed.empty:
-                    # Trim to [start - tol, end + tol] to keep memory small
-                    lo = start_ts - pd.Timedelta(minutes=tol_min)
-                    hi = min(
-                        end_ts + pd.Timedelta(minutes=tol_min),
-                        SEALED_TEST_CUTOFF - pd.Timedelta(seconds=1),
-                    )
-                    sub = parsed[(parsed["obs_time"] >= lo) & (parsed["obs_time"] <= hi)]
-                    if not sub.empty:
-                        frames.append(sub)
-
-        fallback_files[sid] = first_file
-        if not frames:
-            continue
-
-        obs_df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
         vals, offs = match_station_to_hours(obs_df, valid_times, tolerance_minutes=tol_min)
         for var in PRIMARY_VARS:
             data_arrays[var][:, j] = vals[var]
@@ -775,7 +991,6 @@ def build_truth(
             },
         )
 
-    protocol_version = str(load_splits_config().get("protocol_version", "0.1.0"))
     ds = xr.Dataset(
         data_vars=data_vars,
         coords={
@@ -787,74 +1002,34 @@ def build_truth(
         },
         attrs={
             "source": "NOAA ISD global-hourly (noaa-global-hourly-pds)",
-            "protocol_version": protocol_version,
+            "parser_version": PARSER_VERSION,
+            "protocol_version": resolved_cfg.protocol_version,
             "truth_tolerance_minutes": tol_min,
-            "passing_qc_codes": ",".join(sorted(PASSING_QC_CODES)),
+            "passing_qc_codes": passing_qc_signature(),
         },
     )
 
-    validate_truth_dataset(ds, tolerance_minutes=tol_min)
+    validate_truth_dataset(ds, variables=PRIMARY_VARS, cfg=resolved_cfg)
+    validate_truth_values(ds, tolerance_minutes=tol_min)
     return ds
 
 
-def validate_truth_dataset(ds: xr.Dataset, tolerance_minutes: int | None = None) -> None:
-    """Validate that a truth ``xr.Dataset`` satisfies the WRFComp data contract and Addendum 1."""
+def validate_truth_values(ds: xr.Dataset, tolerance_minutes: int | None = None) -> None:
+    """Validate value-level invariants beyond :func:`wrfcomp.harness.schemas.validate_truth_dataset`.
+
+    Checks that every primary variable has its ``X_offset_min`` companion, that ``X_offset_min``
+    equals ``-32768`` wherever ``X`` is ``NaN`` and lies in ``[-tolerance, +tolerance]`` elsewhere,
+    and that ``td2m <= t2m`` wherever both are finite.
+    """
     tol_min = get_truth_tolerance_minutes() if tolerance_minutes is None else int(tolerance_minutes)
 
-    expected_dims = ("valid_time", "station_id")
-    for dim in expected_dims:
-        if dim not in ds.dims:
-            raise ValueError(f"Truth dataset missing required dimension: {dim}")
-
-    # Check valid_time coord: datetime64[ns], strictly hourly, strictly before 2025-01-01
-    vt = ds["valid_time"].to_numpy()
-    if not np.issubdtype(vt.dtype, np.datetime64):
-        raise ValueError(f"valid_time must be datetime64[ns], got {vt.dtype}")
-    vt_ns = vt.astype("datetime64[ns]")
-    if len(vt_ns) > 0:
-        if pd.Timestamp(vt_ns.max()) >= SEALED_TEST_CUTOFF:
-            raise ValueError(f"valid_time reaches sealed test cutoff ({SEALED_TEST_CUTOFF})")
-        if len(vt_ns) > 1:
-            diffs = np.diff(vt_ns.view(np.int64))
-            one_hour_ns = np.int64(3_600_000_000_000)
-            if not np.all(diffs == one_hour_ns):
-                raise ValueError("valid_time must be strictly contiguous full hours (1h step).")
-
-    # Check station_id coord: 11-character strings
-    sids = [str(s) for s in ds["station_id"].to_numpy()]
-    if any(len(s) != 11 for s in sids):
-        raise ValueError("All station_id entries must be 11-character ISD USAF+WBAN strings.")
-
-    # Check required station coordinates
-    for coord in ("latitude", "longitude", "elevation_m"):
-        if coord not in ds.coords:
-            raise ValueError(f"Truth dataset missing required coordinate: {coord}")
-        if ds.coords[coord].dims != ("station_id",):
-            raise ValueError(
-                f"Coordinate {coord} must have dims ('station_id',), got {ds.coords[coord].dims}"
-            )
-
-    # Check primary variables and companion offset variables
     for var in PRIMARY_VARS:
-        if var not in ds.data_vars:
-            raise ValueError(f"Truth dataset missing required variable: {var}")
-        da = ds[var]
-        if da.dims != expected_dims:
-            raise ValueError(f"Variable {var} must have dims {expected_dims}, got {da.dims}")
-        if da.dtype != np.float32:
-            raise ValueError(f"Variable {var} must have dtype float32, got {da.dtype}")
-
         off_var = f"{var}_offset_min"
         if off_var not in ds.data_vars:
             raise ValueError(f"Truth dataset missing required companion variable: {off_var}")
-        off_da = ds[off_var]
-        if off_da.dims != expected_dims:
-            raise ValueError(f"Variable {off_var} must have dims {expected_dims}, got {off_da.dims}")
-        if off_da.dtype != np.int16:
-            raise ValueError(f"Variable {off_var} must have dtype int16, got {off_da.dtype}")
 
-        vals = da.to_numpy()
-        offs = off_da.to_numpy()
+        vals = ds[var].to_numpy()
+        offs = ds[off_var].to_numpy()
         is_nan = np.isnan(vals)
         is_fill = offs == OFFSET_FILL_VALUE
         if not np.array_equal(is_nan, is_fill):
@@ -868,7 +1043,6 @@ def validate_truth_dataset(ds: xr.Dataset, tolerance_minutes: int | None = None)
                 f"[{int(valid_offs.min())}, {int(valid_offs.max())}]"
             )
 
-    # Physical consistency check: td2m <= t2m wherever both are finite
     t2m = ds["t2m"].to_numpy()
     td2m = ds["td2m"].to_numpy()
     both = np.isfinite(t2m) & np.isfinite(td2m)
@@ -877,7 +1051,7 @@ def validate_truth_dataset(ds: xr.Dataset, tolerance_minutes: int | None = None)
 
 
 def write_truth_netcdf(ds: xr.Dataset, out: Path | str) -> None:
-    """Write a validated truth Dataset atomically to NetCDF.
+    """Write a validated truth Dataset atomically to NetCDF4 via ``h5netcdf``.
 
     Ensures ``X_offset_min`` variables are stored as plain ``int16`` with ``-32768``
     where ``X`` is ``NaN`` and no ``_FillValue`` attribute or encoding.
@@ -893,7 +1067,7 @@ def write_truth_netcdf(ds: xr.Dataset, out: Path | str) -> None:
 
     tmp_out = out_path.with_name(f".{out_path.name}.part")
     try:
-        ds.to_netcdf(tmp_out, encoding=encoding)
+        ds.to_netcdf(tmp_out, engine="h5netcdf", encoding=encoding)
         tmp_out.replace(out_path)
     finally:
         if tmp_out.exists():

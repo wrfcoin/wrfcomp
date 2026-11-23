@@ -1,10 +1,16 @@
-"""Build hourly NOAA ISD ground-truth NetCDF datasets for WRFComp.
+"""Build hourly NOAA ISD ground-truth NetCDF4 datasets for WRFComp.
 
 Examples
 --------
-    uv run python scripts/build_truth.py --year 2024 --out ~/wrfcomp-data/truth/isd_conus_2024.nc
-    uv run python scripts/build_truth.py --start-year 2014 --end-year 2023 --discard-raw \\
-        --out ~/wrfcomp-data/truth/isd_conus_2014_2023.nc
+    # 2024 validation truth (with 2023-12-31T18Z lookback for persistence)
+    uv run python scripts/build_truth.py \\
+        --start 2023-12-31T18:00:00 --end 2024-12-31T23:00:00 \\
+        --discard-raw --out ~/wrfcomp-data/truth/isd_conus_2024.nc
+
+    # 2014-2023 training truth (through configs/splits.yaml train.end_utc)
+    uv run python scripts/build_truth.py \\
+        --start 2014-01-01T00:00:00 --end 2023-12-17T18:00:00 \\
+        --discard-raw --out ~/wrfcomp-data/truth/isd_conus_train.nc
 """
 
 from __future__ import annotations
@@ -16,26 +22,29 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import typer
 
 from wrfcomp.harness.truth import (
     AWS_GLOBAL_HOURLY_BASE_URL,
     MAX_CONCURRENT_REQUESTS,
-    PRIMARY_VARS,
+    PARSER_VERSION,
     build_truth,
     compute_completeness,
     download_station_year,
     download_stations,
+    get_harness_config,
+    get_sealed_test_cutoff,
     get_truth_tolerance_minutes,
+    load_parsed_station_year_npz,
     load_stations_metadata,
-    match_station_to_hours,
     parse_isd_csv,
+    required_years_for_window,
+    save_parsed_station_year_npz,
     write_truth_netcdf,
 )
 
-app = typer.Typer(help="Download and build NOAA ISD hourly truth NetCDF datasets.")
+app = typer.Typer(help="Download and build NOAA ISD hourly truth NetCDF4 datasets.")
 
 
 def _default_data_dir() -> Path:
@@ -52,11 +61,13 @@ def _download_parse_discard_one(
     tolerance_minutes: int,
     max_retries: int = 4,
 ) -> tuple[str, int, str]:
-    """Download a station-year CSV, match to full hours, save compact .npz, and delete raw CSV."""
+    """Download a station-year CSV, parse into versioned ``.npz`` observations, and delete raw CSV."""
     npz_dir = parsed_cache_dir / str(year)
     npz_dir.mkdir(parents=True, exist_ok=True)
     npz_path = npz_dir / f"{station_id}.npz"
     if npz_path.is_file() and npz_path.stat().st_size > 0:
+        # Refuse stale/mismatched cache loudly instead of silently reusing it
+        load_parsed_station_year_npz(npz_path, expected_tolerance_minutes=tolerance_minutes)
         return (station_id, year, "cached")
 
     csv_path = download_station_year(
@@ -68,24 +79,65 @@ def _download_parse_discard_one(
     )
     try:
         obs_df = parse_isd_csv(csv_path)
-        valid_times = pd.date_range(f"{year}-01-01T00:00:00", f"{year}-12-31T23:00:00", freq="h")
-        vals, offs = match_station_to_hours(obs_df, valid_times, tolerance_minutes=tolerance_minutes)
-        payload: dict[str, np.ndarray] = {}
-        for var in PRIMARY_VARS:
-            payload[var] = vals[var]
-            payload[f"{var}_offset_min"] = offs[var]
-        tmp_path = npz_dir / f".{station_id}.tmp.npz"
-        np.savez_compressed(tmp_path, **payload)
-        tmp_path.replace(npz_path)
+        save_parsed_station_year_npz(obs_df, npz_path, tolerance_minutes=tolerance_minutes)
     finally:
         csv_path.unlink(missing_ok=True)
 
     return (station_id, year, "downloaded")
 
 
+def _resolve_time_bounds(
+    *,
+    start: str | None,
+    end: str | None,
+    year: int | None,
+    start_year: int | None,
+    end_year: int | None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    has_iso = start is not None or end is not None
+    has_year = year is not None
+    has_year_range = start_year is not None or end_year is not None
+    modes = sum([has_iso, has_year, has_year_range])
+    if modes != 1:
+        typer.echo(
+            "Specify exactly one of: (--start and --end), --year, or (--start-year and --end-year).",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    if has_iso:
+        if start is None or end is None:
+            typer.echo("Provide both --start and --end.", err=True)
+            raise typer.Exit(code=2)
+        start_ts = pd.Timestamp(start)
+        end_ts = pd.Timestamp(end)
+    elif has_year:
+        assert year is not None
+        start_ts = pd.Timestamp(f"{year}-01-01T00:00:00")
+        end_ts = pd.Timestamp(f"{year}-12-31T23:00:00")
+    else:
+        if start_year is None or end_year is None:
+            typer.echo("Provide both --start-year and --end-year.", err=True)
+            raise typer.Exit(code=2)
+        start_ts = pd.Timestamp(f"{start_year}-01-01T00:00:00")
+        end_ts = pd.Timestamp(f"{end_year}-12-31T23:00:00")
+
+    if start_ts.tzinfo is not None:
+        start_ts = start_ts.tz_convert("UTC").tz_localize(None)
+    if end_ts.tzinfo is not None:
+        end_ts = end_ts.tz_convert("UTC").tz_localize(None)
+
+    if end_ts < start_ts:
+        typer.echo(f"end ({end_ts}) must be >= start ({start_ts}).", err=True)
+        raise typer.Exit(code=2)
+    return start_ts, end_ts
+
+
 @app.command()
 def main(
-    out: Path = typer.Option(..., help="Output NetCDF path (e.g. ~/wrfcomp-data/truth/isd_conus_2024.nc)."),
+    out: Path = typer.Option(..., help="Output NetCDF4 path (e.g. ~/wrfcomp-data/truth/isd_conus_2024.nc)."),
+    start: str | None = typer.Option(None, help="Inclusive UTC start timestamp (e.g. 2023-12-31T18:00:00)."),
+    end: str | None = typer.Option(None, help="Inclusive UTC end timestamp (e.g. 2024-12-31T23:00:00)."),
     year: int | None = typer.Option(None, help="Single calendar year to build (e.g. 2024)."),
     start_year: int | None = typer.Option(None, help="First calendar year (inclusive) for multi-year build."),
     end_year: int | None = typer.Option(None, help="Last calendar year (inclusive) for multi-year build."),
@@ -101,6 +153,10 @@ def main(
         None,
         help="Directory for raw ISD CSV cache (default: <WRFCOMP_DATA_DIR>/raw/isd).",
     ),
+    parsed_cache_dir: Path | None = typer.Option(
+        None,
+        help=f"Directory for parsed .npz cache (default: <WRFCOMP_DATA_DIR>/parsed/isd-v{PARSER_VERSION}).",
+    ),
     max_workers: int = typer.Option(
         MAX_CONCURRENT_REQUESTS,
         min=1,
@@ -109,11 +165,11 @@ def main(
     ),
     discard_raw: bool = typer.Option(
         False,
-        help="Parse each station-year CSV into a compact resumable .npz and delete the raw CSV.",
+        help="Parse each station-year CSV into a compact versioned .npz and delete the raw CSV.",
     ),
     skip_download: bool = typer.Option(
         False,
-        help="Do not touch the network; build strictly from files already in --cache-dir.",
+        help="Do not touch the network; build strictly from already-cached files.",
     ),
     base_url: str = typer.Option(
         AWS_GLOBAL_HOURLY_BASE_URL,
@@ -128,30 +184,30 @@ def main(
         help="Abort immediately if failed requests exceed this fraction of total station-years.",
     ),
 ) -> None:
-    if year is not None and (start_year is not None or end_year is not None):
-        typer.echo("Specify either --year or --start-year/--end-year, not both.", err=True)
-        raise typer.Exit(code=2)
-    if year is not None:
-        y0, y1 = year, year
-    elif start_year is not None and end_year is not None:
-        y0, y1 = start_year, end_year
-    else:
-        typer.echo("Provide --year or both --start-year and --end-year.", err=True)
+    cfg = get_harness_config()
+    cutoff = get_sealed_test_cutoff(cfg)
+    tol_min = get_truth_tolerance_minutes(cfg)
+
+    start_ts, end_ts = _resolve_time_bounds(
+        start=start,
+        end=end,
+        year=year,
+        start_year=start_year,
+        end_year=end_year,
+    )
+    if start_ts >= cutoff or end_ts >= cutoff:
+        typer.echo(
+            f"Refusing range [{start_ts.isoformat()}, {end_ts.isoformat()}]: "
+            f"sealed test split starts at {cutoff.isoformat()}.",
+            err=True,
+        )
         raise typer.Exit(code=2)
 
-    if y1 < y0:
-        typer.echo(f"end_year ({y1}) must be >= start_year ({y0}).", err=True)
-        raise typer.Exit(code=2)
-    if y0 >= 2025 or y1 >= 2025:
-        typer.echo("Refusing to download or build any year >= 2025 (sealed test split).", err=True)
-        raise typer.Exit(code=2)
-
-    years = list(range(y0, y1 + 1))
+    years = required_years_for_window(start_ts, end_ts, tol_min, cfg=cfg)
     data_dir = _default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     raw_dir = cache_dir or (data_dir / "raw" / "isd")
-    parsed_dir = data_dir / "parsed" / "isd"
-    tol_min = get_truth_tolerance_minutes()
+    parsed_dir = parsed_cache_dir or (data_dir / "parsed" / f"isd-v{PARSER_VERSION}")
 
     def _check_free_disk() -> None:
         free_gb = shutil.disk_usage(data_dir).free / (1024**3)
@@ -172,11 +228,12 @@ def main(
 
     t0 = time.perf_counter()
     failed: list[tuple[str, int, str]] = []
-    max_failures = int(len(selected_ids) * len(years) * max_fail_rate)
+    total_tasks = len(selected_ids) * len(years)
+    max_failures = int(total_tasks * max_fail_rate)
 
     if not skip_download:
         typer.echo(
-            f"Fetching {len(selected_ids)} stations x {len(years)} year(s) ({y0}..{y1}) "
+            f"Fetching {len(selected_ids)} stations x {len(years)} year(s) ({years[0]}..{years[-1]}) "
             f"with max_workers={max_workers}, discard_raw={discard_raw}..."
         )
         if discard_raw:
@@ -245,6 +302,7 @@ def main(
                 raw_dir,
                 max_workers=max_workers,
                 base_url=base_url,
+                cfg=cfg,
             )
             if len(failed) > max_failures:
                 typer.echo(
@@ -271,15 +329,16 @@ def main(
         typer.echo(f"Wrote failure list to {failed_log}", err=True)
 
     _check_free_disk()
-    typer.echo(f"Building truth dataset for {y0}-01-01T00:00:00 .. {y1}-12-31T23:00:00...")
+    typer.echo(f"Building truth dataset for {start_ts.isoformat()} .. {end_ts.isoformat()}...")
     ds = build_truth(
         selected_ids,
-        start=f"{y0}-01-01T00:00:00",
-        end=f"{y1}-12-31T23:00:00",
+        start=start_ts,
+        end=end_ts,
         cache_dir=raw_dir,
         stations_metadata=meta_df,
         tolerance_minutes=tol_min,
         parsed_cache_dir=parsed_dir if discard_raw else None,
+        cfg=cfg,
     )
 
     write_truth_netcdf(ds, out)
@@ -287,7 +346,7 @@ def main(
     elapsed = time.perf_counter() - t0
     completeness = compute_completeness(ds)
     size_mb = out.stat().st_size / 1e6
-    typer.echo(f"Wrote {out} ({size_mb:.2f} MB) in {elapsed:.1f}s")
+    typer.echo(f"Wrote {out} ({size_mb:.2f} MB, NetCDF4/h5netcdf) in {elapsed:.1f}s")
     typer.echo("Per-variable completeness:")
     for var, frac in completeness.items():
         typer.echo(f"  {var:5s}: {frac * 100:6.2f}%")
