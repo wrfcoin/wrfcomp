@@ -8,9 +8,14 @@ Rules this module follows (see docs/VERIFICATION_PROTOCOL.md and configs/splits.
   Observations must sit on exactly that grid;
   the candidate and the baseline must cover all of it, so a forecast cannot drop a station or a date.
   Whole leads are the one exception: the leads scored are the candidate's leads.
-* **Mask.** A grid point `(init_time, lead_time, station_id)` is scored when its observation is finite.
-  That one mask is used for the candidate and for the baseline. A forecast (candidate or baseline)
-  that is not finite at a scored point is an error, never a silently skipped point.
+* **Mask.** A grid point `(init_time, lead_time, station_id)` is scored when its observation is finite
+  AND the tail threshold of its station, variable and calendar month of the valid time is finite
+  (`scoring_mask`). A threshold is missing exactly where the station has no training observation in
+  that month, so the mask is fixed by the truth and the training data alone: no forecast can change
+  it, and it is the same for every model. Points with a valid observation but no threshold are
+  counted per entry as `n_masked_no_threshold`. That one mask is used for the candidate and for the
+  baseline. A forecast (candidate or baseline) that is not finite at a scored point is an error,
+  never a silently skipped point.
 * **Members are a sample.** Fair CRPS and the spread-skill correction assume the members are
   exchangeable random draws from the forecast distribution. Fair CRPS is not a proper score for
   members placed deliberately: two fixed members score exactly 0 whenever the observation falls
@@ -371,16 +376,20 @@ def _require_finite_at(fcst: xr.DataArray, mask: np.ndarray, name: str) -> None:
 
 
 def _pointwise(fcst: xr.DataArray, obs: xr.DataArray, threshold: xr.DataArray) -> dict[str, np.ndarray]:
-    variance, sq_error = _spread_terms(fcst, obs)
-    arrays = {
-        "crps": fair_crps(fcst, obs),
-        "twcrps": tail_crps(fcst, obs, threshold),
-        "crps_ecdf": ecdf_crps(fcst, obs),
-        "twcrps_ecdf": tail_crps(fcst, obs, threshold, method="ecdf"),
-        "variance": variance,
-        "sq_error": sq_error,
-    }
-    return {k: np.asarray(a.transpose(*POINT_DIMS).values, dtype=np.float64) for k, a in arrays.items()}
+    # Values at points that are not scored (no truth, no threshold) may be NaN or infinite; they are
+    # computed and then left out by the mask, so their arithmetic warnings mean nothing.
+    with warnings.catch_warnings(), np.errstate(invalid="ignore", over="ignore"):
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        variance, sq_error = _spread_terms(fcst, obs)
+        arrays = {
+            "crps": fair_crps(fcst, obs),
+            "twcrps": tail_crps(fcst, obs, threshold),
+            "crps_ecdf": ecdf_crps(fcst, obs),
+            "twcrps_ecdf": tail_crps(fcst, obs, threshold, method="ecdf"),
+            "variance": variance,
+            "sq_error": sq_error,
+        }
+        return {k: np.asarray(a.transpose(*POINT_DIMS).values, dtype=np.float64) for k, a in arrays.items()}
 
 
 def _finite_or_none(value: float) -> float | None:
@@ -438,6 +447,34 @@ def _per_init_mean(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def _point_thresholds(obs: xr.DataArray, tail_threshold: xr.DataArray) -> xr.DataArray:
+    """Thresholds `(station_id, month)` on the points of `obs`, float64, dims `POINT_DIMS`."""
+    if set(tail_threshold.dims) != {"station_id", "month"}:
+        raise ValueError(
+            f"tail_threshold must have dims (station_id, month), got {tuple(tail_threshold.dims)}"
+        )
+    if not obs.indexes["station_id"].isin(tail_threshold.indexes["station_id"]).all():
+        raise ValueError("tail_threshold does not cover every station of the forecast")
+    selected = _as_float64(tail_threshold).sel(station_id=obs["station_id"].values)
+    return broadcast_threshold(selected, obs["init_time"], obs["lead_time"])
+
+
+def scoring_mask(obs: xr.DataArray, tail_threshold: xr.DataArray) -> xr.DataArray:
+    """True where a point is scored: the observation is finite and so is its tail threshold.
+
+    `obs` has dims `(init_time, lead_time, station_id)`, `tail_threshold` has `(station_id, month)`
+    and must list every station of `obs`. The threshold used is the one for the station and the
+    calendar month of the valid time. The result depends on truth and training data only, so it is
+    the same for every forecast scored against them. Dims `(init_time, lead_time, station_id)`.
+    """
+    if set(obs.dims) != set(POINT_DIMS):
+        raise ValueError(f"obs must have dims {POINT_DIMS}, got {tuple(obs.dims)}")
+    obs = obs.transpose(*POINT_DIMS)
+    threshold = _point_thresholds(obs, tail_threshold)
+    mask = np.isfinite(np.asarray(obs.values, dtype=np.float64)) & np.isfinite(threshold.values)
+    return xr.DataArray(mask, dims=POINT_DIMS, coords={dim: obs[dim].values for dim in POINT_DIMS})
+
+
 def score_variable(
     fcst: xr.DataArray,
     obs: xr.DataArray,
@@ -458,11 +495,12 @@ def score_variable(
     and at least the forecast's leads. `fcst` and `baseline` have dims
     `(init_time, lead_time, station_id, ens_member)` and must cover every grid init time and station
     (anything outside the grid is ignored). The leads scored are the forecast's leads; the baseline
-    must have all of them. `tail_threshold` has dims `(station_id, month)` and must be finite wherever
-    it is needed.
+    must have all of them. `tail_threshold` has dims `(station_id, month)` and must list every
+    grid station; a point whose threshold is NaN is not scored for any model (see `scoring_mask`).
 
     Each entry has `crps`, `twcrps_p95`, `loss` (fair estimator), `crps_ecdf`, `twcrps_p95_ecdf`,
-    `loss_ecdf` (ecdf estimator), `spread_skill_ratio`, `n_pairs`, `n_members`, and with a baseline
+    `loss_ecdf` (ecdf estimator), `spread_skill_ratio`, `n_pairs`, `n_masked_no_threshold` (points
+    with a valid observation but no tail threshold, not scored), `n_members`, and with a baseline
     also `crpss_vs_baseline`, `crpss_vs_baseline_ecdf`, `baseline_twcrps_p95`,
     `baseline_twcrps_p95_ecdf`, `dm_pvalue`. See the module docstring for the rules.
     """
@@ -499,23 +537,10 @@ def score_variable(
         baseline = on_grid(_canonical(baseline, "baseline", ensemble=True), "baseline")
 
     hours = _lead_hours(fcst["lead_time"].values)
-    obs_values = np.asarray(obs.values, dtype=np.float64)
-    mask = np.isfinite(obs_values)
-
-    if set(tail_threshold.dims) != {"station_id", "month"}:
-        raise ValueError(
-            f"tail_threshold must have dims (station_id, month), got {tuple(tail_threshold.dims)}"
-        )
-    if not fcst.indexes["station_id"].isin(tail_threshold.indexes["station_id"]).all():
-        raise ValueError("tail_threshold does not cover every station of the forecast")
-    threshold = broadcast_threshold(
-        _as_float64(tail_threshold).sel(station_id=fcst["station_id"]), fcst["init_time"], fcst["lead_time"]
-    )
-    missing = int(np.count_nonzero(mask & ~np.isfinite(threshold.values)))
-    if missing:
-        raise ValueError(
-            f"tail_threshold is not finite at {missing} point(s) where the observation is valid"
-        )
+    threshold = _point_thresholds(obs, tail_threshold)
+    obs_finite = np.isfinite(np.asarray(obs.values, dtype=np.float64))
+    mask = obs_finite & np.isfinite(threshold.values)
+    no_threshold = obs_finite & ~mask
 
     _require_finite_at(fcst, mask, "forecast")
     cand = _pointwise(fcst, obs, threshold)
@@ -538,6 +563,7 @@ def score_variable(
         if n_pairs:
             out.update(_summary(cand, index, sub_mask, cfg))
         out["n_pairs"] = n_pairs
+        out["n_masked_no_threshold"] = int(np.count_nonzero(no_threshold[:, index, :]))
         out["n_members"] = n_members
         if base is None or loss_diff is None:
             return out

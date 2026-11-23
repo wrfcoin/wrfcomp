@@ -254,6 +254,41 @@ def test_truth_nan_point_is_skipped_for_candidate_and_baseline_alike(tmp_path, s
     assert fewer["n_pairs"]["u10"] == reference["n_pairs"]["u10"]
 
 
+def test_missing_threshold_masks_the_point_for_every_model(tmp_path, synthetic) -> None:
+    reference = _scored(_run(_stores(tmp_path / "a", synthetic), tmp_path / "a.json"), tmp_path / "a.json")
+    assert reference["metrics"]["t2m"]["all"]["n_masked_no_threshold"] == 0
+
+    # Station 2 has no t2m training data: no threshold in any month. Its points are not scored.
+    synthetic.thresholds["t2m"].values[2, :] = np.nan
+    obs = align_truth(synthetic.candidate, synthetic.truth)
+    at_station = int(np.isfinite(obs["t2m"].values[:, :, 2]).sum())
+    assert at_station > 0
+    masked = _scored(_run(_stores(tmp_path / "b", synthetic), tmp_path / "b.json"), tmp_path / "b.json")
+    assert masked["n_pairs"]["t2m"] == reference["n_pairs"]["t2m"] - at_station
+    assert masked["metrics"]["t2m"]["all"]["n_masked_no_threshold"] == at_station
+    assert sum(masked["metrics"]["t2m"][h]["n_masked_no_threshold"] for h in ("6", "12", "24")) == at_station
+    assert masked["metrics"]["t2m"]["all"]["crps"] != reference["metrics"]["t2m"]["all"]["crps"]
+    assert masked["metrics"]["u10"] == reference["metrics"]["u10"]  # u10 still has its thresholds
+    assert masked["n_stations"] == reference["n_stations"]
+
+    # The NaN rule applies to the scored points only: either forecast may be NaN at the masked ones.
+    synthetic.candidate["t2m"].values[:, :, 2, :] = np.nan
+    synthetic.baseline["t2m"].values[:, :, 2, 0] = np.nan
+    same = _scored(_run(_stores(tmp_path / "c", synthetic), tmp_path / "c.json"), tmp_path / "c.json")
+    assert same["metrics"] == masked["metrics"] and same["n_pairs"] == masked["n_pairs"]
+
+    # u10 has a threshold at station 2, so a NaN there is still refused, for candidate and baseline.
+    i, j = np.argwhere(np.isfinite(obs["u10"].values[:, :, 2]))[0]
+    for which in ("candidate", "baseline"):
+        broken = make_synthetic()
+        broken.thresholds["t2m"].values[2, :] = np.nan
+        getattr(broken, which)["u10"].values[i, j, 2, 0] = np.nan
+        result = _run(_stores(tmp_path / which, broken), tmp_path / f"{which}.json")
+        assert result.exit_code == 3, result.output
+        assert f"{which} forecast is not finite at 1 point(s)" in result.output
+        assert not (tmp_path / f"{which}.json").exists()
+
+
 def test_2025_init_time_is_refused_without_allow_sealed(tmp_path) -> None:
     syn = make_synthetic(start="2024-12-20T00:00")
     assert syn.candidate["init_time"].values.max() >= np.datetime64("2025-01-01")
@@ -422,7 +457,7 @@ def test_non_v1_lead_is_not_scored(tmp_path) -> None:
     assert "[9]" in result.output
 
 
-CASES = ["missing", "model_id", "baseline_id", "variable", "members", "init_hour", "nan_threshold"]
+CASES = ["missing", "model_id", "baseline_id", "variable", "members", "init_hour"]
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -436,8 +471,6 @@ def test_bad_input_exits_2(tmp_path, case: str) -> None:
         syn.candidate = syn.candidate.isel(ens_member=[0])
     elif case == "init_hour":
         syn.candidate = syn.candidate.assign_coords(init_time=syn.candidate["init_time"].values + HOUR * 3)
-    elif case == "nan_threshold":
-        syn.thresholds["t2m"].values[2, :] = np.nan
     stores = _stores(tmp_path, syn)
     if case == "missing":
         stores["forecast"] = tmp_path / "nope.zarr"

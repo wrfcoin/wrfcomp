@@ -320,6 +320,7 @@ def _lead_metrics(n_pairs: int) -> dict:
         "loss_ecdf": 0.614,
         "spread_skill_ratio": 0.97,
         "n_pairs": n_pairs,
+        "n_masked_no_threshold": 3,
         "n_members": 20,
         "crpss_vs_baseline": 0.12,
         "crpss_vs_baseline_ecdf": 0.1,
@@ -418,6 +419,10 @@ def _break_scorecard(case: str) -> dict:
         p["baseline_sha256"] = None
     elif case == "one_member":
         p["metrics"]["t2m"]["1"]["n_members"] = 1
+    elif case == "missing_masked_count":
+        p["metrics"]["t2m"]["1"].pop("n_masked_no_threshold")
+    elif case == "negative_masked_count":
+        p["metrics"]["t2m"]["1"]["n_masked_no_threshold"] = -1
     elif case == "missing_ecdf":
         p["metrics"]["t2m"]["1"].pop("crps_ecdf")
     elif case == "period_with_offset":
@@ -454,6 +459,8 @@ def _break_scorecard(case: str) -> dict:
         "pvalue_above_one",
         "baseline_id_without_sha",
         "one_member",
+        "missing_masked_count",
+        "negative_masked_count",
         "missing_ecdf",
         "period_with_offset",
         "period_reversed",
