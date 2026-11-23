@@ -300,6 +300,23 @@ def test_thresholds_nan_means_no_training_data_and_inf_is_refused() -> None:
             validate_thresholds(bad.chunk({"station_id": 1}))
 
 
+def test_thresholds_must_be_float32_or_float64() -> None:
+    validate_thresholds(make_thresholds().astype(np.float64), variables=VARIABLES)
+    validate_thresholds(make_thresholds().astype(np.float32), variables=VARIABLES)
+    for dtype in (np.longdouble, np.float16, np.int64):
+        with pytest.raises(SchemaError, match="expected float32 or float64"):
+            validate_thresholds(make_thresholds().astype(dtype), variables=VARIABLES)
+    # The case behind the rule: finite as long double, infinity once scoring casts it to float64.
+    if np.finfo(np.longdouble).max > np.finfo(np.float64).max:
+        for sign in (1, -1):
+            wide = make_thresholds().astype(np.longdouble)
+            wide["t2m"].values[0, 0] = sign * np.longdouble("1e400")
+            assert np.isfinite(wide["t2m"].values).all()
+            expected = f"'t2m' is {np.dtype(np.longdouble)}, expected float32 or float64"
+            with pytest.raises(SchemaError, match=expected):
+                validate_thresholds(wide, variables=VARIABLES)
+
+
 def _break_thresholds(case: str) -> xr.Dataset:
     ds = make_thresholds()
     if case == "eleven_months":
