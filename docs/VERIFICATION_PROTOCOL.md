@@ -84,7 +84,10 @@ All metrics are computed via the Australian Bureau of Meteorology's peer-reviewe
    ```
    Every candidate is normalized against the locked operational baseline (e.g., Earth2Studio `AIFS` / `FCN3` or NOAA GFS/HRRR) evaluated on the exact same station-time mask.
 4. **Ensemble Calibration (`spread_skill_ratio` & Rank Histogram):**
-   - `spread_skill_ratio = sqrt(mean(ens_var)) / sqrt(mean((ens_mean - obs)^2))` (ideal ≈ `1.0`).
+   - `spread_skill_ratio = sqrt((M + 1) / M) * sqrt(mean(ens_var)) / sqrt(mean((ens_mean - obs)^2))` (ideal ≈ `1.0`),
+     where `M` is the number of ensemble members and `ens_var` is the unbiased (ddof = 1) variance. The
+     `sqrt((M + 1) / M)` factor is the standard finite-ensemble correction, so a calibrated ensemble scores
+     `1.0` whatever its size.
    - Diagnostic reliability verified via [`scores.probability.rank_histogram`](https://scores.readthedocs.io/en/stable/tutorials/Rank_Histogram.html) (which handles zero-precipitation ties cleanly).
 
 ---
@@ -99,6 +102,14 @@ Because weather variance shifts dramatically from week to week, raw score improv
 | **2. Extreme-Tail Safety** | `twcrps_p95 <= baseline_twcrps_p95` (no tail degradation) | Prevents models that boost average scores by blurring storms |
 | **3. Calibration Band** | `0.85 <= spread_skill_ratio <= 1.15` | Blocks overconfident (collapsed) or wildly over-dispersed ensembles |
 | **4. Statistical Significance** | One-sided Diebold-Mariano `dm_pvalue < 0.05` (with horizon lag `h = lead_time / init_step`) | Accounts for autocorrelation across overlapping multi-day forecasts (`scores.statistical_tests.diebold_mariano`) |
+
+**Where the gates are judged:** each of the four gates is evaluated per variable on its all-leads entry
+(every scored lead pooled), not on each lead separately. Per-lead values are reported in the scorecard.
+
+**Diebold-Mariano method:** the test uses the Hering-Genton ("HG") statistic with Student's t, because under
+autocorrelated score differences it held the nominal 5 % false-pass rate in simulation (4.8–6.3 %) where the
+Harvey-Leybourne-Newbold form at `h = 1` gave 15–31 %; with HG the lag `h` is a floor on the modelled
+autocorrelation and does not change the result on a long series (details in `wrfcomp.harness.metrics`).
 
 **Multiple-Testing Guard (Agentic Research Loops):** When an automated swarm tests `M` candidate architectures on the 2024 validation split within a single research sprint, apply a **Bonferroni-adjusted threshold (`alpha = 0.05 / M`)** or require the winning candidate to hold its gain across at least **3 of 4 calendar quarters** of 2024 before promoting it to a release candidate.
 
@@ -122,4 +133,4 @@ Each JSON scorecard records:
 - `harness_version` (exact `wrfcomp` package + `scores` version)
 - `truth_sha256` and `forecast_sha256` (content hashes guaranteeing reproducible inputs)
 - `commit_sha256` (optional pre-window `drand` timelock commitment hash, bridging directly into `docs/TOKENOMICS.md`)
-- Full per-variable, per-lead-time metric dictionaries and the boolean `passed_significance_gate` verdict.
+- Full per-variable, per-lead-time metric dictionaries and the boolean `passed_gate` verdict.

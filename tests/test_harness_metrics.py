@@ -223,8 +223,8 @@ def test_spread_skill_calibrated_near_one_and_overconfident_fails() -> None:
     overconfident = as_fcst(centre[..., None] + 0.6 * rng.normal(size=(*shape, n_mem)), c)
 
     ratio = float(M.spread_skill_ratio(calibrated, obs))
-    # expected sqrt(M / (M + 1)) = 0.990 for 50 members; 4000 points, tolerance +-0.03
-    assert ratio == pytest.approx(math.sqrt(n_mem / (n_mem + 1)), abs=0.03)
+    # 4000 points, tolerance +-0.03
+    assert ratio == pytest.approx(1.0, abs=0.03)
     per_lead = M.spread_skill_ratio(calibrated, obs, preserve_dims=("lead_time",))
     assert per_lead.dims == ("lead_time",)
     assert np.all(np.abs(per_lead.values - 1.0) < 0.05)
@@ -238,6 +238,30 @@ def test_spread_skill_calibrated_near_one_and_overconfident_fails() -> None:
     assert bad["all"]["spread_skill_ratio"] < CFG.gate.spread_skill_min
     assert bad["all"]["spread_skill_ratio"] == pytest.approx(0.3, abs=0.05)
     assert M.evaluate_gates(bad, CFG)["spread_skill"] is False
+
+
+@pytest.mark.parametrize("n_mem", [2, 30])
+def test_spread_skill_is_one_for_a_calibrated_ensemble_of_any_size(n_mem: int) -> None:
+    # Obs and members are exchangeable draws around the same centre. 8000 points; tolerance +-0.04.
+    rng = np.random.default_rng(40 + n_mem)
+    c = coords(400, (6, 24), 10)
+    shape = (400, 2, 10)
+    centre = 280 + 3 * rng.normal(size=shape)
+    obs = as_obs(centre + 2.0 * rng.normal(size=shape), c)
+    fcst = as_fcst(centre[..., None] + 2.0 * rng.normal(size=(*shape, n_mem)), c)
+    ratio = float(M.spread_skill_ratio(fcst, obs))
+    assert ratio == pytest.approx(1.0, abs=0.04)
+
+    # by hand: sqrt((M + 1) / M) * sqrt(mean unbiased variance) / rmse of the ensemble mean
+    f, o = fcst.values.astype(np.float64), obs.values.astype(np.float64)
+    spread = math.sqrt(f.var(axis=-1, ddof=1).mean())
+    rmse = math.sqrt(((f.mean(axis=-1) - o) ** 2).mean())
+    assert ratio == pytest.approx(math.sqrt((n_mem + 1) / n_mem) * spread / rmse, rel=1e-12)
+    assert spread / rmse == pytest.approx(math.sqrt(n_mem / (n_mem + 1)), abs=0.04)  # uncorrected value
+
+    result = M.score_variable(fcst, obs, flat_threshold(10, 285.0), cfg=CFG)
+    assert result["all"]["spread_skill_ratio"] == pytest.approx(ratio, rel=1e-12)
+    assert M.evaluate_gates(result, CFG)["spread_skill"] is True
 
 
 def test_composite_loss_uses_config_weights() -> None:
