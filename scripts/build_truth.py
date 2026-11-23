@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -29,8 +30,10 @@ from wrfcomp.harness.truth import (
     AWS_GLOBAL_HOURLY_BASE_URL,
     MAX_CONCURRENT_REQUESTS,
     PARSER_VERSION,
+    PREFERRED_REPORT_TYPES,
     build_truth,
     compute_completeness,
+    count_report_types,
     download_station_year,
     download_stations,
     get_harness_config,
@@ -39,6 +42,7 @@ from wrfcomp.harness.truth import (
     load_parsed_station_year_npz,
     load_stations_metadata,
     parse_isd_csv,
+    read_parsed_npz_report_types,
     required_years_for_window,
     save_parsed_station_year_npz,
     write_truth_netcdf,
@@ -60,7 +64,7 @@ def _download_parse_discard_one(
     base_url: str,
     tolerance_minutes: int,
     max_retries: int = 4,
-) -> tuple[str, int, str]:
+) -> tuple[str, int, str, dict[str, int]]:
     """Download a station-year CSV, parse into versioned ``.npz`` observations, and delete raw CSV."""
     npz_dir = parsed_cache_dir / str(year)
     npz_dir.mkdir(parents=True, exist_ok=True)
@@ -68,7 +72,7 @@ def _download_parse_discard_one(
     if npz_path.is_file() and npz_path.stat().st_size > 0:
         # Refuse stale/mismatched cache loudly instead of silently reusing it
         load_parsed_station_year_npz(npz_path, expected_tolerance_minutes=tolerance_minutes)
-        return (station_id, year, "cached")
+        return (station_id, year, "cached", read_parsed_npz_report_types(npz_path))
 
     csv_path = download_station_year(
         station_id,
@@ -78,12 +82,18 @@ def _download_parse_discard_one(
         max_retries=max_retries,
     )
     try:
+        rt_counts = count_report_types(csv_path)
         obs_df = parse_isd_csv(csv_path)
-        save_parsed_station_year_npz(obs_df, npz_path, tolerance_minutes=tolerance_minutes)
+        save_parsed_station_year_npz(
+            obs_df,
+            npz_path,
+            tolerance_minutes=tolerance_minutes,
+            report_type_counts=rt_counts,
+        )
     finally:
         csv_path.unlink(missing_ok=True)
 
-    return (station_id, year, "downloaded")
+    return (station_id, year, "downloaded", rt_counts)
 
 
 def _resolve_time_bounds(
@@ -228,6 +238,7 @@ def main(
 
     t0 = time.perf_counter()
     failed: list[tuple[str, int, str]] = []
+    report_type_by_sy: dict[str, dict[str, int]] = {}
     total_tasks = len(selected_ids) * len(years)
     max_failures = int(total_tasks * max_fail_rate)
 
@@ -257,7 +268,8 @@ def main(
                     sid, yr = fmap[fut]
                     done += 1
                     try:
-                        fut.result()
+                        _, _, _, rt_counts = fut.result()
+                        report_type_by_sy[f"{yr}/{sid}"] = rt_counts
                     except Exception as exc:
                         failed.append((sid, yr, str(exc)))
                     if done % 10 == 0 or done == len(tasks):
@@ -343,6 +355,40 @@ def main(
 
     write_truth_netcdf(ds, out)
 
+    # Collect per-station-year report-type counts if not already populated during download
+    for yr in years:
+        for sid in selected_ids:
+            key = f"{yr}/{sid}"
+            if key in report_type_by_sy:
+                continue
+            npz_path = parsed_dir / str(yr) / f"{sid}.npz"
+            csv_path = raw_dir / str(yr) / f"{sid}.csv"
+            if discard_raw and npz_path.is_file():
+                report_type_by_sy[key] = read_parsed_npz_report_types(npz_path)
+            elif csv_path.is_file():
+                report_type_by_sy[key] = count_report_types(csv_path)
+
+    rt_report_path = out.with_suffix(out.suffix + ".report_types.json")
+    rt_report_path.write_text(
+        json.dumps(dict(sorted(report_type_by_sy.items())), indent=2),
+        encoding="utf-8",
+    )
+
+    tot_rt: Counter[str] = Counter()
+    n_pref_mode = 0
+    n_fm12_fallback = 0
+    sparse_preferred: list[tuple[str, int, int]] = []
+    for key, counts in sorted(report_type_by_sy.items()):
+        tot_rt.update(counts)
+        pref_n = sum(counts.get(rt, 0) for rt in PREFERRED_REPORT_TYPES)
+        fm12_n = counts.get("FM-12", 0)
+        if pref_n > 0:
+            n_pref_mode += 1
+            if pref_n < 500 and fm12_n >= 500:
+                sparse_preferred.append((key, pref_n, fm12_n))
+        elif fm12_n > 0:
+            n_fm12_fallback += 1
+
     elapsed = time.perf_counter() - t0
     completeness = compute_completeness(ds)
     size_mb = out.stat().st_size / 1e6
@@ -350,6 +396,20 @@ def main(
     typer.echo("Per-variable completeness:")
     for var, frac in completeness.items():
         typer.echo(f"  {var:5s}: {frac * 100:6.2f}%")
+    typer.echo(
+        f"Report-type summary ({len(report_type_by_sy)} station-years: "
+        f"{n_pref_mode} preferred FM-15/FM-16/SY-MT, {n_fm12_fallback} FM-12 fallback):"
+    )
+    for rt, cnt in sorted(tot_rt.items()):
+        typer.echo(f"  {rt:6s}: {cnt:,}")
+    if sparse_preferred:
+        typer.echo(
+            "  WARNING sparse-preferred station-years (<500 pref with >=500 FM-12): "
+            f"{len(sparse_preferred)}"
+        )
+        for key, pref_n, fm12_n in sparse_preferred[:20]:
+            typer.echo(f"    {key}: preferred={pref_n}, FM-12={fm12_n}")
+    typer.echo(f"Per-station-year report-type counts written to {rt_report_path}")
 
 
 if __name__ == "__main__":

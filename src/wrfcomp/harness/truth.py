@@ -8,11 +8,13 @@ into the canonical WRFComp hourly truth ``xarray.Dataset`` defined in
 from __future__ import annotations
 
 import gzip
+import json
 import math
 import random
 import time
 import urllib.error
 import urllib.request
+import warnings
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -25,7 +27,7 @@ import xarray as xr
 from wrfcomp.harness.config import HarnessConfig, load_config
 from wrfcomp.harness.schemas import validate_truth_dataset
 
-PARSER_VERSION: str = "2"
+PARSER_VERSION: str = "3"
 
 PRIMARY_VARS: tuple[str, ...] = ("t2m", "td2m", "u10", "v10", "msl")
 OFFSET_VARS: tuple[str, ...] = tuple(f"{v}_offset_min" for v in PRIMARY_VARS)
@@ -53,11 +55,11 @@ PASSING_QC_CODES_WIND_SLP: frozenset[str] = frozenset({"0", "1", "4", "5", "9"})
 PASSING_QC_CODES: frozenset[str] = PASSING_QC_CODES_TEMP_DEW
 
 # Report-type filtering (see docs/TRUTH_SOURCES.md):
-# Use METAR-family reports (FM-15, FM-16) whenever a station-year has any, avoiding 3-hourly FM-12
-# synoptic copies of the preceding :53 routine METAR. Fall back to FM-12 / SY-MT only for
-# station-years with zero FM-15 / FM-16 rows.
-METAR_REPORT_TYPES: frozenset[str] = frozenset({"FM-15", "FM-16"})
-SYNOPTIC_FALLBACK_REPORT_TYPES: frozenset[str] = frozenset({"FM-12", "SY-MT"})
+# Use measurement-time routine/special reports (FM-15, FM-16, SY-MT) whenever a station-year has
+# any, avoiding 3-hourly FM-12 on-the-hour synoptic copies of the preceding :53 routine METAR.
+# Fall back to FM-12 only for station-years with none of the three preferred types.
+PREFERRED_REPORT_TYPES: frozenset[str] = frozenset({"FM-15", "FM-16", "SY-MT"})
+SYNOPTIC_FALLBACK_REPORT_TYPES: frozenset[str] = frozenset({"FM-12"})
 
 # Documented ISD physical bounds (isd-format-document.pdf, p. 8):
 # Wind direction angle: MIN 001, MAX 360 (999 = missing).
@@ -382,6 +384,20 @@ def _empty_parsed_frame() -> pd.DataFrame:
     )
 
 
+def count_report_types(source: Path | str | TextIO) -> dict[str, int]:
+    """Count raw stripped ``REPORT_TYPE`` rows in an ISD station-year CSV."""
+    df = pd.read_csv(
+        source,
+        usecols=lambda c: c == "REPORT_TYPE",
+        dtype=str,
+        keep_default_na=False,
+    )
+    if df.empty or "REPORT_TYPE" not in df.columns:
+        return {}
+    counts = df["REPORT_TYPE"].str.strip().value_counts()
+    return {str(k): int(v) for k, v in sorted(counts.items())}
+
+
 def parse_isd_csv(
     source: Path | str | TextIO,
     *,
@@ -389,9 +405,9 @@ def parse_isd_csv(
 ) -> pd.DataFrame:
     """Parse a NOAA ISD global-hourly station-year CSV into canonical units.
 
-    Applies report-type selection (METAR-family ``FM-15``/``FM-16`` whenever the station-year
-    contains any; otherwise synoptic fallback ``FM-12``/``SY-MT``), NOAA quality filters, unit
-    conversions, physical ``td2m <= t2m`` guard, and the sealed-test cutoff from
+    Applies report-type selection (preferred measurement-time reports ``FM-15``/``FM-16``/``SY-MT``
+    whenever the station-year contains any; otherwise synoptic fallback ``FM-12``), NOAA quality
+    filters, unit conversions, physical ``td2m <= t2m`` guard, and the sealed-test cutoff from
     ``configs/splits.yaml``.
     """
     cutoff = get_sealed_test_cutoff(cfg)
@@ -410,9 +426,9 @@ def parse_isd_csv(
 
     if "REPORT_TYPE" in df.columns:
         rtypes = df["REPORT_TYPE"].str.strip()
-        is_metar = rtypes.isin(METAR_REPORT_TYPES)
-        if is_metar.any():
-            keep_rt = is_metar
+        is_preferred = rtypes.isin(PREFERRED_REPORT_TYPES)
+        if is_preferred.any():
+            keep_rt = is_preferred
         else:
             keep_rt = rtypes.isin(SYNOPTIC_FALLBACK_REPORT_TYPES)
         df = df.loc[keep_rt].reset_index(drop=True)
@@ -458,6 +474,7 @@ def save_parsed_station_year_npz(
     dest: Path,
     *,
     tolerance_minutes: int,
+    report_type_counts: dict[str, int] | None = None,
 ) -> Path:
     """Save parsed station-year observations and cache provenance metadata to a compressed ``.npz``."""
     dest_path = Path(dest)
@@ -472,6 +489,7 @@ def save_parsed_station_year_npz(
         "meta_parser_version": np.array(PARSER_VERSION),
         "meta_tolerance_minutes": np.array(int(tolerance_minutes), dtype=np.int32),
         "meta_passing_qc_codes": np.array(passing_qc_signature()),
+        "meta_report_type_counts": np.array(json.dumps(report_type_counts or {}, sort_keys=True)),
     }
     for var in PRIMARY_VARS:
         payload[var] = (
@@ -486,6 +504,15 @@ def save_parsed_station_year_npz(
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
     return dest_path
+
+
+def read_parsed_npz_report_types(path: Path) -> dict[str, int]:
+    """Read stored raw ``REPORT_TYPE`` counts from a versioned parsed station-year ``.npz``."""
+    with np.load(path, allow_pickle=False) as z:
+        if "meta_report_type_counts" not in z.files:
+            return {}
+        raw = json.loads(str(z["meta_report_type_counts"].item()))
+        return {str(k): int(v) for k, v in raw.items()}
 
 
 def load_parsed_station_year_npz(
@@ -859,7 +886,15 @@ def _load_station_observations_for_window(
                     first_csv = fpath
                 parsed_df = parse_isd_csv(fpath, cfg=cfg)
 
-        if parsed_df is not None and not parsed_df.empty:
+        if parsed_df is None:
+            warnings.warn(
+                f"Missing cached ISD data for station-year {yr}/{station_id}",
+                UserWarning,
+                stacklevel=3,
+            )
+            continue
+
+        if not parsed_df.empty:
             sub = parsed_df[(parsed_df["obs_time"] >= lo) & (parsed_df["obs_time"] <= hi)]
             if not sub.empty:
                 frames.append(sub)

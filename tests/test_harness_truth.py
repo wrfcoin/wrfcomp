@@ -17,9 +17,11 @@ from wrfcomp.harness.schemas import validate_truth_dataset
 from wrfcomp.harness.truth import (
     OFFSET_FILL_VALUE,
     OFFSET_VARS,
+    PARSER_VERSION,
     PRIMARY_VARS,
     build_truth,
     compute_completeness,
+    count_report_types,
     download_station_year,
     load_parsed_station_year_npz,
     match_station_to_hours,
@@ -27,6 +29,7 @@ from wrfcomp.harness.truth import (
     parse_slp,
     parse_tmp_or_dew,
     parse_wnd,
+    read_parsed_npz_report_types,
     required_years_for_window,
     save_parsed_station_year_npz,
     validate_truth_values,
@@ -163,6 +166,42 @@ def test_parse_real_sample_file_amarillo_and_fm12_filtering() -> None:
     assert np.isnan(row_var["v10"])
     assert row_var["t2m"] == pytest.approx(273.15 + 14.4, abs=1e-3)
 
+    # 5. Real SY-MT routine report at measurement time (2024-07-14T23:53:00) MUST be retained!
+    #    Raw: WND=210,5,N,0062,5 TMP=+0372,5 DEW=+0117,5 SLP=10116,5
+    row_symt = by_time.loc[pd.Timestamp("2024-07-14T23:53:00")]
+    assert row_symt["t2m"] == pytest.approx(273.15 + 37.2, abs=1e-3)
+    assert row_symt["td2m"] == pytest.approx(273.15 + 11.7, abs=1e-3)
+    assert row_symt["msl"] == pytest.approx(101160.0, abs=1e-1)
+    exp_su, exp_sv = wind_to_uv(210.0, 6.2)
+    assert row_symt["u10"] == pytest.approx(exp_su, abs=1e-4)
+    assert row_symt["v10"] == pytest.approx(exp_sv, abs=1e-4)
+
+    # Verify report-type counting on real sample
+    rt_counts = count_report_types(SAMPLE_AMARILLO)
+    assert rt_counts["FM-15"] > 0
+    assert rt_counts["FM-12"] > 0
+    assert rt_counts["SY-MT"] == 1
+    assert rt_counts["SOD"] > 0
+
+
+def test_real_symt_row_matches_00z_in_build_truth(tmp_path: Path) -> None:
+    cache_2024 = tmp_path / "2024"
+    cache_2024.mkdir(parents=True)
+    shutil.copy(SAMPLE_AMARILLO, cache_2024 / "72363023047.csv")
+
+    ds = build_truth(
+        station_ids=["72363023047"],
+        start="2024-07-14T23:00:00",
+        end="2024-07-15T01:00:00",
+        cache_dir=tmp_path,
+    )
+    t_00z = ds.sel(valid_time="2024-07-15T00:00:00", station_id="72363023047")
+    assert float(t_00z["t2m"]) == pytest.approx(310.35, abs=1e-3)
+    assert float(t_00z["td2m"]) == pytest.approx(284.85, abs=1e-3)
+    assert float(t_00z["msl"]) == pytest.approx(101160.0, abs=1e-1)
+    assert int(t_00z["t2m_offset_min"]) == -7
+    assert int(t_00z["msl_offset_min"]) == -7
+
 
 def test_report_type_fm12_copy_rejected_and_synoptic_fallback() -> None:
     # Case 1: FM-15 at 05:53 has suspect SLP (6) and variable wind WITH direction (190,5,V,0041,5);
@@ -201,11 +240,11 @@ def test_report_type_fm12_copy_rejected_and_synoptic_fallback() -> None:
     assert vals2["u10"][0] == pytest.approx(exp_u, abs=1e-4)
     assert vals2["v10"][0] == pytest.approx(exp_v, abs=1e-4)
 
-    # Case 2: Station-year with NO FM-15/FM-16 falls back to FM-12 and SY-MT (dropping SOD)
+    # Case 2: Station-year with NO FM-15/FM-16/SY-MT falls back to FM-12 only (dropping SOD)
     synoptic_only = io.StringIO(
         'DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n'
         '"2024-06-01T00:00:00","FM-12","+0150,1","+0050,1","10132,1","180,1,N,0050,1"\n'
-        '"2024-06-01T03:00:00","SY-MT","+0160,1","+0060,1","10135,1","180,1,N,0050,1"\n'
+        '"2024-06-01T03:00:00","FM-12","+0160,1","+0060,1","10135,1","180,1,N,0050,1"\n'
         '"2024-06-01T05:59:00","SOD  ","+9999,9","+9999,9","99999,9","999,9,9,9999,9"\n'
     )
     parsed_syn = parse_isd_csv(synoptic_only)
@@ -214,6 +253,16 @@ def test_report_type_fm12_copy_rejected_and_synoptic_fallback() -> None:
         pd.Timestamp("2024-06-01T00:00:00"),
         pd.Timestamp("2024-06-01T03:00:00"),
     ]
+
+    # Case 3: SY-MT alongside FM-12 keeps SY-MT and drops FM-12
+    symt_and_fm12 = io.StringIO(
+        'DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n'
+        '"2024-06-01T02:53:00","SY-MT","+0160,5","+0060,5","10135,5","180,5,N,0050,5"\n'
+        '"2024-06-01T03:00:00","FM-12","+0160,1","+0060,1","10135,1","180,1,N,0050,1"\n'
+    )
+    parsed_symt = parse_isd_csv(symt_and_fm12)
+    assert len(parsed_symt) == 1
+    assert parsed_symt["obs_time"].iloc[0] == pd.Timestamp("2024-06-01T02:53:00")
 
 
 def test_parse_real_sample_file_awos_qc_c() -> None:
@@ -369,31 +418,34 @@ def test_year_boundary_both_paths_identical_and_never_2025(tmp_path: Path) -> No
 
 def test_parsed_cache_refuses_metadata_mismatch(tmp_path: Path) -> None:
     obs_df = parse_isd_csv(SAMPLE_AMARILLO)
+    rt_counts = count_report_types(SAMPLE_AMARILLO)
     npz_path = save_parsed_station_year_npz(
         obs_df,
         tmp_path / "2024" / "72363023047.npz",
         tolerance_minutes=15,
+        report_type_counts=rt_counts,
     )
 
-    # Matching metadata loads cleanly
+    # Matching metadata loads cleanly and preserves report-type counts
     loaded = load_parsed_station_year_npz(npz_path, expected_tolerance_minutes=15)
     assert len(loaded) == len(obs_df)
+    assert read_parsed_npz_report_types(npz_path) == rt_counts
 
     # Tolerance mismatch raises ValueError
     with pytest.raises(ValueError, match="tolerance_minutes mismatch"):
         load_parsed_station_year_npz(npz_path, expected_tolerance_minutes=10)
 
-    # Parser version mismatch raises ValueError
+    # Previous parser version ("2") mismatch raises ValueError
     with np.load(npz_path) as z:
         payload = {k: z[k] for k in z.files}
-    payload["meta_parser_version"] = np.array("1")
+    payload["meta_parser_version"] = np.array("2")
     bad_ver = tmp_path / "bad_ver.npz"
     np.savez_compressed(bad_ver, **payload)
     with pytest.raises(ValueError, match="parser_version mismatch"):
         load_parsed_station_year_npz(bad_ver, expected_tolerance_minutes=15)
 
     # Passing QC codes mismatch raises ValueError
-    payload["meta_parser_version"] = np.array("2")
+    payload["meta_parser_version"] = np.array(PARSER_VERSION)
     payload["meta_passing_qc_codes"] = np.array("temp_dew=0,1;wind_slp=0,1")
     bad_qc = tmp_path / "bad_qc.npz"
     np.savez_compressed(bad_qc, **payload)
@@ -405,6 +457,21 @@ def test_parsed_cache_refuses_metadata_mismatch(tmp_path: Path) -> None:
     np.savez_compressed(legacy, t2m=np.zeros(2, dtype=np.float32))
     with pytest.raises(ValueError, match="missing required metadata"):
         load_parsed_station_year_npz(legacy, expected_tolerance_minutes=15)
+
+
+def test_missing_station_year_emits_warning(tmp_path: Path) -> None:
+    cache_2024 = tmp_path / "2024"
+    cache_2024.mkdir(parents=True)
+    shutil.copy(SAMPLE_AMARILLO, cache_2024 / "72363023047.csv")
+
+    # Requesting 2024-01-01T00:00 needs 2023 lookback; missing 2023/72363023047 must warn
+    with pytest.warns(UserWarning, match=r"2023/72363023047"):
+        build_truth(
+            ["72363023047"],
+            start="2024-01-01T00:00:00",
+            end="2024-01-01T02:00:00",
+            cache_dir=tmp_path,
+        )
 
 
 def test_build_truth_contract_and_h5netcdf_roundtrip(tmp_path: Path) -> None:

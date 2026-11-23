@@ -38,20 +38,21 @@ adapter will be required for post-August-2025 dates.
 
 ## Report-Type Selection (`REPORT_TYPE`)
 
-US ASOS stations in ISD routinely emit both aviation METAR/SPECI records (`FM-15` at `:51`–`:56`,
-`FM-16` specials) and 3-hourly synoptic records (`FM-12` at `:00`) that duplicate the preceding
-`:53` `FM-15` measurement with a nominal `:00` timestamp and independent QC flags. Taking `FM-12`
-copies alongside `FM-15` reports distorts `X_offset_min` (reporting offset `0` instead of `-7` at
-synoptic/init hours), can bypass a suspect flag on the underlying `FM-15` observation, and can beat
-a genuine `:00` `FM-16` special report at the same timestamp.
+US ASOS stations in ISD routinely emit aviation METAR/SPECI records (`FM-15` at `:51`–`:56`,
+`FM-16` specials) alongside occasional combined synoptic/METAR records (`SY-MT`) that also sit at
+routine `:52`–`:54` measurement times and serve as the sole routine report for those hours. In
+addition, ASOS stations emit 3-hourly `FM-12` synoptic records at `:00` that duplicate the
+preceding `:53` routine measurement with a nominal `:00` timestamp and independent QC flags.
+Taking `FM-12` copies alongside routine reports distorts `X_offset_min` (reporting offset `0`
+instead of `-7` at synoptic/init hours), can bypass a suspect flag on the underlying routine
+observation, and can beat a genuine `:00` `FM-16` special report at the same timestamp.
 
 WRFComp therefore applies a deterministic per-station-year report-type rule:
-- **METAR-family preferred:** If a station-year CSV contains any `FM-15` or `FM-16` rows, **only**
-  `FM-15` and `FM-16` rows are retained (`FM-12`, `SY-MT`, `SOD`, `SOM`, and other types are
-  dropped).
-- **Synoptic fallback:** Only if a station-year has **zero** `FM-15` and `FM-16` rows does the
-  loader fall back to `FM-12` and `SY-MT` (combined synoptic/METAR) rows. Summary rows (`SOD`,
-  `SOM`) are always excluded.
+- **Preferred measurement-time reports:** If a station-year CSV contains any `FM-15`, `FM-16`, or
+  `SY-MT` rows, **only** `FM-15`, `FM-16`, and `SY-MT` rows are retained (`FM-12`, `SOD`, `SOM`,
+  and other types are dropped).
+- **Synoptic fallback:** Only if a station-year has **zero** `FM-15`, `FM-16`, and `SY-MT` rows
+  does the loader fall back to `FM-12` rows. Summary rows (`SOD`, `SOM`) are always excluded.
 
 ---
 
