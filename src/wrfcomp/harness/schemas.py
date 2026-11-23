@@ -86,10 +86,43 @@ def _check_station_coords(ds: xr.Dataset, kind: str) -> None:
     _require(bool(((lon >= -180) & (lon <= 360)).all()), f"{kind}: longitude outside -180..360")
 
 
+OFFSET_SUFFIX = "_offset_min"
+OFFSET_DTYPE = "int16"
+
+
+def _check_offset_companions(ds: xr.Dataset, kind: str, dims: tuple[str, ...], names: list[str]) -> None:
+    """Data contract addendum 1: `X_offset_min` next to truth variable `X` (int16, same dims as `X`)."""
+    for name in names:
+        base = name[: -len(OFFSET_SUFFIX)]
+        _require(
+            base in VARIABLE_UNITS and base in ds.data_vars,
+            f"{kind}: '{name}' has no truth variable '{base}' next to it",
+        )
+        var = ds[name]
+        _require(
+            set(var.dims) == set(dims) and len(var.dims) == len(dims),
+            f"{kind}: variable '{name}' has dims {tuple(var.dims)}, expected {dims}",
+        )
+        _require(
+            var.dtype == np.dtype(OFFSET_DTYPE),
+            f"{kind}: variable '{name}' is {var.dtype}, expected {OFFSET_DTYPE}",
+        )
+
+
 def _check_variables(
-    ds: xr.Dataset, kind: str, dims: tuple[str, ...], required: Iterable[str] | None, dtype: str | None
+    ds: xr.Dataset,
+    kind: str,
+    dims: tuple[str, ...],
+    required: Iterable[str] | None,
+    dtype: str | None,
+    *,
+    offset_companions: bool = False,
 ) -> None:
     names = [str(n) for n in ds.data_vars]
+    if offset_companions:
+        companions = [n for n in names if n.endswith(OFFSET_SUFFIX)]
+        names = [n for n in names if not n.endswith(OFFSET_SUFFIX)]
+        _check_offset_companions(ds, kind, dims, companions)
     _require(len(names) > 0, f"{kind}: no data variables")
     for name in names:
         _require(
@@ -178,7 +211,11 @@ def validate_truth_dataset(
     cfg: HarnessConfig | None = None,
     allow_sealed: bool = False,
 ) -> None:
-    """Check a truth dataset: dims `(valid_time, station_id)`, hourly on the full hour, NaN where missing."""
+    """Check a truth dataset: dims `(valid_time, station_id)`, hourly on the full hour, NaN where missing.
+
+    Besides the contract variables, the only other variables accepted are the observation time offsets
+    `X_offset_min` (int16, same dims) of a variable `X` that is present. Scoring ignores them.
+    """
     kind = "truth"
     ds = _check_dataset(ds, kind)
     times = _check_index(ds, kind, "valid_time")
@@ -194,7 +231,7 @@ def validate_truth_dataset(
     )
     _check_station_ids(ds, kind)
     _check_station_coords(ds, kind)
-    _check_variables(ds, kind, TRUTH_DIMS, variables, "float32")
+    _check_variables(ds, kind, TRUTH_DIMS, variables, "float32", offset_companions=True)
     _check_not_sealed(times.max(), kind, cfg, allow_sealed)
 
 
@@ -283,6 +320,8 @@ class Scorecard(_Strict):
     n_pairs: dict[str, Annotated[int, Field(ge=0)]]
     metrics: dict[str, dict[str, LeadMetrics]]
     gates: dict[str, dict[str, bool]]
+    # Primary variables the forecast does not have. Any entry here means the gate is not passed.
+    variables_missing: list[NonEmptyStr] = Field(default_factory=list)
     passed_gate: bool
 
     @model_validator(mode="after")
@@ -310,9 +349,20 @@ class Scorecard(_Strict):
                 raise ValueError(f"n_pairs[{variable!r}] differs from metrics[{variable!r}]['all'].n_pairs")
             if set(self.gates[variable]) != set(GATE_NAMES):
                 raise ValueError(f"gates[{variable!r}] must have exactly the gates {GATE_NAMES}")
-        expected = len(self.gates) > 0 and all(all(g.values()) for g in self.gates.values())
+        if self.variables_missing != sorted(set(self.variables_missing)):
+            raise ValueError("variables_missing must be sorted and unique")
+        if set(self.variables_missing) & set(self.metrics):
+            raise ValueError("a variable cannot be both scored and missing")
+        expected = (
+            len(self.gates) > 0
+            and not self.variables_missing
+            and all(all(g.values()) for g in self.gates.values())
+        )
         if self.passed_gate != expected:
-            raise ValueError("passed_gate must be true exactly when every gate of every variable passed")
+            raise ValueError(
+                "passed_gate must be true exactly when no primary variable is missing and every gate of "
+                "every variable passed"
+            )
         if self.passed_gate and self.baseline_id is None:
             raise ValueError("a scorecard without a baseline cannot pass the gate")
         return self

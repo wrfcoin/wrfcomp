@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import xarray as xr
-from conftest import open_zarr, write_zarr
+from conftest import PRIMARY, open_zarr, write_zarr
 
 from wrfcomp.harness.align import (
     MAX_LISTED,
@@ -47,7 +47,7 @@ def _tiny_truth(times: list[str], stations: list[str], values: np.ndarray) -> xr
 def test_alignment_matches_truth_at_init_plus_lead(synthetic) -> None:
     obs = align_truth(synthetic.candidate, synthetic.truth)
     assert obs["t2m"].dims == ("init_time", "lead_time", "station_id")
-    assert set(obs.data_vars) == {"t2m", "u10"}
+    assert set(obs.data_vars) == PRIMARY
     truth = synthetic.truth
     for i in (0, 7, 29):
         for j in range(3):
@@ -96,7 +96,7 @@ def test_offset_companion_variables_are_ignored(synthetic) -> None:
         offset = np.where(np.isnan(truth[name].values), -32768, 7).astype("int16")
         truth[f"{name}_offset_min"] = (("valid_time", "station_id"), offset)
     obs = align_truth(synthetic.candidate, truth)
-    assert set(obs.data_vars) == {"t2m", "u10"}
+    assert set(obs.data_vars) == PRIMARY
     assert content_sha256(obs) == content_sha256(align_truth(synthetic.candidate, synthetic.truth))
     check_nan_rule(synthetic.candidate, obs)
 
@@ -121,6 +121,18 @@ def test_sealed_valid_time_is_refused_even_with_2024_init() -> None:
     forecast = _tiny_forecast(["2024-12-31T12"], [6, 12], ["A"])  # 12 h lead lands on 2025-01-01T00
     with pytest.raises(SealedSplitError, match="valid_time"):
         check_forecast_not_sealed(forecast)
+
+
+def test_sealed_truth_is_refused_inside_align_truth() -> None:
+    # Review finding 2: a 2024 forecast against a truth file that also holds 2025 rows.
+    forecast = _tiny_forecast(["2024-12-30T00"], [6], ["A"])
+    truth = _tiny_truth(["2024-12-30T06", "2025-01-01T00"], ["A"], np.array([[1.0], [2.0]]))
+    with pytest.raises(SealedSplitError, match="truth valid_time"):
+        align_truth(forecast, truth)
+    with pytest.warns(UserWarning, match="SEALED SPLIT IN USE"):
+        obs = align_truth(forecast, truth, allow_sealed=True)
+    assert obs["t2m"].values[0, 0, 0] == 1.0
+    assert align_truth(forecast, truth.isel(valid_time=[0]))["t2m"].values[0, 0, 0] == 1.0
 
 
 def test_last_unsealed_hour_is_allowed() -> None:

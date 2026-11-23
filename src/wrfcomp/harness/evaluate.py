@@ -9,11 +9,12 @@ Exit codes
 Scorecard bytes
     JSON with sorted keys, two-space indent, ASCII only, one trailing newline. Every float is rounded to
     10 significant digits (``float(f"{x:.10g}")``) and written with Python's shortest ``repr``; a
-    non-finite float is written as ``null``. No timestamps and no file paths are written, so the same
-    inputs give the same bytes.
+    non-finite float is written as ``null`` and negative zero as ``0.0``. No timestamps and no file
+    paths are written, so the same inputs give the same bytes.
 
 What is scored
-    Every primary variable (``configs/splits.yaml``) that the forecast has, at every v1 lead
+    Every primary variable (``configs/splits.yaml``) that the forecast has (the ones it lacks are listed
+    in ``variables_missing``, and any entry there means ``passed_gate`` is false), at every v1 lead
     (``evaluation.lead_hours``) that the forecast has. Leads outside that list are not scored and are
     named on stderr.
 
@@ -95,7 +96,8 @@ def _canonical(value: Any) -> Any:
         number = float(value)
         if not math.isfinite(number):
             return None
-        return float(f"{number:.{FLOAT_SIG_DIGITS}g}")
+        rounded = float(f"{number:.{FLOAT_SIG_DIGITS}g}")
+        return 0.0 if rounded == 0.0 else rounded  # never "-0.0"
     if value is None or isinstance(value, str):
         return value
     raise TypeError(f"cannot write {type(value).__name__} to a scorecard")
@@ -131,6 +133,23 @@ def _require_unique(ds: xr.Dataset, what: str, dims: tuple[str, ...]) -> None:
             raise BadInputError(f"{what}: missing coordinate {dim}")
         if not ds.indexes[dim].is_unique:
             raise BadInputError(f"{what}: duplicate values in {dim}")
+
+
+_TIME_KINDS = {"M": "datetime64", "m": "timedelta64"}
+
+
+def _require_time_dtype(ds: xr.Dataset, what: str, name: str, kind: str) -> None:
+    """The sealed check converts times before schema validation runs, so the dtype is checked here."""
+    dtype = ds[name].dtype
+    if dtype.kind != kind:
+        raise BadInputError(f"{what}: {name} must be {_TIME_KINDS[kind]}, got dtype {dtype}")
+
+
+def _content_hash(ds: xr.Dataset, what: str) -> str:
+    try:
+        return content_sha256(ds)
+    except TypeError as exc:
+        raise BadInputError(f"{what}: {exc}") from exc
 
 
 def _lead_hours(ds: xr.Dataset, what: str) -> list[int]:
@@ -245,11 +264,16 @@ def _score_opened(
     # Sealed split first: coordinates only, before any value is read or hashed.
     _require_unique(forecast, "forecast", POINT_DIMS)
     _require_unique(truth, "truth", ("valid_time", "station_id"))
+    _require_time_dtype(forecast, "forecast", "init_time", "M")
+    _require_time_dtype(forecast, "forecast", "lead_time", "m")
+    _require_time_dtype(truth, "truth", "valid_time", "M")
     seal = {"sealed_start": sealed_start, "allow_sealed": allow_sealed}
     sealed_used = check_forecast_not_sealed(forecast, what="forecast", **seal)
     sealed_used |= check_not_sealed(truth["valid_time"], what="truth valid_time", **seal)
     if baseline is not None:
         _require_unique(baseline, "baseline", POINT_DIMS)
+        _require_time_dtype(baseline, "baseline", "init_time", "M")
+        _require_time_dtype(baseline, "baseline", "lead_time", "m")
         sealed_used |= check_forecast_not_sealed(baseline, what="baseline", **seal)
 
     validate_forecast_dataset(forecast, cfg=cfg, allow_sealed=allow_sealed)
@@ -266,16 +290,23 @@ def _score_opened(
         raise BadInputError(f"--model-id {model_id!r} does not match the forecast's model_id {attr_id!r}")
 
     hashes = {
-        "forecast_sha256": content_sha256(forecast),
-        "truth_sha256": content_sha256(truth),
-        "thresholds_sha256": content_sha256(thresholds),
-        "baseline_sha256": content_sha256(baseline) if baseline is not None else None,
+        "forecast_sha256": _content_hash(forecast, "forecast"),
+        "truth_sha256": _content_hash(truth, "truth"),
+        "thresholds_sha256": _content_hash(thresholds, "thresholds"),
+        "baseline_sha256": _content_hash(baseline, "baseline") if baseline is not None else None,
     }
 
     # Variables: every primary variable the forecast has. Each must exist everywhere else.
     variables = [v for v in cfg.evaluation.variables.primary if v in forecast.data_vars]
     if not variables:
         raise BadInputError("forecast has none of the primary variables")
+    variables_missing = sorted(v for v in cfg.evaluation.variables.primary if v not in forecast.data_vars)
+    if variables_missing:
+        typer.echo(
+            f"note: forecast lacks primary variable(s) {variables_missing}; it is scored on the rest "
+            "and cannot pass the gate",
+            err=True,
+        )
     others = {"truth": truth, "thresholds": thresholds}
     if baseline is not None:
         others["baseline"] = baseline
@@ -371,11 +402,13 @@ def _score_opened(
         period_start=_naive_utc(period[0]),
         period_end=_naive_utc(period[1]),
         sealed_data_used=bool(sealed_used),
-        leads_scored=_lead_hours(forecast, "forecast"),
+        leads_scored=sorted(_lead_hours(forecast, "forecast")),
         n_pairs=n_pairs,
         metrics=metrics,
         gates=gates,
-        passed_gate=all(bool(ok) for per_var in gates.values() for ok in per_var.values()),
+        variables_missing=variables_missing,
+        passed_gate=not variables_missing
+        and all(bool(ok) for per_var in gates.values() for ok in per_var.values()),
         **hashes,
     )
     return scorecard.model_dump(mode="json")

@@ -101,6 +101,10 @@ def align_truth(
     ``(init_time, lead_time)``. Only the truth rows at the forecast's valid times are read.
     """
     check_forecast_not_sealed(forecast, sealed_start=sealed_start, allow_sealed=allow_sealed)
+    # The truth file as a whole, not only the rows used: nothing sealed is opened by accident.
+    check_not_sealed(
+        truth["valid_time"], what="truth valid_time", sealed_start=sealed_start, allow_sealed=allow_sealed
+    )
     for dim in ("valid_time", "station_id"):
         if not truth.indexes[dim].is_unique:
             raise ValueError(f"truth {dim} has duplicate values")

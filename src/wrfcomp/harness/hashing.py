@@ -12,8 +12,9 @@ the schema validators check units, so the hash stands for the numbers and their 
 
 Canonical forms (so that a store round trip cannot change the hash):
 
-- numbers and booleans: little-endian bytes of the in-memory dtype; every NaN is written as the one
-  canonical quiet NaN of that dtype;
+- real numbers and booleans: little-endian bytes of the in-memory dtype; every NaN is written as the
+  one canonical quiet NaN of that dtype. Complex dtypes are refused (``TypeError``): the data contract
+  has none, and a NaN in one component would otherwise hide the other component;
 - ``datetime64`` / ``timedelta64``: converted to nanosecond resolution, hashed as int64 (NaT included);
 - strings (``str``, ``bytes``, object or numpy string dtypes): each element as UTF-8 with a length prefix.
 """
@@ -44,7 +45,7 @@ def _dtype_label(dtype: np.dtype) -> str:
         return "timedelta64[ns]"
     if kind in "OUST":
         return "string"
-    if kind in "biufc":
+    if kind in "biuf":
         return f"{kind}{dtype.itemsize}"
     raise TypeError(f"cannot hash dtype {dtype!r}")
 
@@ -68,7 +69,7 @@ def _values_bytes(values: np.ndarray, label: str) -> bytes:
             parts.append(raw)
         return b"".join(parts)
     out = values.astype(values.dtype.newbyteorder("<"), copy=True)
-    if out.dtype.kind in "fc":
+    if out.dtype.kind == "f":
         out[np.isnan(out)] = np.nan
     return np.ascontiguousarray(out).tobytes()
 

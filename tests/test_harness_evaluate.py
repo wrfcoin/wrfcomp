@@ -7,7 +7,16 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr
-from conftest import Synthetic, make_synthetic, open_zarr, station_ids, write_config, write_netcdf, write_zarr
+from conftest import (
+    PRIMARY,
+    Synthetic,
+    make_synthetic,
+    open_zarr,
+    station_ids,
+    write_config,
+    write_netcdf,
+    write_zarr,
+)
 from typer.testing import CliRunner
 
 from wrfcomp.harness.align import align_truth
@@ -74,7 +83,7 @@ def test_coordinate_changes_change_hash(synthetic) -> None:
 def test_names_dims_and_dtypes_are_covered(synthetic) -> None:
     ds = synthetic.thresholds
     before = content_sha256(ds)
-    assert content_sha256(ds.rename({"t2m": "td2m"})) != before
+    assert content_sha256(ds.rename({"t2m": "t2m_renamed"})) != before
     assert content_sha256(ds.astype("float64")) != before
     assert content_sha256(ds.transpose("month", "station_id")) != before
     assert content_sha256(ds.drop_vars("u10")) != before
@@ -147,7 +156,7 @@ def test_end_to_end_scorecard_validates_and_is_byte_identical(tmp_path, syntheti
     assert model.model_id == "synth" and model.baseline_id == "synth_base"
     assert (model.n_stations, model.n_init_times) == (20, 30)
     assert model.leads_scored == [6, 12, 24] and model.init_hours_scored == [0, 12]
-    assert set(model.metrics) == {"t2m", "u10"}
+    assert set(model.metrics) == PRIMARY and model.variables_missing == []
     assert model.forecast_sha256 == content_sha256(synthetic.candidate)
     assert model.truth_sha256 == content_sha256(synthetic.truth)
     assert model.baseline_sha256 == content_sha256(synthetic.baseline)
@@ -303,7 +312,7 @@ def test_no_baseline_scores_but_cannot_pass(tmp_path, synthetic) -> None:
 def test_better_candidate_passes_the_gate(tmp_path, synthetic) -> None:
     out = tmp_path / "s.json"
     card = _scored(_run(_stores(tmp_path, synthetic), out), out)
-    assert set(card["gates"]) == {"t2m", "u10"}
+    assert set(card["gates"]) == PRIMARY
     for name, per_gate in card["gates"].items():
         assert set(per_gate) == set(GATE_NAMES), name  # the kernel's gate list, whatever it holds
         assert all(per_gate.values()), (name, per_gate)
@@ -444,6 +453,117 @@ def test_bad_input_exits_2(tmp_path, case: str) -> None:
     assert not out.exists()
 
 
+def test_unsorted_lead_time_scores_the_same(tmp_path, synthetic) -> None:
+    # Review finding 1: lead_time stored as 24 h, 6 h, 12 h used to crash with exit 1.
+    reference = _scored(_run(_stores(tmp_path / "a", synthetic), tmp_path / "a.json"), tmp_path / "a.json")
+    synthetic.candidate = synthetic.candidate.isel(lead_time=[2, 0, 1])
+    assert [int(v / HOUR) for v in synthetic.candidate["lead_time"].values] == [24, 6, 12]
+    card = _scored(_run(_stores(tmp_path / "b", synthetic), tmp_path / "b.json"), tmp_path / "b.json")
+    assert card["leads_scored"] == [6, 12, 24]
+    assert card.pop("forecast_sha256") != reference.pop("forecast_sha256")
+    assert canonical_json(card) == canonical_json(reference)
+
+
+@pytest.mark.parametrize("where", ["forecast_init", "forecast_lead", "baseline_init", "truth_valid"])
+def test_bad_time_dtype_exits_2(tmp_path, where: str) -> None:
+    # Review finding 3: a time coordinate that is not a time used to crash with exit 1.
+    syn = make_synthetic(n_init=6)
+    if where == "forecast_init":
+        syn.candidate = syn.candidate.assign_coords(init_time=[f"bad{i}" for i in range(6)])
+    elif where == "forecast_lead":
+        syn.candidate = syn.candidate.assign_coords(lead_time=[6, 12, 24])
+    elif where == "baseline_init":
+        syn.baseline = syn.baseline.assign_coords(init_time=[f"bad{i}" for i in range(6)])
+    else:
+        syn.truth = syn.truth.assign_coords(
+            valid_time=[f"h{i:04d}" for i in range(syn.truth.sizes["valid_time"])]
+        )
+    out = tmp_path / "s.json"
+    result = _run(_stores(tmp_path, syn), out)
+    assert result.exit_code == 2, f"{result.output}\n{result.exception!r}"
+    assert "bad input" in result.output and "must be" in result.output
+    assert not out.exists()
+
+
+def test_complex_dtype_is_refused_by_the_hash() -> None:
+    # Review finding 4: 1+nanj and 2+nanj used to hash the same.
+    for value in (1.0, 2.0):
+        ds = xr.Dataset({"t2m": ("x", np.array([complex(value, np.nan)]))})
+        with pytest.raises(TypeError, match="cannot hash dtype"):
+            content_sha256(ds)
+    with pytest.raises(TypeError):
+        content_sha256(xr.Dataset(coords={"x": np.array([1 + 2j], dtype="complex64")}))
+
+
+def test_missing_primary_variable_is_scored_but_cannot_pass(tmp_path, synthetic) -> None:
+    # Review finding 6: the fixture candidate passes every gate, so only the missing variables stop it.
+    full = _scored(_run(_stores(tmp_path / "a", synthetic), tmp_path / "a.json"), tmp_path / "a.json")
+    assert full["passed_gate"] is True and full["variables_missing"] == []
+    synthetic.candidate = synthetic.candidate.drop_vars(["v10", "msl"])
+    out = tmp_path / "b.json"
+    result = _run(_stores(tmp_path / "b", synthetic), out)
+    card = _scored(result, out)
+    Scorecard.model_validate(card)
+    assert card["variables_missing"] == ["msl", "v10"]
+    assert set(card["metrics"]) == {"t2m", "td2m", "u10"}
+    assert all(all(g.values()) for g in card["gates"].values())
+    assert card["passed_gate"] is False
+    assert card["metrics"]["t2m"] == full["metrics"]["t2m"]
+    assert "cannot pass the gate" in result.output
+
+
+def test_scorecard_model_refuses_a_pass_with_missing_variables(tmp_path, synthetic) -> None:
+    out = tmp_path / "s.json"
+    card = _scored(_run(_stores(tmp_path, synthetic), out), out)
+    del card["metrics"]["msl"], card["gates"]["msl"], card["n_pairs"]["msl"]
+    Scorecard.model_validate({**card, "variables_missing": []})  # dropped silently: the model cannot know
+    with pytest.raises(ValueError, match="no primary variable is missing"):
+        Scorecard.model_validate({**card, "variables_missing": ["msl"]})
+    Scorecard.model_validate({**card, "variables_missing": ["msl"], "passed_gate": False})
+    with pytest.raises(ValueError, match="both scored and missing"):
+        Scorecard.model_validate({**card, "variables_missing": ["t2m"], "passed_gate": False})
+
+
+def test_truth_with_offset_companions_scores_the_same(tmp_path, synthetic) -> None:
+    # Data contract addendum 1: X_offset_min (int16) next to each truth variable; scoring ignores them.
+    reference = _scored(_run(_stores(tmp_path / "a", synthetic), tmp_path / "a.json"), tmp_path / "a.json")
+    rng = np.random.default_rng(7)
+    for name in sorted(PRIMARY):
+        values = synthetic.truth[name].values
+        offset = rng.integers(-15, 16, size=values.shape).astype("int16")
+        offset[np.isnan(values)] = -32768
+        synthetic.truth[f"{name}_offset_min"] = (("valid_time", "station_id"), offset)
+    stores = _stores(tmp_path / "b", synthetic)
+    for kind in ("zarr", "netcdf4", "netcdf3"):
+        if kind != "zarr":
+            stores["truth"] = write_netcdf(
+                synthetic.truth, tmp_path / f"{kind}.nc", netcdf3=kind == "netcdf3"
+            )
+        out = tmp_path / f"{kind}.json"
+        card = _scored(_run(stores, out), out)
+        assert card["truth_sha256"] == content_sha256(synthetic.truth) != reference["truth_sha256"], kind
+        card.pop("truth_sha256")
+        assert card == {k: v for k, v in reference.items() if k != "truth_sha256"}, kind
+
+
+@pytest.mark.parametrize("case", ["float_offset", "orphan_offset", "other_unknown", "wrong_dims"])
+def test_truth_accepts_no_other_unknown_variable(tmp_path, case: str) -> None:
+    syn = make_synthetic(n_init=6)
+    dims = ("valid_time", "station_id")
+    shape = syn.truth["t2m"].shape
+    if case == "float_offset":
+        syn.truth["t2m_offset_min"] = (dims, np.zeros(shape, "float32"))
+    elif case == "orphan_offset":
+        syn.truth["ws10_offset_min"] = (dims, np.zeros(shape, "int16"))
+    elif case == "other_unknown":
+        syn.truth["t2m_quality"] = (dims, np.zeros(shape, "int16"))
+    else:
+        syn.truth["t2m_offset_min"] = (("station_id",), np.zeros(shape[1], "int16"))
+    result = _run(_stores(tmp_path, syn), tmp_path / "s.json")
+    assert result.exit_code == 2, f"{result.output}\n{result.exception!r}"
+    assert "truth:" in result.output
+
+
 def test_canonical_json_float_rule() -> None:
     text = canonical_json(
         {
@@ -469,3 +589,11 @@ def test_canonical_json_float_rule() -> None:
     assert '"i": 7,' in text and '"t": true' in text
     with pytest.raises(TypeError):
         canonical_json({"when": np.datetime64("2024-01-01")})
+
+
+def test_canonical_json_has_no_negative_zero() -> None:
+    # Review finding 5.
+    text = canonical_json({"a": -0.0, "b": np.float32(-0.0), "c": -1e-320, "d": [0.0, -0.0], "e": -2.5})
+    assert "-0.0" not in text
+    assert json.loads(text) == {"a": 0.0, "b": 0.0, "c": -1e-320, "d": [0.0, 0.0], "e": -2.5}
+    assert text == canonical_json({"a": 0.0, "b": 0.0, "c": -1e-320, "d": [0.0, 0.0], "e": -2.5})

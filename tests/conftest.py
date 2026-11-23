@@ -10,8 +10,16 @@ import pandas as pd
 import pytest
 import xarray as xr
 
-VARIABLES = {"t2m": (285.0, 6.0), "u10": (1.0, 3.0)}  # name -> (mean, day-to-day spread)
-UNITS = {"t2m": "K", "u10": "m/s"}
+# All five primary variables: name -> (mean, day-to-day spread)
+VARIABLES = {
+    "t2m": (285.0, 6.0),
+    "td2m": (278.0, 5.0),
+    "u10": (1.0, 3.0),
+    "v10": (-0.5, 3.0),
+    "msl": (101325.0, 300.0),
+}
+UNITS = {"t2m": "K", "td2m": "K", "u10": "m/s", "v10": "m/s", "msl": "Pa"}
+PRIMARY = set(VARIABLES)
 
 
 @dataclass
