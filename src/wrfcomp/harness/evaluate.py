@@ -345,7 +345,13 @@ def _score_opened(
         tail = thresholds[name].sel(station_id=forecast["station_id"].values).load()
         try:
             metrics[name] = score_variable(
-                fc, obs[name], tail, bl, cfg=cfg, init_times=grid_init, station_ids=grid_stations
+                fc,
+                obs[name],
+                tail,
+                bl,
+                cfg=cfg,
+                expected_init_times=grid_init,
+                expected_station_ids=grid_stations,
             )
         except ValueError as exc:  # for example a NaN threshold at a point with valid truth
             raise BadInputError(f"{name}: {exc}") from exc
