@@ -92,8 +92,9 @@ def official_series(ds, forecasts):
     for var in SUPPORTED:
         if var == "wind_speed":
             values = np.hypot(ds.u10.values, ds.v10.values)
-            offsets = np.where(ds.u10_offset_min.values == ds.v10_offset_min.values,
-                               ds.u10_offset_min.values, np.nan)
+            offsets = np.where(
+                ds.u10_offset_min.values == ds.v10_offset_min.values, ds.u10_offset_min.values, np.nan
+            )
         else:
             values, offsets = ds[var].values, ds[var + "_offset_min"].values
         series = []
@@ -116,3 +117,243 @@ def align(series, times):
     ok = ix >= 0
     out[ok], votes[ok] = value[ix[ok]], z[ix[ok]]
     return out, votes
+
+
+def station_points(batch):
+    codes, ids = pd.factorize(batch.station_ids)
+    variables = pd.Categorical(batch.variable)
+    frame = pd.DataFrame(dict(station=codes, time=batch.obs_time, variable=variables, value=batch.values))
+    geo = pd.DataFrame(dict(station=codes, lat=batch.lat, lon=batch.lon, height=batch.elevation_m))
+    geo = geo.drop_duplicates().sort_values("station")
+    if len(geo) != len(ids):
+        raise ValueError("station position changed within trial")
+    return frame, geo
+
+
+def indoor_screen(when, values, measured, reference):
+    """Count distinct hourly matches in a trailing day, with at least 18 hours of coverage."""
+    ix = latest_indices(measured, when)
+    matched = np.flatnonzero(ix >= 0)
+    if not len(matched):
+        return False, False
+    rows = matched[np.r_[True, np.diff(ix[matched]) != 0]]
+    windows = pd.DataFrame(
+        {"citizen": values[rows], "official": reference[ix[rows]], "hours": (when[rows] - START) / HOUR},
+        index=when[rows],
+    ).rolling("24h", min_periods=12)
+    ranges = windows.max() - windows.min()
+    eligible = (ranges.hours >= 18) & (ranges.official >= 5)
+    return bool(eligible.any()), bool((eligible & (ranges.citizen <= 1)).any())
+
+
+def aggregate_station(wide, position, official, forecasts, series, totals, modes, samples, station):
+    times = wide.index.values.astype("datetime64[ns]")
+    lat, lon, height = position
+    dist = distances_km(lat, lon, official.latitude.values, official.longitude.values)
+    nearest = int(np.argmin(dist))
+    buddies = np.flatnonzero(dist <= CFG.radius_km)
+    official_dist = distances_km(
+        official.latitude.values[nearest],
+        official.longitude.values[nearest],
+        official.latitude.values,
+        official.longitude.values,
+    )
+    official_dist[nearest] = np.inf
+    other = int(np.argmin(official_dist))
+    issued, valid, means = forecasts
+    fi = forecast_indices(issued, valid, times)
+    sun = np.array([solar_elevation(t, lat, lon) > CFG.day_degrees for t in times])
+    peers = wide.to_dict("records")
+    report_flags = np.zeros(len(times), dtype=int)
+    reports = totals["reports"]
+    reports["total"] += len(times)
+    for var in wide:
+        rows = np.flatnonzero(np.isfinite(wide[var].values))
+        values = wide[var].values[rows]
+        when = times[rows]
+        counts = totals[var]
+        counts["total"] += len(rows)
+        state = StationState()
+        day_count = night_count = 0
+        flags = np.zeros(len(rows), dtype=int)
+        weights = []
+        if var in SUPPORTED:
+            if var == "t2m" and dist[nearest] <= CFG.radius_km:
+                eligible, indoor = indoor_screen(when, values, *series[var][nearest][:2])
+                if eligible:
+                    modes["indoor_evaluable"].add(station)
+                if indoor:
+                    modes["indoor_screen"].add(station)
+            reference, _ = align(series[var][nearest], when)
+            comparison, _ = align(series[var][other], when)
+            official_pair = np.isfinite(reference) & np.isfinite(comparison)
+            counts["official_pairs"] += int(official_pair.sum())
+            counts["official_sq"] += float(
+                np.sum((reference[official_pair] - comparison[official_pair]) ** 2)
+            )
+            both = np.isfinite(reference)
+            counts["reference_pairs"] += int(both.sum())
+            counts["reference_sq"] += float(np.sum((values[both] - reference[both]) ** 2))
+            adjusted = np.full((len(when), len(buddies)), np.nan)
+            votes = adjusted.copy()
+            thermal = var in ("t2m", "td2m")
+            for col, buddy in enumerate(buddies):
+                adjusted[:, col], votes[:, col] = align(series[var][buddy], when)
+                if thermal:
+                    adjusted[:, col] += (
+                        CFG.lapse_k_per_km * (official.elevation_m.values[buddy] - height) / 1000
+                    )
+            background = np.where(fi[rows] >= 0, means[var][fi[rows], nearest], np.nan)
+            if thermal:
+                background += CFG.lapse_k_per_km * (official.elevation_m.values[nearest] - height) / 1000
+        for j, row in enumerate(rows):
+            value = float(values[j])
+            ns = int(times[row].astype(np.int64))
+            flag = static_gate(var, value, height, peers[row], CFG)
+            flag |= temporal_gate(var, value, ns, state, CFG)
+            if var in SUPPORTED:
+                neighbours = adjusted[j]
+                spatial, median = spatial_gate(value, neighbours[np.isfinite(neighbours)], SIGMA, CFG)
+                flag |= spatial
+                if spatial != Flag.FEW_BUDDIES:
+                    counts["spatial_applied"] += 1
+                innovation = value - background[j]
+                day = bool(sun[row])
+                bias = state.bias_day if day else state.bias_night
+                if np.isfinite(innovation):
+                    bg_flag, huber = background_gate((innovation - (bias or 0)) / SIGMA, votes[j], CFG)
+                    flag |= bg_flag
+                    counts["background_applied"] += 1
+                else:
+                    huber = 0
+                hard = bool(flag & (Flag.STATIC | Flag.TEMPORAL))
+                state = update_state(
+                    state,
+                    time_ns=ns,
+                    value=value,
+                    buddy=median,
+                    reference=reference[j],
+                    innovation=innovation,
+                    day=day,
+                    solar_sensitive=thermal,
+                    huber=huber,
+                    sigma_bg=SIGMA,
+                    official=False,
+                    hard_fail=hard,
+                    cfg=CFG,
+                )
+                if state.copycat:
+                    flag |= Flag.COPYCAT
+                    modes["copycat"].add(station)
+                if np.isfinite(innovation):
+                    weights.append(state.weight)
+                    if state.weight > 0.8 and np.isfinite(reference[j]):
+                        counts["high_pairs"] += 1
+                        counts["high_sq"] += (value - reference[j]) ** 2
+                    if huber and not hard and not state.copycat:
+                        day_count += int(day)
+                        night_count += int(not day)
+                if var == "t2m":
+                    if min(day_count, night_count) >= CFG.min_pairs:
+                        if state.bias_day - state.bias_night > CFG.solar_allowance:
+                            modes["daytime_bias"].add(station)
+                    if state.correlation_guard < 0.1 and not state.copycat and np.isfinite(median):
+                        modes["low_temperature_correlation"].add(station)
+            else:
+                # No comparable official/GEFS field. Maintain the true temporal history only.
+                state.recent = (state.recent + [value])[-CFG.flat_reports :]
+                state.last_ns = ns
+            if flag & Flag.FLATLINE:
+                modes["flatline"].add(station)
+                if var == "wind_speed":
+                    modes["wind_speed_flatline"].add(station)
+                    counts["calm_flatline"] += int(value == 0)
+            flags[j] = int(flag)
+        report_flags[rows] |= flags
+        for bit in Flag:
+            counts[bit.name] += int(np.count_nonzero(flags & bit))
+        if weights:
+            samples[var].append(np.array(weights))
+    for bit in Flag:
+        reports[bit.name] += int(np.count_nonzero(report_flags & bit))
+
+
+def buddy_geometry(geo, official):
+    """Station counts only. Eight km bounds the displacement from rounding both axes to a tenth."""
+    counts = Counter()
+    for lat, lon in geo[["lat", "lon"]].itertuples(index=False, name=None):
+        distances = distances_km(lat, lon, official.latitude.values, official.longitude.values)
+        for label, radius in (
+            ("guaranteed", CFG.radius_km - 8),
+            ("nominal", CFG.radius_km),
+            ("possible", CFG.radius_km + 8),
+        ):
+            counts[label] += int(np.count_nonzero(distances <= radius) >= CFG.minimum_buddies)
+    return counts
+
+
+def trial_region(path, official, forecasts, series):
+    batch = load_citizen_batch(path)
+    if not len(batch.values) or np.any((batch.obs_time < START) | (batch.obs_time >= STOP)):
+        raise ValueError("citizen observations outside the trial window or empty")
+    frame, geo = station_points(batch)
+    del batch
+    totals = defaultdict(Counter)
+    modes = {
+        name: set()
+        for name in (
+            "indoor_screen",
+            "indoor_evaluable",
+            "daytime_bias",
+            "low_temperature_correlation",
+            "flatline",
+            "wind_speed_flatline",
+            "copycat",
+        )
+    }
+    samples = defaultdict(list)
+    for station, group in frame.groupby("station", sort=True):
+        wide = group.pivot(index="time", columns="variable", values="value").sort_index()
+        wide = wide.dropna(axis=1, how="all")
+        position = geo.iloc[station][["lat", "lon", "height"]].to_numpy()
+        aggregate_station(wide, position, official, forecasts, series, totals, modes, samples, station)
+
+    def distribution(parts):
+        w = np.concatenate(parts)
+        return dict(
+            n=len(w),
+            zero=int(np.count_nonzero(w == 0)),
+            above08=int(np.count_nonzero(w > 0.8)),
+            quantiles=np.quantile(w, [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1]).tolist(),
+        )
+
+    weights = {var: distribution(parts) for var, parts in samples.items()}
+    weights["all"] = distribution([p for parts in samples.values() for p in parts])
+    return dict(
+        stations=len(geo),
+        geometry=buddy_geometry(geo, official),
+        counts=totals,
+        weights=weights,
+        signatures={k: len(v) for k, v in modes.items()},
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=Path.home() / "wrfcomp-data")
+    parser.add_argument("--region", choices=REGIONS, required=True)
+    args = parser.parse_args()
+    root = args.data_dir
+    path = root / "citizen" / f"{REGIONS[args.region]}_20240708_20240721.nc"
+    with xr.open_dataset(root / "truth/isd_conus_2024.nc") as ds:
+        official = ds.sel(valid_time=slice(START - HOUR, STOP)).load()
+    forecasts = forecast_archive(root, official.station_id.values)
+    print(
+        json.dumps(
+            trial_region(path, official, forecasts, official_series(official, forecasts)), allow_nan=False
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
