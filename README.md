@@ -4,7 +4,11 @@
 judges every forecast the same way, the baselines a new forecast has to beat, quality control for citizen
 weather stations, and a paper-only payout ledger.
 
-Status: early. The harness is being built. Nothing here pays anyone or touches a chain.
+Status (2026-11-24): the harness is locked at version 0.1.0. One candidate, `gefs-station-corrected`
+version 3 (NOAA GEFS corrected per station from recent verified errors), passes the promotion rule on 2024
+(all gates against both climatology and raw GEFS in 3 of 4 quarters). That result is **provisional** until
+the same, unchanged candidate passes an untouched 2023 confirmation period. Nothing here pays anyone or
+touches a chain.
 
 ## Design rules
 
@@ -27,8 +31,8 @@ src/wrfcomp/
   assimilation/   station quality control and trust scores
   models/         candidate forecast models
 configs/          splits.yaml, stations_conus.csv
-experiments/      committed scorecard JSONs
-docs/             protocol, tokenomics draft, design notes
+experiments/      committed reference scorecards (2024 months and quarters), SUMMARY_2024.md
+docs/             protocol, harness lock, baselines, candidate models (docs/models/), QC, tokenomics draft
 ```
 
 ## Quickstart
@@ -48,8 +52,16 @@ The `ai` extra (Earth2Studio, torch) needs an NVIDIA GPU and is not required for
 `src/wrfcomp/harness/`, `configs/`, the verification protocol, the promotion check and the Gate 1 reference
 scorecards are **locked at harness version 0.1.0** (2026-11-23). A change there needs the project owner's
 approval on the exact commit, a version bump and a re-score of every baseline. A candidate is promoted only if
-it passes the gate against both climatology and NOAA GEFS. What is enforced, and what is not, is in
+it passes every gate against both climatology and NOAA GEFS in at least 3 of the 4 calendar quarters of the
+year. What is enforced, and what is not, is in
 [docs/HARNESS_LOCK.md](docs/HARNESS_LOCK.md). Everything else merges on green CI.
+
+## How this was built
+
+Most code and reviews here were written by AI coding agents (Claude, Codex and Gemini) working under one
+maintainer. Changes to the harness were reviewed by an agent from a different provider than the author, and
+locked changes need the project owner's approval on the exact commit. Pull request comments are posted
+through the maintainer's GitHub account, so a comment's author is not always the person who wrote it.
 
 ## Data
 

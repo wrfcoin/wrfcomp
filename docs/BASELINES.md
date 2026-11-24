@@ -132,4 +132,4 @@ cache occupied 1,573,968. GRIB payloads were discarded.
 Decimal GB. Estimates scale the single observation linearly, including cold-cache work on
 each cycle. Compression, network latency and retries vary. The calendar-year figure is
 a sizing estimate only and includes cycles outside the allowed validation window.
-Bulk downloads require the sprint manager's go.
+Bulk downloads require a maintainer's go.
