@@ -8,6 +8,39 @@ exists. This is design number 1 of the Phase 3 family (M = 1).
 Owner ruling 2026-11-24: the premise of WRFCoin is that citizen weather stations make forecasts better;
 design the test now. The control is `gefs-station-corrected` version 3 (v3), promoted on 2024.
 
+## Amendment 1 (2026-11-24, before any scoring): arrival time
+
+Manager ruling, 2026-11-24. Made after the registration at commit `12d0bff` and **before any forecast of B
+or C existed and before anything was scored**, so this is still design number 1 (M = 1). Nothing else in
+this document changes.
+
+**What was found.** The registration assumed the archive holds measurement time only. The NetCDF archive
+also holds the time each report arrived (`receivedTime`). Measured on 2024-01-01: reports arrive a median of
+5.8 minutes after they were measured, 95 % within 10.8 minutes. Of the reports measured in the last
+15 minutes of an hour, only 61 % had arrived by the hour.
+
+**Why it matters.** Rule 3 as registered reads reports by measurement time. About four in ten of the
+reports it would read at an issue time T had, in reality, not arrived by T. A forecast built that way uses
+information no live system would have had, and **would overstate what citizen stations do for a live
+forecast.**
+
+**The amended rule.** A citizen report counts at issue time T only if **both** its measurement time and its
+arrival time are at or before T. This applies to the value (rule 3), to the usual-difference history
+(rule 5) and to the QC state behind the weight (rule 3).
+
+How it is carried out, fixed here: the issue times are 00Z and 12Z. A citizen report that had not arrived
+by the first issue time at or after its measurement is not used at all: not for that issue, not for a later
+one, and not in any QC state, its own station's or a neighbour's. A report with no arrival time is treated
+the same way. Every other report is used exactly as registered. This removes a report only when it is
+measured in the last minutes before an issue time and arrives after it (roughly 1 % of all reports), and it
+guarantees with one QC pass that nothing behind a weight or a value at T arrived after T.
+
+**Official readings keep the v3 rule** (measurement time at or before T), in A, B and C alike, so the
+comparison of C against B is not affected by how official readings are timed.
+
+The leakage row "Citizen reports after T" in section 3 is read with this amendment: measured at or before T
+**and** arrived at or before T. The sentence there that the archive holds no arrival time is withdrawn.
+
 ## The short version
 
 - **Three forecasts, not two.** A = v3. B = v3 plus the airport's *own* latest reading (official data
@@ -63,7 +96,8 @@ All arithmetic is float64 until the final float32 cast. "Label T" is the hourly 
 2. **Own innovation.** `own(s,T) = O(s,T) − mean of the 31 v3 members issued at T − 12 h for lead 12 h`.
    That is the latest earlier v3 forecast that verifies exactly at T. If it does not exist (first issue of
    the year), `own` is undefined and B = A.
-3. **Citizen reports that count.** For citizen station c: its latest report of the variable with
+3. **Citizen reports that count** (amended, see Amendment 1: the report must also have arrived by T).
+   For citizen station c: its latest report of the variable with
    measurement time in [T − 15 min, T] and final QC weight `w > 0`. The weight is the one the shipped
    quality control (`wrfcomp.assimilation.qc`, `QCConfig` defaults, pinned by commit before the download)
    gives that report, run in time order, with state from reports at or before T only.
