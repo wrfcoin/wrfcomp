@@ -55,7 +55,15 @@ def partition(citizen_dir: Path, year: int) -> None:
         tables = [load_table(p) for p in days if p.name.startswith(month)]
         cols = {
             name: np.concatenate([getattr(t, name) for t in tables])
-            for name in ("station_id", "obs_time", "lat", "lon", "elevation_m", *VALUE_COLUMNS)
+            for name in (
+                "station_id",
+                "obs_time",
+                "lat",
+                "lon",
+                "elevation_m",
+                "received_delay_s",
+                *VALUE_COLUMNS,
+            )
         }
         ti, tj = tile_of(cols["lat"].astype(np.float64), cols["lon"].astype(np.float64))
         code = ti * 1000 + tj
@@ -80,6 +88,7 @@ def partition(citizen_dir: Path, year: int) -> None:
                 ident_elevation_m=cols["elevation_m"][head],
                 row_ident=ident.astype(np.int32),
                 obs_time=cols["obs_time"][rows].astype("datetime64[s]").astype(np.int64),
+                received_delay_s=cols["received_delay_s"][rows],
                 **{c: cols[c][rows] for c in VALUE_COLUMNS},
             )
             tmp.replace(folder / f"{month}.npz")
@@ -144,6 +153,8 @@ def run_tile(args) -> dict:
         with np.load(path) as z:
             gid = ids[z["row_ident"]]
             keep = np.flatnonzero(wanted[gid])
+            # Amendment 1: a report that had not arrived by the next issue time is never read.
+            keep = keep[p3.arrived_by_next_issue(z["obs_time"][keep], z["received_delay_s"][keep])]
             gid = gid[keep]
             arrays = [z["obs_time"][keep], *(z[c][keep] for c in VALUE_COLUMNS)]
         if not keep.size:
@@ -151,6 +162,11 @@ def run_tile(args) -> dict:
         cuts = np.flatnonzero(np.r_[True, gid[1:] != gid[:-1], True])
         for a, b in zip(cuts[:-1], cuts[1:], strict=True):
             chunks[int(gid[a])].append([x[a:b] for x in arrays])
+    # A station with no usable report left is not a station.
+    needed = [k for k in needed if chunks[k]]
+    alive = set(needed)
+    core = np.array([k for k in core if k in alive], dtype=int)
+    near = {k: np.array([j for j in near[k] if j in alive], dtype=int) for k in core}
 
     def station(k: int) -> p3.StationData:
         parts = sorted(chunks.pop(k), key=lambda c: c[0][0])  # months in time order

@@ -36,6 +36,8 @@ from .qc import (
 )
 from .trust import StationState, advance_state, suspected_copy, veto_recent_copy
 
+ISSUE_STEP_S = 12 * 3600  # issue times are 00Z and 12Z
+UNKNOWN_DELAY_S = 32767  # the stored delay saturates here; such a report is treated as never arrived
 THERMAL = ("t2m", "td2m")
 WIND = ("u10", "v10", "wind_speed")
 HALF_HOUR_NS = 1_800_000_000_000
@@ -55,6 +57,19 @@ def load_trial_module(origin: np.datetime64):
     spec.loader.exec_module(module)
     module.START = np.datetime64(origin, "ns")
     return module
+
+
+def arrived_by_next_issue(obs_time_s, received_delay_s) -> np.ndarray:
+    """Amendment 1 of the design: which reports may be used at all.
+
+    A report is kept only if it had arrived by the first issue time (00Z or 12Z) at or after its
+    measurement. A report with no arrival time, or a saturated delay, is not kept. Everything the QC
+    and the forecast read at an issue time T was then both measured and received at or before T.
+    """
+    measured = np.asarray(obs_time_s).astype("datetime64[s]").astype(np.int64)
+    delay = np.asarray(received_delay_s).astype(np.int64)
+    next_issue = -(-measured // ISSUE_STEP_S) * ISSUE_STEP_S
+    return (delay >= 0) & (delay < UNKNOWN_DELAY_S) & (measured + delay <= next_issue)
 
 
 # ----------------------------------------------------------------------------- forecasts

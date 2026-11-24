@@ -259,3 +259,30 @@ def test_issue_snapshot_takes_the_latest_report_of_the_last_15_minutes_only():
     assert has[0] and value[0] == 3 and weight[0] == 0.3  # exactly 15 minutes old counts
     assert not has[1] and np.isnan(value[1]) and weight[1] == 0  # 16 minutes old does not
     assert not p3.issue_snapshot(shorter, [when[0].astype("datetime64[ns]") - S])[0][0]
+
+
+def test_a_report_that_had_not_arrived_by_the_next_issue_time_is_never_used():
+    noon = int(np.datetime64("2024-03-02T12:00:00", "s").astype(np.int64))
+    #            measured            delay   kept?
+    cases = [
+        (noon - 600, 300, True),  # measured 11:50, arrived 11:55
+        (noon - 600, 600, True),  # arrived exactly at the issue time
+        (noon - 600, 601, False),  # arrived one second after it
+        (noon, 0, True),  # measured and arrived at the issue time
+        (noon, 1, False),
+        (noon + 1, 700, True),  # after the issue: the next one is twelve hours away
+        (noon - 3600, -1, False),  # no arrival time
+        (noon - 3600, p3.UNKNOWN_DELAY_S, False),  # saturated delay
+        (noon + 12 * 3600 - 5, 4, True),  # just before midnight, arrived before it
+        (noon + 12 * 3600 - 5, 6, False),
+    ]
+    measured, delay, expected = (np.array(c) for c in zip(*cases, strict=True))
+    kept = p3.arrived_by_next_issue(measured.astype("datetime64[s]"), delay.astype(np.int16))
+    np.testing.assert_array_equal(kept, expected.astype(bool))
+    # Whatever is kept and measured at or before an issue time had arrived by that issue time.
+    rng = np.random.default_rng(8)
+    m = noon + rng.integers(-40 * 3600, 40 * 3600, 20000)
+    d = rng.integers(-1, 1500, 20000)
+    k = p3.arrived_by_next_issue(m, d)
+    for issue in noon + np.arange(-3, 4) * 12 * 3600:
+        assert np.all((m + d)[k & (m <= issue)] <= issue)

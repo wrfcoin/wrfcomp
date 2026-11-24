@@ -1,12 +1,14 @@
 # Phase 3, step 2: building the arms for 2024
 
-The design is `docs/PHASE3_DESIGN.md`, registered at commit `12d0bff` (pull request 34). **No number in it
-is changed here.** This page says how the registered rule is carried out, what was measured, and where the
+The design is `docs/PHASE3_DESIGN.md`, registered at commit `12d0bff` (pull request 34), with **Amendment 1**
+(arrival time, manager ruling 2026-11-24, recorded before any forecast of B or C existed). No number in it
+is changed here. This page says how the registered rule is carried out, what was measured, and where the
 results are. Nothing on this page is a score. Scoring is the manager's.
 
 Rulings in force (manager and owner, 2026-11-24): 2024 only, no 2023 citizen data; NetCDF archive; data cap
 45 GB, stop line 40 GB free; the COVERED config is approved by the manager before use; **C against B
-decides**, C against A and B against A are reported.
+decides**, C against A and B against A are reported; the readings below go to an outside review before the
+build is relied on.
 
 ## The pipeline
 
@@ -45,15 +47,11 @@ a number.
    position; heights are the stored citizen height and the official elevation.
 8. **COVERED** counts every issue of the year (704), including the first days when nothing can be defined.
 
-## One thing the archive has that the design did not know
-
-The design says the archive holds measurement time only. The NetCDF archive also has `receivedTime`.
-Measured on 2024-01-01: reports arrive a median of 5.8 minutes after they were measured, 95 % within
-10.8 minutes, 99 % within 12.8. The registered rule uses measurement time (as v3 does for official
-readings). Of the reports measured in the last 15 minutes of an hour, 61 % had arrived by the hour; **about
-four in ten of the reports the rule reads had, in reality, not arrived yet.** The delay is stored with each report (`received_delay_s`). This build does not use it,
-because that would change the registered rule. **It is a limit on what the result means for a live
-system**, and a stricter rule (received at or before T) would be a new design.
+9. **Amendment 1 (arrival time)** is applied where the reports are read for the QC
+   (`phase3_qc.arrived_by_next_issue`): a report that had not arrived by the first 00Z or 12Z at or after
+   its measurement, or that has no arrival time, is never read, by its own station's QC or a neighbour's.
+   Everything downstream (weights, values at the issue time, usual differences) is built from what is
+   left. On 2024-01-01 this removes 1.8 % of the reports. Official readings keep the v3 rule.
 
 ## Measured before the bulk run (2024-01-01)
 
