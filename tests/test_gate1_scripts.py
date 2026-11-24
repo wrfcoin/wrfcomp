@@ -427,7 +427,6 @@ def test_runner_refuses_bad_requests_before_reading_data(
 ) -> None:
     out = tmp_path / "experiments"
     for periods in (
-        ("2024-12",),
         ("2023-07",),
         ("2025-01",),
         ("2024-1",),
@@ -436,8 +435,10 @@ def test_runner_refuses_bad_requests_before_reading_data(
     ):
         assert run(base_world, out, periods=periods) == 2, periods
     capsys.readouterr()
-    assert run(base_world, out, periods=("2024-12",)) == 2
-    assert "validation split" in capsys.readouterr().err
+    assert run(base_world, out, periods=("2023-12",)) == 2
+    assert "before the validation split" in capsys.readouterr().err
+    assert run(base_world, out, periods=("2025-01",)) == 2
+    assert "no init time is inside the validation split" in capsys.readouterr().err
 
     args = ["--data-dir", str(base_world["data"]), "--period", "2024-01", "--out", str(out)]
     args += ["--config", str(base_world["config"])]
@@ -457,6 +458,146 @@ def test_runner_refuses_bad_requests_before_reading_data(
     assert run_gate1.main(inside) == 2
     assert not out.exists() or not list(out.iterdir())
     assert not (base_world["data"] / "gate1").exists()
+
+
+def _config_with(world: dict[str, Path], **replace: str) -> None:
+    """Rewrite split boundaries in the world's own copy of splits.yaml (never the repository's)."""
+    text = world["config"].read_text()
+    for old, new in replace.items():
+        assert text.count(old) == 1, old
+        text = text.replace(old, new)
+    world["config"].write_text(text)
+
+
+def test_last_init_rule_with_the_real_config() -> None:
+    cfg = load_config()
+    longest = np.timedelta64(max(cfg.evaluation.lead_hours), "h")
+    for month in range(1, 12):  # January to November: nothing is left out
+        period = run_gate1.parse_period(f"2024-{month:02d}", [0, 12], cfg)
+        days = pd.Period(f"2024-{month:02d}").days_in_month
+        assert (period.init_times.size, period.n_dropped) == (2 * days, 0)
+        assert period.init_times.max() == np.datetime64(f"2024-{month:02d}-{days:02d}T12", "ns")
+    # December stops at the last init inside the validation split, for every model.
+    december = run_gate1.parse_period("2024-12", [0, 12], cfg)
+    assert december.init_times.min() == np.datetime64("2024-12-01T00", "ns")
+    assert december.init_times.max() == np.datetime64("2024-12-17T12", "ns")
+    assert (december.init_times.size, december.n_dropped) == (34, 28)
+    assert december.cycles[-1] == "2024121712" and not any(c.startswith("2025") for c in december.cycles)
+    assert (december.init_times <= cfg.splits.validation.end).all()
+    assert (december.init_times + longest < cfg.splits.sealed_test.start).all()
+    # The validation end is inclusive: an 18Z run on the last day is scored.
+    assert run_gate1.parse_period("2024-12", [18], cfg).init_times.max() == cfg.splits.validation.end
+    assert run_gate1.parse_period("2024-12", [0, 6, 12, 18], cfg).init_times.size == 17 * 4
+
+
+def test_last_init_rule_sealed_lead_limit(tmp_path: Path) -> None:
+    # Without an embargo the sealed-lead limit is the one that cuts: 2024-12-29T12Z + 48 h is the last
+    # valid time before 2025, so 12-30 and 12-31 are left out.
+    world = {"config": write_config(tmp_path, list(station_ids(N_STATIONS)))}
+    _config_with(world, **{'end_utc: "2024-12-17T18:00:00Z"': 'end_utc: "2024-12-31T18:00:00Z"'})
+    cfg = load_config(world["config"])
+    period = run_gate1.parse_period("2024-12", [0, 12], cfg)
+    assert period.init_times.max() == np.datetime64("2024-12-29T12", "ns")
+    assert (period.init_times.size, period.n_dropped) == (58, 4)
+    last_valid = period.init_times.max() + np.timedelta64(48, "h")
+    assert last_valid == np.datetime64("2024-12-31T12", "ns") < cfg.splits.sealed_test.start
+    # 12-30T00Z would verify at 2025-01-01T00Z, the first sealed hour: left out, not scored at shorter leads.
+    assert np.datetime64("2024-12-30T00", "ns") not in period.init_times
+    # The rule follows the longest configured lead, whatever leads a model has.
+    kept = run_gate1.scorable_init_times(
+        np.array(["2024-12-29T12", "2024-12-30T00", "2024-12-31T12"], dtype="datetime64[ns]"), cfg
+    )
+    assert kept.tolist() == np.array(["2024-12-29T12"], dtype="datetime64[ns]").tolist()
+
+
+def test_runner_scores_a_period_that_stops_early_alike_for_all_models(
+    base_world: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture, no_network: None
+) -> None:
+    world = copy_world(base_world, tmp_path / "w")
+    # In this world the validation split ends on 17 July 18Z, as the real one does in December.
+    _config_with(world, **{'end_utc: "2024-12-17T18:00:00Z"': 'end_utc: "2024-07-17T18:00:00Z"'})
+    # The GEFS cycles after the last scored init are removed: the runner must not need or open them.
+    removed = 0
+    for store in sorted((world["data"] / "baselines" / "gefs").glob("202407*.zarr")):
+        if store.name > "2024071712.zarr":
+            shutil.rmtree(store)
+            removed += 1
+    assert removed == 28
+    out = tmp_path / "experiments"
+    assert run(world, out, periods=("2024-01", "2024-07")) == 0
+    printed = capsys.readouterr().out
+    assert "[2024-07] stops at 2024-07-17T12Z: the last 28 init time(s)" in printed
+    assert "[2024-01] stops" not in printed
+    cards = {m: json.loads((out / f"{m}_2024-07.json").read_text()) for m in MODELS}
+    for model, card in cards.items():
+        Scorecard.model_validate(card)
+        assert card["n_init_times"] == 34, model
+        assert (card["period_start"], card["period_end"]) == ("2024-07-01T00:00:00", "2024-07-17T12:00:00")
+        assert card["init_hours_scored"] == [0, 12] and card["sealed_data_used"] is False
+    assert cards["gefs"]["baseline_sha256"] == cards["climatology"]["forecast_sha256"]
+    assert cards["persistence"]["baseline_sha256"] == cards["climatology"]["forecast_sha256"]
+    # January, untouched by the rule, is byte-identical to a run with the unchanged config.
+    reference = tmp_path / "reference"
+    assert run(copy_world(base_world, tmp_path / "unchanged"), reference, periods=("2024-01",)) == 0
+    for model in MODELS:
+        assert (out / f"{model}_2024-01.json").read_bytes() == (
+            reference / f"{model}_2024-01.json"
+        ).read_bytes()
+    # A rerun changes nothing.
+    before = {p.name: p.read_bytes() for p in out.glob("*.json")}
+    assert run(world, out, periods=("2024-01", "2024-07")) == 0
+    assert {p.name: p.read_bytes() for p in out.glob("*.json")} == before
+
+    # The summary tables are built from these files alone and show the shortened month.
+    tables = run_gate1.summary_tables(out, 2024)
+    assert [line for line in tables.splitlines() if line.startswith("### ")] == [
+        *(f"### `{v}`" for v in ("t2m", "td2m", "u10", "v10", "msl")),
+        "### Single leads at which GEFS scores below climatology",
+    ]
+    losing = tables.split("### Single leads")[1]
+    expected_losing = sum(
+        entry["crpss_vs_baseline"] < 0
+        for month in ("2024-01", "2024-07")
+        for per_lead in json.loads((out / f"gefs_{month}.json").read_text())["metrics"].values()
+        for lead, entry in per_lead.items()
+        if lead != "all"
+    )
+    assert sum(line.startswith("| 2024-") for line in losing.splitlines()) == expected_losing
+    assert ("| none |" in losing) == (expected_losing == 0)
+    t2m = tables.split("### `td2m`")[0].splitlines()
+    july = next(line for line in t2m if line.startswith("| 2024-07 |"))
+    cells = [c.strip() for c in july.strip("|").split("|")]
+    entry = cards["gefs"]["metrics"]["t2m"]["all"]
+    assert cells[1] == "34"
+    assert cells[2] == f"{100 * entry['crpss_vs_baseline']:+.1f}"
+    assert cells[3] == f"{100 * entry['crpss_vs_baseline_ecdf']:+.1f}"
+    assert cells[4] == f"{entry['spread_skill_ratio']:.2f}"
+    failed = [g for g in run_gate1.SUMMARY_GATES if not cards["gefs"]["gates"]["t2m"][g]]
+    assert cells[5] == ("pass" if not failed else "fails " + ", ".join(failed))
+    assert cells[8] == f"{cards['persistence']['metrics']['t2m']['all']['spread_skill_ratio']:.2f}"
+    assert cells[10] == f"{cards['climatology']['metrics']['t2m']['all']['spread_skill_ratio']:.2f}"
+    march = next(line for line in t2m if line.startswith("| 2024-03 |"))
+    assert set(c.strip() for c in march.strip("|").split("|")[1:]) == {"n/a"}
+    capsys.readouterr()
+    assert run_gate1.main(["summary", "--scorecards", str(out), "--year", "2024"]) == 0
+    assert capsys.readouterr().out.strip() == tables.strip()
+    assert run_gate1.main(["summary", "--scorecards", str(out), "--year", "2023"]) == 2
+
+
+def test_committed_summary_matches_the_committed_scorecards() -> None:
+    """`experiments/SUMMARY_2024.md` must hold exactly what the summary command prints from the files."""
+    experiments = Path(__file__).resolve().parents[1] / "experiments"
+    text = (experiments / "SUMMARY_2024.md").read_text()
+    block = text.split("<!-- tables:start -->\n")[1].split("<!-- tables:end -->")[0]
+    assert block.strip() == run_gate1.summary_tables(experiments, 2024).strip()
+    # 36 scorecards, every one valid, none sealed, and the three models of a month share their coverage.
+    for month in range(1, 13):
+        cards = [json.loads((experiments / f"{m}_2024-{month:02d}.json").read_text()) for m in MODELS]
+        for card in cards:
+            Scorecard.model_validate(card)
+            assert card["sealed_data_used"] is False and card["period_end"] < "2024-12-18"
+        assert len({(c["period_start"], c["period_end"], c["n_init_times"]) for c in cards}) == 1
+    assert json.loads((experiments / "gefs_2024-12.json").read_text())["period_end"] == "2024-12-17T12:00:00"
 
 
 def test_runner_refuses_sealed_and_short_truth(base_world: dict[str, Path], tmp_path: Path, capsys) -> None:

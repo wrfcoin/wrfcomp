@@ -1,8 +1,9 @@
 # Gate 1: reproducing the reference scorecards
 
-Gate 1 scores the three reference forecasts (climatology, persistence, NOAA GEFS) on two months of
-the 2024 validation split with `wrfcomp-eval`. This page is the exact command sequence. Everything
-after step 2 runs offline.
+Gate 1 scores the three reference forecasts (climatology, persistence, NOAA GEFS) on the 2024
+validation split with `wrfcomp-eval`, one scorecard per model and month. This page is the exact
+command sequence. Everything after step 2 runs offline. The first run covered January and July; the
+full year followed (results and reading: `experiments/README.md`, `experiments/SUMMARY_2024.md`).
 
 All data lives outside the repository, in `$WRFCOMP_DATA_DIR` (default `~/wrfcomp-data`).
 
@@ -40,8 +41,9 @@ For every init time to be scored, once (see `docs/BASELINES.md` for size and tim
 uv run python scripts/build_baselines.py gefs 2024-01-01T00
 ```
 
-January and July 2024 at 00Z and 12Z are 124 cycles. The runner never downloads: it lists the cycles
-that are missing and scores the other models.
+January and July 2024 at 00Z and 12Z are 124 cycles; the whole scored year is 704 (2024-01-01T00Z to
+2024-12-17T12Z, see "Where a period ends" below). The runner never downloads: it lists the cycles that
+are missing and scores the other models.
 
 ## 3. Tail thresholds
 
@@ -70,10 +72,12 @@ uv run python scripts/run_gate1.py \
 
 For each period this
 
-1. builds the climatology and persistence forecasts for every init time of the month at 00Z and 12Z
+1. builds the climatology and persistence forecasts for every scorable init time of the month at 00Z
+   and 12Z
    (leads 1, 3, 6, 12, 24, 48 h, 30 members each) into
    `$WRFCOMP_DATA_DIR/gate1/<period>_h00-12/{climatology,persistence}.zarr`;
-2. joins the 62 GEFS cycle stores of the month into `.../gefs.zarr` (leads 3, 6, 12, 24, 48 h);
+2. joins the GEFS cycle stores of those init times (62 for January) into `.../gefs.zarr` (leads 3, 6,
+   12, 24, 48 h);
 3. runs `wrfcomp-eval` three times: climatology alone, persistence against climatology, GEFS against
    climatology, each on the leads the model has;
 4. writes the scorecards.
@@ -91,8 +95,39 @@ The file name uses the short model name. Inside the scorecard, `model_id` is `cl
 baseline, so its `passed_gate` is always `false`.
 
 The summary at the end has one line per model and period: `written`, `unchanged` or `FAILED` with the
-reason. Exit code 0 means all six are in place, 1 means at least one failed, 2 means the request or
-an input was refused.
+reason. Exit code 0 means every requested scorecard is in place, 1 means at least one failed, 2 means
+the request or an input was refused.
+
+For the whole year, give all twelve periods (`--period 2024-01` ... `--period 2024-12`): 36 scorecards.
+
+### Where a period ends
+
+A period is a calendar month, but its last init time is set by one rule, the same for all three
+models:
+
+> The last init of a period is the last one that is inside the validation split and whose longest
+> scored lead stays before the sealed split.
+
+Both limits are read from `configs/splits.yaml`; the longest scored lead is the longest of
+`evaluation.lead_hours` (48 h), also for a model that lacks it. Init times after that are left out
+whole (never scored at their shorter leads only), and the run prints a line saying how many.
+
+With the present config this touches December only. The validation split ends on 2024-12-17T18Z, 14
+days before the sealed split, so December is scored from 12-01T00Z to 12-17T12Z: 34 init times at
+00Z and 12Z instead of 62. (The sealed-lead limit alone would allow 12-29T12Z, whose 48 h lead ends
+on 12-31T12Z; the validation end is the stricter one.) The scorecards record the result in
+`period_start`, `period_end` and `n_init_times`.
+
+### Summary tables
+
+```sh
+uv run python scripts/run_gate1.py summary --scorecards experiments/ --year 2024
+```
+
+prints, from the scorecard files alone, one table per variable with the monthly skill of GEFS and of
+persistence over climatology (fair and ecdf), the spread-skill ratios and the gates each fails, and a
+list of the single leads at which GEFS scores below climatology. `experiments/SUMMARY_2024.md` holds
+that output between two markers, and a test compares the two.
 
 ## 5. Rerunning
 
@@ -107,14 +142,15 @@ an input was refused.
 
 ## 6. What the runner refuses
 
-- A period that is not a whole month inside the validation split, or whose last valid time reaches
-  2025. With the 48 h lead, `2024-12` is refused.
+- A period that is not a calendar month, that starts before the validation split, or that has no
+  scorable init time at all (for example `2025-01`). A month that only runs past the end is not
+  refused; it is cut by the rule in "Where a period ends".
 - An init hour that is not in `init_hours_utc` of `configs/splits.yaml`.
 - Truth that contains any time in the sealed split (checked on the time coordinate, before values
   are read), or that does not span every valid time of the period.
 - A data directory inside the repository or under `/tmp`.
 
-It never opens a file dated 2025 or later: GEFS cycles are opened by name for the requested months
+It never opens a file dated 2025 or later: GEFS cycles are opened by name for the scored init times
 only.
 
 ## 7. What is scored, and what still fails
