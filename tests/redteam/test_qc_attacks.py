@@ -9,7 +9,6 @@ All inputs are synthetic and deterministically seeded.
 """
 
 import numpy as np
-import pytest
 
 from wrfcomp.assimilation.qc import Flag, quality_control, solar_elevation
 from wrfcomp.assimilation.tokens import ObservationBatch, QCConfig
@@ -82,15 +81,6 @@ def test_solar_heated_sensor_penalized_when_official_bias_available():
     assert not result.states[("SYNTH000001", "t2m")].earned
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: Without an official station within 150 km (bias_available=False), qc.py sets "
-        "learn_bias=False, disabling both bias_day/bias_night learning and mse_ema updates. "
-        "An unshielded sensor with +4.5 K daytime solar heating keeps solar=1.0, reliability=1.0, "
-        "and full new_prior weight (0.5) on every daytime report."
-    ),
-)
 def test_solar_heated_sensor_without_nearby_official_history_penalized():
     """Attack: +4.5 K daytime radiative bias at a rural site with no official bias station within 150 km."""
     times, true_t, elev = _diurnal_series(10)
@@ -109,15 +99,6 @@ def test_solar_heated_sensor_without_nearby_official_history_penalized():
     assert day_weight < 0.5 * night_weight
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: update_verification only checks daily-mean reference bias <= 1*sigma_bg (2.0 K) "
-        "and day-to-day bias spread, ignoring day-minus-night radiative divergence. A solar-heated "
-        "sensor running +3.2 K hot every afternoon (0 K at night) has daily mean bias ~+1.7 K <= 2.0 K, "
-        "so it earns the verified temperature tier (prior=1.0) and retains substantial daytime weight."
-    ),
-)
 def test_moderate_solar_heated_sensor_denied_verified_tier():
     """Attack: Unshielded sensor with +3.2 K daytime solar error still earns the verified tier."""
     times, true_t, elev = _diurnal_series(10)
@@ -190,15 +171,6 @@ def test_indoor_sensor_with_three_outdoor_buddies_decays_weight():
     assert float(np.max(indoor_tail)) < 0.05
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: trust.advance_state only triggers correlation_guard decay from buddy_r, never ref_r "
-        "(trust.py:131-132). An HVAC-cycled indoor sensor without 3 buddies within 25 km (FEW_BUDDIES) "
-        "keeps correlation_guard=1.0 even when paired with an official reference giving ref_r ~ 0, "
-        "retaining significant weight whenever outdoor temperature passes near room temperature."
-    ),
-)
 def test_indoor_sensor_without_three_buddies_but_with_reference_suppressed():
     """Attack: Noisy HVAC indoor sensor in sparse area (FEW_BUDDIES) with nearby official reference."""
     rng = np.random.default_rng(20240702)
@@ -239,16 +211,6 @@ def test_frozen_anemometer_nonzero_at_15min_cadence_rejected():
     assert result.weights[-1] == 0.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: temporal_gate exempts abs(value) <= calm_wind_ms (0.5 m/s) unconditionally "
-        "(qc.py:52) without checking reference, buddies, or background; Flag.SPATIAL is also "
-        "excluded from hard_fail (qc.py:298), and wind_speed retains learn_bias=True so bias_day "
-        "absorbs the -10 m/s deficit. A seized 0.0 m/s anemometer in 10 m/s wind never flatlines "
-        "and retains positive weight."
-    ),
-)
 def test_frozen_anemometer_seized_at_zero_in_high_wind_rejected():
     """Attack: Anemometer frozen/seized at 0.0 m/s for 6 hours while ambient wind blows at 10 m/s."""
     times = np.datetime64("2024-07-12T06", "ns") + np.arange(24) * np.timedelta64(15, "m")
@@ -264,15 +226,6 @@ def test_frozen_anemometer_seized_at_zero_in_high_wind_rejected():
     assert result.weights[-1] == 0.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: Both temporal_gate (qc.py:53) and advance_state (trust.py:137) require consecutive "
-        "reports to be <= step_minutes (15 min) apart to advance constant_since_ns and trigger "
-        "wind FLATLINE. A frozen anemometer stuck at 5.0 m/s reporting every 20 minutes (or hourly) "
-        "never triggers Flag.FLATLINE and keeps positive weight indefinitely."
-    ),
-)
 def test_frozen_anemometer_reporting_slower_than_15min_rejected():
     """Attack: Anemometer stuck at 5.0 m/s reporting every 20 minutes for 8 hours vs 10 m/s ref."""
     times = np.datetime64("2024-07-12T06", "ns") + np.arange(24) * np.timedelta64(20, "m")
@@ -293,15 +246,6 @@ def test_frozen_anemometer_reporting_slower_than_15min_rejected():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: bias_day and bias_night EMA (alpha=0.04) have no magnitude cap and smoothly absorb "
-        "a uniform slow drift (+0.5 K/day -> +8 K error), keeping residual~0, huber=1, reliability~1, "
-        "and solar=1 (since |bias_day - bias_night|~0). Even when Flag.SPATIAL fires against 3 honest "
-        "buddies, Flag.SPATIAL is excluded from hard_fail (qc.py:298) and does not reduce weight."
-    ),
-)
 def test_slow_uniform_drift_to_large_error_downweighted():
     """Attack: Uniform +0.5 K/day drift for 16 days (+8 K error) with 3 honest buddies."""
     rng = np.random.default_rng(20240704)
@@ -365,15 +309,6 @@ def test_exact_airport_copycat_caught_and_zeroed():
     assert not result.states[("SYNTH000001", "t2m")].earned
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: Copycat detection requires ref_rmse <= copy_residual_sigma * sigma_bg "
-        "(0.01 * 2.0 = 0.02 K, trust.py:134). Adding tiny Gaussian noise (sigma=0.05 K) to scraped "
-        "airport observations evades Flag.COPYCAT completely AND allows the scraper to earn the "
-        "verified temperature tier (prior=1.0, weight > 0.9)."
-    ),
-)
 def test_airport_copycat_with_small_noise_caught_and_denied_verified():
     """Attack: Scraper copies nearby official airport temperature plus tiny 0.05 K Gaussian noise."""
     rng = np.random.default_rng(20240705)
@@ -421,15 +356,6 @@ def test_same_cell_colluding_cluster_cannot_corroborate_fake_spike():
     assert np.all(result.weights == 0.0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: Cell independence uses np.rint(lon * 10) (qc.py:110). Four Sybil citizen stations "
-        "placed only ~1.7 km apart straddling a 0.1-degree boundary (lon -90.04 and -90.06) are "
-        "treated as independent, letting them corroborate each other's fabricated >8-sigma spike "
-        "in background_gate with positive weight despite an honest nearby official station."
-    ),
-)
 def test_cross_cell_boundary_sybil_cluster_cannot_corroborate_fake_spike():
     """Attack: 4 Sybil stations ~1.7 km apart across a 0.1-deg grid line fake a -10 sigma storm."""
     t = np.datetime64("2024-07-12T18", "ns")
@@ -452,15 +378,6 @@ def test_cross_cell_boundary_sybil_cluster_cannot_corroborate_fake_spike():
     assert np.all(result.weights[:4] == 0.0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: spatial_series weights each official station at 2x and each citizen at 1x (qc.py:84). "
-        "Five colluding fake citizens placed ~1.7 km apart across a 0.1-deg boundary outvote two "
-        "genuine official stations (5 > 2*2), causing both official stations to be flagged "
-        "Flag.SPATIAL while all five fake citizens pass spatial QC unflagged."
-    ),
-)
 def test_sybil_cluster_cannot_outvote_official_stations_in_spatial_gate():
     """Attack: 5 Sybil citizens across a 0.1-deg boundary outvote 2 official stations in spatial QC."""
     t = np.datetime64("2024-07-12T18", "ns")
@@ -549,15 +466,6 @@ def test_real_severe_storm_spike_seen_by_two_good_neighbours_is_kept():
     assert wind_res.weights[0] > 0.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "BROKEN: temporal_gate hard-rejects any t2m step > 10 K within <= 15 minutes (qc.py:45-46, "
-        "263, 298) before spatial/buddy corroboration, excluding all corroborated stations from "
-        "eligible and zeroing their weights. A genuine supercell outflow boundary dropping -12 K "
-        "in 15 minutes across 3 independent stations (including an official site) is completely lost."
-    ),
-)
 def test_real_rapid_15min_severe_storm_drop_seen_by_two_good_neighbours_is_kept():
     """False-positive attack: Real -12 K outflow drop in 15 min corroborated by 2 good neighbours."""
     t0 = np.datetime64("2024-07-12T18:00", "ns")
