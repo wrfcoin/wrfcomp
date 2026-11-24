@@ -209,7 +209,7 @@
       "mode": "100644"
     },
     "scripts/check_promotion.py": {
-      "blob": "b310697b980fd05ca0354a9f7291d2c69c4a87da",
+      "blob": "0919681b0404a7683ce93b5b6d24c5e0d9e6d9f8",
       "mode": "100644"
     },
     "src/wrfcomp/__init__.py": {
