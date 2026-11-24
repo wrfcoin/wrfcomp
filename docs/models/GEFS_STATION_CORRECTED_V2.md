@@ -4,7 +4,7 @@
 The model below was specified after diagnosing v1 and before producing or scoring
 any v2 forecast. The owner retains the locked harness, both reference comparisons
 and the requirement to pass all gates in at least three of four calendar quarters.
-The manager runs the official check. January–December 2024 supplied diagnostic
+A maintainer runs the official check. January–December 2024 supplied diagnostic
 evidence and therefore cannot serve as an independent confirmation of this design.
 
 ## What failed in v1
