@@ -120,16 +120,29 @@ autocorrelated score differences it held the nominal 5 % false-pass rate in simu
 Harvey-Leybourne-Newbold form at `h = 1` gave 15–31 %; with HG the lag `h` is a floor on the modelled
 autocorrelation and does not change the result on a long series (details in `wrfcomp.harness.metrics`).
 
-**Two reference baselines (owner decision 2026-11-23):** a candidate is promoted only if it passes the whole gate
-above against **both** reference baselines, climatology and NOAA GEFS, for the same forecast, truth, thresholds
-and period (raw GEFS is the harder reference in winter, climatology in summer). The verdict comes from
-`python -P scripts/check_promotion.py evaluate --forecast <candidate.zarr> --data-dir <data dir> --period <YYYY-MM> --out <dir>`,
+**Two reference baselines (owner decision 2026-11-23):** a candidate passes a period only if it passes the whole
+gate above against **both** reference baselines, climatology and NOAA GEFS, for the same forecast, truth, thresholds
+and period (raw GEFS is the harder reference in winter, climatology in summer). The result for one period comes from
+`python -P scripts/check_promotion.py evaluate --forecast <candidate.zarr> --data-dir <data dir> --period <YYYY-Qn> --out <dir>`,
 which runs `wrfcomp-eval` twice itself and judges the two scorecards it produced. The reference forecasts, their
 truth, thresholds, period, init count and leads are pinned per period in `experiments/REFERENCES.json`; a reference
 store whose content hash is not the pinned one is refused, so a weakened stand-in baseline cannot be used, and a
 candidate whose forecast is a copy of a reference is refused. Against climatology every v1 lead is scored; against
 GEFS the leads GEFS has (3 h and longer). The `verify` mode only compares two existing scorecards with the pins:
 it says CONSISTENT or INCONSISTENT and is never a promotion. Details and limits: `docs/HARNESS_LOCK.md`.
+
+**Promotion rule: 3 of 4 quarters (owner ruling 2026-11-23, promotion rule version 2):** a candidate is promoted
+only if it passes every gate against both reference baselines in **at least 3 of the 4 calendar quarters** of the
+validation year, each quarter scored as **one period** (`2024-Q1` to `2024-Q4`; Q4 ends with the init of
+2024-12-17T12Z, the last one inside the validation split). `evaluate` says PASSED or NOT PASSED for one period and
+is never a promotion; `python -P scripts/check_promotion.py promote --year 2024 --model-id <id> --model-version <v> <four result directories>`
+combines the four quarter results of one candidate and is the only command that says PROMOTED. A quarter with no
+result, or with a result that is not this check's output for that candidate under the locked harness and pinned
+references, counts as not passed. **Monthly results are diagnostic only**: tail-gate results flip on a month's
+sample, so no monthly verdict promotes or blocks a candidate. This rule does not change any metric, mask or
+threshold, so `protocol_version` and the pinned reference scorecards are unchanged; the rule has its own number,
+`promotion_rule_version` (1: a single month decided; 2: this rule), recorded in every verdict. The 3-of-4
+requirement of the guard below is therefore always in force, not an alternative.
 
 **Multiple-Testing Guard (Agentic Research Loops):** When an automated swarm tests `M` candidate architectures on the 2024 validation split within a single research sprint, apply a **Bonferroni-adjusted threshold (`alpha = 0.05 / M`)** or require the winning candidate to hold its gain across at least **3 of 4 calendar quarters** of 2024 before promoting it to a release candidate.
 

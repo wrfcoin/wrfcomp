@@ -2,6 +2,46 @@
 
 Committed `wrfcomp-eval` scorecards. Each JSON is the byte-exact output of the harness; do not edit one.
 
+## Quarterly reference scorecards: 2024-Q1 to 2024-Q4
+
+The pinned references of the promotion rule (at least 3 of 4 quarters; `docs/HARNESS_LOCK.md`): climatology,
+persistence and NOAA GEFS, each quarter scored as ONE period. 12 scorecards, `<model>_2024-Qn.json`, built on
+2026-11-23 from the monthly reference stores already in the data directory. No download, no harness, baseline
+or config change, nothing dated 2025.
+
+- A quarter's forecast store is its three monthly stores joined along init time. Before joining, all 36
+  monthly stores were checked against the content hashes pinned in `REFERENCES.json`: no mismatch.
+- Init times: Q1 182, Q2 182, Q3 184, Q4 156 (Q4 ends at 2024-12-17T12Z, as December does). In every
+  quarterly scorecard the number of scored points per variable and lead is the sum of its three months.
+- Same truth and thresholds as the monthly run (`truth_sha256` `013466cf...`, `thresholds_sha256`
+  `7ee7e1e5...`), harness 0.1.0, protocol 0.1.0. No model passes the gate in any quarter.
+
+```sh
+uv run python scripts/run_gate1.py \
+  --data-dir "$WRFCOMP_DATA_DIR" \
+  --period 2024-Q1 --period 2024-Q2 --period 2024-Q3 --period 2024-Q4 \
+  --init-hours 0 12 \
+  --out experiments/
+```
+
+Run after the twelve months. Wall time 5 min 38 s, peak memory 2.3 GB; the joined stores are
+`$WRFCOMP_DATA_DIR/gate1/2024-Qn_h00-12/`, 2.0 GB.
+
+```text
+fae63b5edd0ed23934f6789a7249eedbd9763b627767fcb3923d1682f9b3ca0b  climatology_2024-Q1.json
+8c60b06796f63e2cc374bb21c5a87aabb108e03ab5b13dd63aaa3eea7784c1c8  climatology_2024-Q2.json
+f07873064364bf131e52b5671e1426ecb51a3db60119bf6e9a31ad4bad85067c  climatology_2024-Q3.json
+678b309e70a324d477d223a627c715ff3ed768420fbbd0ee2dc3ff26390cc814  climatology_2024-Q4.json
+e7b5fcc439c70220168229cd86ebfbf8d531e57b3787cc4423a75b5210822759  gefs_2024-Q1.json
+0dd4cf6566a07ec628f3473ae31e27f750a6396385efcfbee470e8c9fb270145  gefs_2024-Q2.json
+6f672b46a8071d99bd0edd26c1e85458dbc99b97a72c4ce1455e3972a50ff2a5  gefs_2024-Q3.json
+0dba6f894be83b0488e5b3d45b8495072ea99ea5448d993e35cacfeddabbbe2b  gefs_2024-Q4.json
+ff1286e4c7b7e5104fb801dd96707c0c1cec12dcf00418d2e55794be362e4b9c  persistence_2024-Q1.json
+ab9f22ffce25d4eed859ed1765bcff6e4429924bdac45084a9f228748c3b9a2e  persistence_2024-Q2.json
+293bd8d2bb9befc9864f87a67b0275976dc59cc389dd0713737edd84247f540f  persistence_2024-Q3.json
+587c979e607602ded892fdc302fb9d8cd760142823d02fac848fd81b68476732  persistence_2024-Q4.json
+```
+
 ## Gate 1 reference run: all of 2024
 
 Climatology, persistence and NOAA GEFS for every month of the 2024 validation split, 00Z and 12Z runs,

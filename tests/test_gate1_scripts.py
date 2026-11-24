@@ -95,14 +95,20 @@ def make_truth(start: str, end: str, seed: int) -> tuple[xr.Dataset, dict[str, n
     return xr.Dataset(data, coords=coords), clean
 
 
-def write_gefs_cycles(root: Path, truth: xr.Dataset, clean: dict[str, np.ndarray], seed: int) -> None:
+def write_gefs_cycles(
+    root: Path,
+    truth: xr.Dataset,
+    clean: dict[str, np.ndarray],
+    seed: int,
+    periods: tuple[str, ...] = PERIODS,
+) -> None:
     """One store per cycle, laid out like the real extractor's output (Zarr v2, one init time)."""
     rng = np.random.default_rng(seed)
     times = truth["valid_time"].values
     leads = np.array(GEFS_LEADS, dtype="timedelta64[h]").astype("timedelta64[ns]")
-    for label in PERIODS:
+    for label in periods:
         start = np.datetime64(f"{label}-01T00", "ns")
-        end = start + np.timedelta64(31, "D") - np.timedelta64(1, "h")
+        end = start + np.timedelta64(pd.Period(label).days_in_month, "D") - np.timedelta64(1, "h")
         for init in run_gate1.evaluation_init_times(start, end, [0, 12]):
             rows = np.searchsorted(times, init + leads)
             data = {}
@@ -598,6 +604,82 @@ def test_committed_summary_matches_the_committed_scorecards() -> None:
             assert card["sealed_data_used"] is False and card["period_end"] < "2024-12-18"
         assert len({(c["period_start"], c["period_end"], c["n_init_times"]) for c in cards}) == 1
     assert json.loads((experiments / "gefs_2024-12.json").read_text())["period_end"] == "2024-12-17T12:00:00"
+
+
+def test_quarter_periods_with_the_real_config() -> None:
+    cfg = load_config()
+    sizes = {}
+    for number in range(1, 5):
+        quarter = run_gate1.parse_period(f"2024-Q{number}", [0, 12], cfg)
+        months = [run_gate1.parse_period(m, [0, 12], cfg) for m in quarter.months]
+        assert quarter.months == tuple(f"2024-{m:02d}" for m in range(3 * number - 2, 3 * number + 1))
+        # a quarter is exactly its three months, in time order, as one period
+        assert quarter.init_times.tolist() == np.concatenate([m.init_times for m in months]).tolist()
+        sizes[quarter.label] = (int(quarter.init_times.size), quarter.n_dropped)
+    assert sizes == {"2024-Q1": (182, 0), "2024-Q2": (182, 0), "2024-Q3": (184, 0), "2024-Q4": (156, 28)}
+    # Q4 ends where December does: the last init inside the validation split
+    q4 = run_gate1.parse_period("2024-Q4", [0, 12], cfg)
+    assert q4.init_times.max() == np.datetime64("2024-12-17T12", "ns") and q4.cycles[-1] == "2024121712"
+    assert run_gate1.parse_period("2024-03", [0, 12], cfg).months == ()  # a month is not a quarter
+    for label in ("2024-Q0", "2024-Q5", "2024-q1", "2024-Q", "2024-Q12", "24-Q1", "2025-Q1", "2023-Q4"):
+        with pytest.raises(run_gate1.Refused):
+            run_gate1.parse_period(label, [0, 12], cfg)
+
+
+def test_runner_scores_a_quarter_as_one_period_from_its_month_stores(
+    base_world: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture, no_network: None
+) -> None:
+    from wrfcomp.harness.hashing import content_sha256
+
+    world = copy_world(base_world, tmp_path / "w")
+    out = tmp_path / "experiments"
+    # a quarter needs the stores of its months: asked for alone, every model fails and says what to run
+    assert run(world, out, periods=("2024-Q1",)) == 1
+    printed = capsys.readouterr().out
+    assert (
+        printed.count("FAILED") == 3
+        and "run the months of 2024-Q1 (2024-01, 2024-02, 2024-03) first" in printed
+    )
+    assert not list(out.glob("*.json"))
+
+    # GEFS cycles for February and March (the world has January and July); same truth as the world's
+    truth, clean = make_truth("2023-12-31T00", "2024-08-03T00", seed=2)
+    write_gefs_cycles(
+        world["data"] / "baselines" / "gefs", truth, clean, seed=11, periods=("2024-02", "2024-03")
+    )
+    months = ("2024-01", "2024-02", "2024-03")
+    assert run(world, out, periods=(*months, "2024-Q1")) == 0
+    printed = capsys.readouterr().out
+    assert "[2024-Q1] gefs: joined the stores of 2024-01, 2024-02, 2024-03" in printed
+
+    work = world["data"] / "gate1"
+    for model in MODELS:
+        quarter = json.loads((out / f"{model}_2024-Q1.json").read_text())
+        monthly = [json.loads((out / f"{model}_{m}.json").read_text()) for m in months]
+        Scorecard.model_validate(quarter)
+        assert quarter["n_init_times"] == sum(c["n_init_times"] for c in monthly) == 182
+        assert (quarter["period_start"], quarter["period_end"]) == (
+            "2024-01-01T00:00:00",
+            "2024-03-31T12:00:00",
+        )
+        assert quarter["sealed_data_used"] is False and quarter["leads_scored"] == monthly[0]["leads_scored"]
+        # one evaluation over the whole quarter: the same points as the three months together
+        for variable, per_lead in quarter["metrics"].items():
+            for lead, entry in per_lead.items():
+                assert entry["n_pairs"] == sum(c["metrics"][variable][lead]["n_pairs"] for c in monthly)
+        # the quarter's forecast is the month stores joined along init time, nothing else
+        parts = [xr.open_zarr(work / f"{m}_h00-12" / f"{model}.zarr", chunks=None).load() for m in months]
+        joined = xr.concat(parts, dim="init_time", data_vars="all", coords="minimal", compat="override")
+        assert quarter["forecast_sha256"] == content_sha256(joined.sortby("init_time"))
+        assert quarter["forecast_sha256"] not in {c["forecast_sha256"] for c in monthly}
+    cards = {m: json.loads((out / f"{m}_2024-Q1.json").read_text()) for m in MODELS}
+    assert cards["gefs"]["baseline_sha256"] == cards["climatology"]["forecast_sha256"]
+
+    # deterministic: a rerun reuses the quarter stores and changes nothing
+    before = {p.name: p.read_bytes() for p in out.glob("*.json")}
+    assert run(world, out, periods=(*months, "2024-Q1")) == 0
+    assert {p.name: p.read_bytes() for p in out.glob("*.json")} == before
+    assert "[2024-Q1] climatology: forecast store present, reused" in capsys.readouterr().out
 
 
 def test_runner_refuses_sealed_and_short_truth(base_world: dict[str, Path], tmp_path: Path, capsys) -> None:

@@ -118,6 +118,15 @@ days before the sealed split, so December is scored from 12-01T00Z to 12-17T12Z:
 on 12-31T12Z; the validation end is the stricter one.) The scorecards record the result in
 `period_start`, `period_end` and `n_init_times`.
 
+### Quarters
+
+`--period 2024-Q1` (to `2024-Q4`) scores a calendar quarter as ONE period. Run the months first: a
+quarter's forecast stores are the stores of its three months joined along init time
+(`gate1/2024-Q1_h00-12/`), and its scorecards are `<model>_2024-Q1.json`. The same rule decides where
+it ends, so Q4 stops at 2024-12-17T12Z (156 init times). The quarterly scorecards are the pinned
+references of the promotion rule (at least 3 of 4 quarters, `docs/HARNESS_LOCK.md`); the monthly ones
+are diagnostic.
+
 ### Summary tables
 
 ```sh
