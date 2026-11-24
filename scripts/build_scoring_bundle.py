@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+import h5py
 import numpy as np
 import xarray as xr
 
@@ -77,6 +78,63 @@ PERIOD_RE = re.compile(r"^(?P<year>[0-9]{4})-(?:[0-9]{2}|Q[1-4])$")
 CHUNK_INDEX_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 ZARR_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 NETCDF_MAGICS = (b"\x89HDF\r\n\x1a\n", b"CDF\x01", b"CDF\x02")
+MAX_ATTR_VALUE_LEN = 512
+
+# Approved public metadata allowlists (any unlisted attribute is refused before packing).
+ALLOWED_HDF5_ROOT_ATTRS: dict[str, frozenset[str]] = {
+    "truth": frozenset(
+        {
+            "_NCProperties",
+            "parser_version",
+            "passing_qc_codes",
+            "protocol_version",
+            "source",
+            "truth_tolerance_minutes",
+        }
+    ),
+    "thresholds": frozenset(
+        {
+            "_NCProperties",
+            "protocol_version",
+            "tail_quantile",
+            "train_end_utc",
+        }
+    ),
+}
+_HDF5_STRUCTURAL_VAR_ATTRS = frozenset(
+    {
+        "CLASS",
+        "DIMENSION_LIST",
+        "NAME",
+        "REFERENCE_LIST",
+        "_FillValue",
+        "_Netcdf4Coordinates",
+        "_Netcdf4Dimid",
+        "calendar",
+        "coordinates",
+    }
+)
+ALLOWED_HDF5_VAR_ATTRS: dict[str, frozenset[str]] = {
+    "truth": _HDF5_STRUCTURAL_VAR_ATTRS | {"long_name", "units"},
+    "thresholds": _HDF5_STRUCTURAL_VAR_ATTRS | {"tail_quantile", "train_end_utc", "units"},
+}
+ALLOWED_ZARR_ROOT_ATTRS = frozenset({"model_id", "model_version"})
+ALLOWED_ZARR_VAR_ATTRS = frozenset({"_ARRAY_DIMENSIONS", "calendar", "coordinates", "dtype", "units"})
+ALLOWED_ZARR_ZGROUP_KEYS = frozenset({"zarr_format"})
+ALLOWED_ZARR_ZARRAY_KEYS = frozenset(
+    {
+        "chunks",
+        "compressor",
+        "dimension_separator",
+        "dtype",
+        "fill_value",
+        "filters",
+        "order",
+        "shape",
+        "zarr_format",
+    }
+)
+ALLOWED_ZARR_ZMETADATA_KEYS = frozenset({"metadata", "zarr_consolidated_format"})
 
 
 class BundleError(RuntimeError):
@@ -206,10 +264,47 @@ def _assert_source_contained(root: Path, relpath: str, what: str) -> Path:
     return cur
 
 
+def _check_attr_value(val: Any, what: str) -> None:
+    if isinstance(val, bytes):
+        if len(val) > MAX_ATTR_VALUE_LEN or b"\x00" in val:
+            raise BundleError(f"{what}: attribute bytes value too large or contains NUL")
+        return
+    if isinstance(val, str):
+        if len(val) > MAX_ATTR_VALUE_LEN or "\x00" in val:
+            raise BundleError(f"{what}: attribute string too large or contains NUL")
+        return
+    if isinstance(val, bool | int | float | np.generic) or val is None:
+        return
+    if isinstance(val, list | tuple):
+        if len(val) > 32:
+            raise BundleError(f"{what}: attribute sequence too long")
+        for item in val:
+            _check_attr_value(item, what)
+        return
+    if isinstance(val, np.ndarray):
+        if val.size > 32:
+            raise BundleError(f"{what}: attribute array too large")
+        return
+    raise BundleError(f"{what}: unsupported attribute value type {type(val).__name__}")
+
+
+def _validate_zarr_attrs_dict(attrs: Any, allowed_keys: frozenset[str], what: str) -> dict[str, Any]:
+    if not isinstance(attrs, dict):
+        raise BundleError(f"{what}: must be a JSON object")
+    disallowed = sorted(set(attrs) - allowed_keys)
+    if disallowed:
+        raise BundleError(f"{what}: unapproved metadata attributes refused: {disallowed}")
+    for key, val in attrs.items():
+        _check_attr_value(val, f"{what}[{key!r}]")
+    return attrs
+
+
 def _validate_netcdf_file(
     data_dir: Path,
     relpath: str,
-) -> tuple[str, int, list[dict[str, Any]]]:
+    *,
+    kind: str,
+) -> tuple[str, int, list[dict[str, Any]], set[str]]:
     target = _assert_source_contained(data_dir, relpath, f"netcdf {relpath}")
     st = os.lstat(target)
     if not stat.S_ISREG(st.st_mode):
@@ -219,8 +314,8 @@ def _validate_netcdf_file(
     total = 0
     with fh:
         head = fh.read(8)
-        if not any(head.startswith(magic) for magic in NETCDF_MAGICS):
-            raise BundleError(f"{relpath}: file does not start with a NetCDF/HDF5 header")
+        if head != NETCDF_MAGICS[0]:
+            raise BundleError(f"{relpath}: expected an HDF5/NetCDF4 file")
         h.update(head)
         total += len(head)
         while True:
@@ -231,7 +326,54 @@ def _validate_netcdf_file(
             total += len(chunk)
     if total != fst.st_size:
         raise BundleError(f"{relpath}: file size changed while hashing")
-    return "netcdf", total, [{"path": relpath, "size_bytes": total, "sha256": h.hexdigest()}]
+
+    allowed_root = ALLOWED_HDF5_ROOT_ATTRS.get(kind)
+    allowed_var = ALLOWED_HDF5_VAR_ATTRS.get(kind)
+    if allowed_root is None or allowed_var is None:
+        raise BundleError(f"{relpath}: unsupported NetCDF dataset kind {kind!r}")
+
+    try:
+        with h5py.File(target, "r") as h5f:
+            disallowed_root = sorted(set(h5f.attrs.keys()) - allowed_root)
+            if disallowed_root:
+                raise BundleError(
+                    f"{relpath}: unapproved root NetCDF metadata attributes refused: {disallowed_root}"
+                )
+            for attr_name in h5f.attrs.keys():
+                _check_attr_value(h5f.attrs[attr_name], f"{relpath} root attr {attr_name!r}")
+
+            hdf5_datasets: set[str] = set()
+            for name in sorted(h5f.keys()):
+                link = h5f.get(name, getlink=True)
+                if not isinstance(link, h5py.HardLink):
+                    raise BundleError(f"{relpath}: non-hardlink HDF5 entry refused: {name!r}")
+                obj = h5f[name]
+                if isinstance(obj, h5py.Group):
+                    raise BundleError(f"{relpath}: nested NetCDF/HDF5 group refused: {name!r}")
+                if not isinstance(obj, h5py.Dataset):
+                    raise BundleError(f"{relpath}: unsupported HDF5 object refused: {name!r}")
+                disallowed_var = sorted(set(obj.attrs.keys()) - allowed_var)
+                if disallowed_var:
+                    raise BundleError(
+                        f"{relpath}/{name}: unapproved variable NetCDF metadata attributes refused: "
+                        f"{disallowed_var}"
+                    )
+                for attr_name in obj.attrs.keys():
+                    if attr_name in ("DIMENSION_LIST", "REFERENCE_LIST"):
+                        continue
+                    _check_attr_value(obj.attrs[attr_name], f"{relpath}/{name} attr {attr_name!r}")
+                hdf5_datasets.add(name)
+    except BundleError:
+        raise
+    except Exception as exc:
+        raise BundleError(f"{relpath}: failed to inspect HDF5/NetCDF4 structure: {exc}") from exc
+
+    return (
+        "netcdf",
+        total,
+        [{"path": relpath, "size_bytes": total, "sha256": h.hexdigest()}],
+        hdf5_datasets,
+    )
 
 
 def _validate_zarr_store(
@@ -276,14 +418,20 @@ def _validate_zarr_store(
     if ".zgroup" not in root_files:
         raise BundleError(f"{relpath}: missing .zgroup in Zarr v2 store")
     zgroup = _read_bounded_json(root_files[".zgroup"], max_metadata_bytes, f"{relpath}/.zgroup")
-    if not isinstance(zgroup, dict) or zgroup.get("zarr_format") != 2:
-        raise BundleError(f"{relpath}: only Zarr v2 groups are supported")
+    if (
+        not isinstance(zgroup, dict)
+        or set(zgroup) != ALLOWED_ZARR_ZGROUP_KEYS
+        or zgroup.get("zarr_format") != 2
+    ):
+        raise BundleError(f"{relpath}: only Zarr v2 groups with standard keys are supported")
 
     parsed_metadata: dict[str, Any] = {".zgroup": zgroup}
     if ".zattrs" in root_files:
-        zattrs = _read_bounded_json(root_files[".zattrs"], max_metadata_bytes, f"{relpath}/.zattrs")
-        if not isinstance(zattrs, dict):
-            raise BundleError(f"{relpath}/.zattrs must be a JSON object")
+        zattrs = _validate_zarr_attrs_dict(
+            _read_bounded_json(root_files[".zattrs"], max_metadata_bytes, f"{relpath}/.zattrs"),
+            ALLOWED_ZARR_ROOT_ATTRS,
+            f"{relpath}/.zattrs",
+        )
         parsed_metadata[".zattrs"] = zattrs
 
     if not var_dirs:
@@ -297,8 +445,12 @@ def _validate_zarr_store(
         if not os.path.lexists(zarray_path) or not stat.S_ISREG(os.lstat(zarray_path).st_mode):
             raise BundleError(f"{relpath}/{var_name}: missing regular .zarray metadata")
         za = _read_bounded_json(zarray_path, max_metadata_bytes, f"{relpath}/{var_name}/.zarray")
-        if not isinstance(za, dict) or za.get("zarr_format") != 2:
-            raise BundleError(f"{relpath}/{var_name}: unsupported .zarray format")
+        if (
+            not isinstance(za, dict)
+            or not set(za).issubset(ALLOWED_ZARR_ZARRAY_KEYS)
+            or za.get("zarr_format") != 2
+        ):
+            raise BundleError(f"{relpath}/{var_name}: unsupported .zarray format or keys")
         shape = za.get("shape")
         chunks = za.get("chunks")
         dtype_raw = za.get("dtype")
@@ -360,9 +512,11 @@ def _validate_zarr_store(
                     allowed_files.append(fpath)
                     continue
                 if inner_rel == ".zattrs":
-                    vattrs = _read_bounded_json(fpath, max_metadata_bytes, f"{relpath}/{var_name}/.zattrs")
-                    if not isinstance(vattrs, dict):
-                        raise BundleError(f"{relpath}/{var_name}/.zattrs must be a JSON object")
+                    vattrs = _validate_zarr_attrs_dict(
+                        _read_bounded_json(fpath, max_metadata_bytes, f"{relpath}/{var_name}/.zattrs"),
+                        ALLOWED_ZARR_VAR_ATTRS,
+                        f"{relpath}/{var_name}/.zattrs",
+                    )
                     parsed_metadata[f"{var_name}/.zattrs"] = vattrs
                     allowed_files.append(fpath)
                     continue
@@ -382,6 +536,7 @@ def _validate_zarr_store(
         zmeta = _read_bounded_json(root_files[".zmetadata"], max_metadata_bytes, f"{relpath}/.zmetadata")
         if (
             not isinstance(zmeta, dict)
+            or set(zmeta) != ALLOWED_ZARR_ZMETADATA_KEYS
             or zmeta.get("zarr_consolidated_format") != 1
             or not isinstance(zmeta.get("metadata"), dict)
         ):
@@ -732,29 +887,29 @@ def build_bundle(
     for item in items:
         target = _assert_source_contained(data_dir, item.relpath, f"{item.kind} {item.relpath}")
         st = os.lstat(target)
-        expected_var_dirs: set[str] | None = None
         if stat.S_ISDIR(st.st_mode):
-            fmt, size_bytes, files, expected_var_dirs = _validate_zarr_store(
+            fmt, size_bytes, files, expected_var_names = _validate_zarr_store(
                 data_dir,
                 item.relpath,
                 max_chunk_bytes=max_chunk_bytes,
                 max_dataset_bytes=max_dataset_bytes,
             )
         elif stat.S_ISREG(st.st_mode):
-            fmt, size_bytes, files = _validate_netcdf_file(data_dir, item.relpath)
+            fmt, size_bytes, files, expected_var_names = _validate_netcdf_file(
+                data_dir, item.relpath, kind=item.kind
+            )
         else:
             raise BundleError(f"{item.relpath}: unsupported filesystem entry type")
 
         with _open_dataset(target, fmt, f"{item.kind} {item.relpath}") as ds:
             _check_dataset_bounds(ds, item.relpath, max_dataset_bytes=max_dataset_bytes)
             _check_not_sealed(ds, item.kind, item.relpath, cfg)
-            if expected_var_dirs is not None:
-                ds_vars = {str(name) for name in ds.variables}
-                if ds_vars != expected_var_dirs:
-                    raise BundleError(
-                        f"{item.relpath}: Zarr directories {sorted(expected_var_dirs)} "
-                        f"do not match dataset variables {sorted(ds_vars)}"
-                    )
+            ds_vars = {str(name) for name in ds.variables}
+            if ds_vars != expected_var_names:
+                raise BundleError(
+                    f"{item.relpath}: container datasets {sorted(expected_var_names)} "
+                    f"do not match xarray variables {sorted(ds_vars)}"
+                )
             actual = content_sha256(ds)
         if actual != item.expected_sha256:
             raise BundleError(

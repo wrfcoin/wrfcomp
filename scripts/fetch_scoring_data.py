@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import math
@@ -34,6 +35,7 @@ import urllib.request
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+import h5py
 import numpy as np
 import xarray as xr
 
@@ -48,6 +50,8 @@ DEFAULT_MAX_ARCHIVE_BYTES = 8 * 1024**3
 DEFAULT_MAX_MEMBERS = 50_000
 DEFAULT_MAX_MEMBER_BYTES = 512 * 1024**2
 DEFAULT_MAX_TOTAL_BYTES = 10 * 1024**3
+DEFAULT_MAX_STREAM_BYTES = 11 * 1024**3
+DEFAULT_MAX_HEADER_OVERHEAD_BYTES = 256 * 1024**2
 DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024**2
 DEFAULT_MAX_README_BYTES = 1 * 1024**2
 DEFAULT_MAX_METADATA_BYTES = 1 * 1024**2
@@ -84,10 +88,93 @@ ZARR_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 ZENODO_RECORD_RE = re.compile(r"^/(?:records?|api/records)/(?P<id>[0-9]+)/?$")
 ZENODO_DOI_RE = re.compile(r"^/10\.5281/zenodo\.(?P<id>[0-9]+)/?$")
 NETCDF_MAGICS = (b"\x89HDF\r\n\x1a\n", b"CDF\x01", b"CDF\x02")
+MAX_ATTR_VALUE_LEN = 512
+
+ALLOWED_HDF5_ROOT_ATTRS: dict[str, frozenset[str]] = {
+    "truth": frozenset(
+        {
+            "_NCProperties",
+            "parser_version",
+            "passing_qc_codes",
+            "protocol_version",
+            "source",
+            "truth_tolerance_minutes",
+        }
+    ),
+    "thresholds": frozenset(
+        {
+            "_NCProperties",
+            "protocol_version",
+            "tail_quantile",
+            "train_end_utc",
+        }
+    ),
+}
+_HDF5_STRUCTURAL_VAR_ATTRS = frozenset(
+    {
+        "CLASS",
+        "DIMENSION_LIST",
+        "NAME",
+        "REFERENCE_LIST",
+        "_FillValue",
+        "_Netcdf4Coordinates",
+        "_Netcdf4Dimid",
+        "calendar",
+        "coordinates",
+    }
+)
+ALLOWED_HDF5_VAR_ATTRS: dict[str, frozenset[str]] = {
+    "truth": _HDF5_STRUCTURAL_VAR_ATTRS | {"long_name", "units"},
+    "thresholds": _HDF5_STRUCTURAL_VAR_ATTRS | {"tail_quantile", "train_end_utc", "units"},
+}
+ALLOWED_ZARR_ROOT_ATTRS = frozenset({"model_id", "model_version"})
+ALLOWED_ZARR_VAR_ATTRS = frozenset({"_ARRAY_DIMENSIONS", "calendar", "coordinates", "dtype", "units"})
+ALLOWED_ZARR_ZGROUP_KEYS = frozenset({"zarr_format"})
+ALLOWED_ZARR_ZARRAY_KEYS = frozenset(
+    {
+        "chunks",
+        "compressor",
+        "dimension_separator",
+        "dtype",
+        "fill_value",
+        "filters",
+        "order",
+        "shape",
+        "zarr_format",
+    }
+)
+ALLOWED_ZARR_ZMETADATA_KEYS = frozenset({"metadata", "zarr_consolidated_format"})
 
 
 class FetchError(RuntimeError):
     """Raised when downloading, verifying, or unpacking a scoring bundle fails."""
+
+
+class _BoundedStream:
+    """Wrapper that enforces a hard cap on total decompressed bytes read by ``tarfile``."""
+
+    def __init__(self, stream: Any, max_bytes: int) -> None:
+        self._stream = stream
+        self._max_bytes = max_bytes
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self._max_bytes - self.bytes_read
+        if remaining < 0:
+            raise FetchError(
+                f"Decompressed archive stream (including headers/metadata) exceeded limit "
+                f"({self._max_bytes} bytes)"
+            )
+        to_read = remaining + 1 if (size is None or size < 0 or size > remaining + 1) else size
+        chunk = self._stream.read(to_read)
+        if chunk:
+            self.bytes_read += len(chunk)
+            if self.bytes_read > self._max_bytes:
+                raise FetchError(
+                    f"Decompressed archive stream (including headers/metadata) exceeded limit "
+                    f"({self._max_bytes} bytes)"
+                )
+        return chunk
 
 
 def default_data_dir() -> Path:
@@ -219,6 +306,41 @@ def _assert_tree_no_symlinks(root: Path, relpath: str, what: str, *, must_exist:
     return cur
 
 
+def _check_attr_value(val: Any, what: str) -> None:
+    if isinstance(val, bytes):
+        if len(val) > MAX_ATTR_VALUE_LEN or b"\x00" in val:
+            raise FetchError(f"{what}: attribute bytes value too large or contains NUL")
+        return
+    if isinstance(val, str):
+        if len(val) > MAX_ATTR_VALUE_LEN or "\x00" in val:
+            raise FetchError(f"{what}: attribute string too large or contains NUL")
+        return
+    if isinstance(val, bool | int | float | np.generic) or val is None:
+        return
+    if isinstance(val, list | tuple):
+        if len(val) > 32:
+            raise FetchError(f"{what}: attribute sequence too long")
+        for item in val:
+            _check_attr_value(item, what)
+        return
+    if isinstance(val, np.ndarray):
+        if val.size > 32:
+            raise FetchError(f"{what}: attribute array too large")
+        return
+    raise FetchError(f"{what}: unsupported attribute value type {type(val).__name__}")
+
+
+def _validate_zarr_attrs_dict(attrs: Any, allowed_keys: frozenset[str], what: str) -> dict[str, Any]:
+    if not isinstance(attrs, dict):
+        raise FetchError(f"{what}: must be a JSON object")
+    disallowed = sorted(set(attrs) - allowed_keys)
+    if disallowed:
+        raise FetchError(f"{what}: unapproved metadata attributes refused: {disallowed}")
+    for key, val in attrs.items():
+        _check_attr_value(val, f"{what}[{key!r}]")
+    return attrs
+
+
 def _validate_zarr_store(
     root: Path,
     relpath: str,
@@ -227,7 +349,7 @@ def _validate_zarr_store(
     max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
     max_metadata_bytes: int = DEFAULT_MAX_METADATA_BYTES,
 ) -> set[str]:
-    """Validate strict Zarr v2 layout and chunk/dataset bounds BEFORE opening with xarray."""
+    """Validate strict Zarr v2 layout, approved metadata, and chunk/dataset bounds BEFORE xarray."""
     store = _assert_tree_no_symlinks(root, relpath, f"zarr store {relpath}", must_exist=True)
     if not stat.S_ISDIR(os.lstat(store).st_mode):
         raise FetchError(f"{relpath}: expected a Zarr store directory")
@@ -250,14 +372,20 @@ def _validate_zarr_store(
     if ".zgroup" not in root_files:
         raise FetchError(f"{relpath}: missing .zgroup in Zarr v2 store")
     zgroup = _read_bounded_json(root_files[".zgroup"], max_metadata_bytes, f"{relpath}/.zgroup")
-    if not isinstance(zgroup, dict) or zgroup.get("zarr_format") != 2:
-        raise FetchError(f"{relpath}: only Zarr v2 groups are supported")
+    if (
+        not isinstance(zgroup, dict)
+        or set(zgroup) != ALLOWED_ZARR_ZGROUP_KEYS
+        or zgroup.get("zarr_format") != 2
+    ):
+        raise FetchError(f"{relpath}: only Zarr v2 groups with standard keys are supported")
 
     parsed_metadata: dict[str, Any] = {".zgroup": zgroup}
     if ".zattrs" in root_files:
-        zattrs = _read_bounded_json(root_files[".zattrs"], max_metadata_bytes, f"{relpath}/.zattrs")
-        if not isinstance(zattrs, dict):
-            raise FetchError(f"{relpath}/.zattrs must be a JSON object")
+        zattrs = _validate_zarr_attrs_dict(
+            _read_bounded_json(root_files[".zattrs"], max_metadata_bytes, f"{relpath}/.zattrs"),
+            ALLOWED_ZARR_ROOT_ATTRS,
+            f"{relpath}/.zattrs",
+        )
         parsed_metadata[".zattrs"] = zattrs
 
     if not var_dirs:
@@ -269,8 +397,12 @@ def _validate_zarr_store(
         if not os.path.lexists(zarray_path) or not stat.S_ISREG(os.lstat(zarray_path).st_mode):
             raise FetchError(f"{relpath}/{var_name}: missing regular .zarray metadata")
         za = _read_bounded_json(zarray_path, max_metadata_bytes, f"{relpath}/{var_name}/.zarray")
-        if not isinstance(za, dict) or za.get("zarr_format") != 2:
-            raise FetchError(f"{relpath}/{var_name}: unsupported .zarray format")
+        if (
+            not isinstance(za, dict)
+            or not set(za).issubset(ALLOWED_ZARR_ZARRAY_KEYS)
+            or za.get("zarr_format") != 2
+        ):
+            raise FetchError(f"{relpath}/{var_name}: unsupported .zarray format or keys")
         shape = za.get("shape")
         chunks = za.get("chunks")
         dtype_raw = za.get("dtype")
@@ -317,9 +449,11 @@ def _validate_zarr_store(
                 if inner_rel == ".zarray":
                     continue
                 if inner_rel == ".zattrs":
-                    vattrs = _read_bounded_json(fpath, max_metadata_bytes, f"{relpath}/{var_name}/.zattrs")
-                    if not isinstance(vattrs, dict):
-                        raise FetchError(f"{relpath}/{var_name}/.zattrs must be a JSON object")
+                    vattrs = _validate_zarr_attrs_dict(
+                        _read_bounded_json(fpath, max_metadata_bytes, f"{relpath}/{var_name}/.zattrs"),
+                        ALLOWED_ZARR_VAR_ATTRS,
+                        f"{relpath}/{var_name}/.zattrs",
+                    )
                     parsed_metadata[f"{var_name}/.zattrs"] = vattrs
                     continue
                 parts = inner_rel.split(sep)
@@ -337,6 +471,7 @@ def _validate_zarr_store(
         zmeta = _read_bounded_json(root_files[".zmetadata"], max_metadata_bytes, f"{relpath}/.zmetadata")
         if (
             not isinstance(zmeta, dict)
+            or set(zmeta) != ALLOWED_ZARR_ZMETADATA_KEYS
             or zmeta.get("zarr_consolidated_format") != 1
             or not isinstance(zmeta.get("metadata"), dict)
         ):
@@ -351,15 +486,57 @@ def _validate_zarr_store(
     return set(var_dirs)
 
 
-def _validate_netcdf_header(root: Path, relpath: str) -> None:
+def _validate_netcdf_file(root: Path, relpath: str, *, kind: str) -> set[str]:
     target = _assert_tree_no_symlinks(root, relpath, f"netcdf {relpath}", must_exist=True)
     if not stat.S_ISREG(os.lstat(target).st_mode):
         raise FetchError(f"{relpath}: expected a regular NetCDF file")
     fh, _ = _open_regular_nofollow(target, f"netcdf {relpath}")
     with fh:
         head = fh.read(8)
-    if not any(head.startswith(magic) for magic in NETCDF_MAGICS):
-        raise FetchError(f"{relpath}: file does not start with a NetCDF/HDF5 header")
+    if head != NETCDF_MAGICS[0]:
+        raise FetchError(f"{relpath}: expected an HDF5/NetCDF4 file")
+
+    allowed_root = ALLOWED_HDF5_ROOT_ATTRS.get(kind)
+    allowed_var = ALLOWED_HDF5_VAR_ATTRS.get(kind)
+    if allowed_root is None or allowed_var is None:
+        raise FetchError(f"{relpath}: unsupported NetCDF dataset kind {kind!r}")
+
+    try:
+        with h5py.File(target, "r") as h5f:
+            disallowed_root = sorted(set(h5f.attrs.keys()) - allowed_root)
+            if disallowed_root:
+                raise FetchError(
+                    f"{relpath}: unapproved root NetCDF metadata attributes refused: {disallowed_root}"
+                )
+            for attr_name in h5f.attrs.keys():
+                _check_attr_value(h5f.attrs[attr_name], f"{relpath} root attr {attr_name!r}")
+
+            hdf5_datasets: set[str] = set()
+            for name in sorted(h5f.keys()):
+                link = h5f.get(name, getlink=True)
+                if not isinstance(link, h5py.HardLink):
+                    raise FetchError(f"{relpath}: non-hardlink HDF5 entry refused: {name!r}")
+                obj = h5f[name]
+                if isinstance(obj, h5py.Group):
+                    raise FetchError(f"{relpath}: nested NetCDF/HDF5 group refused: {name!r}")
+                if not isinstance(obj, h5py.Dataset):
+                    raise FetchError(f"{relpath}: unsupported HDF5 object refused: {name!r}")
+                disallowed_var = sorted(set(obj.attrs.keys()) - allowed_var)
+                if disallowed_var:
+                    raise FetchError(
+                        f"{relpath}/{name}: unapproved variable NetCDF metadata attributes refused: "
+                        f"{disallowed_var}"
+                    )
+                for attr_name in obj.attrs.keys():
+                    if attr_name in ("DIMENSION_LIST", "REFERENCE_LIST"):
+                        continue
+                    _check_attr_value(obj.attrs[attr_name], f"{relpath}/{name} attr {attr_name!r}")
+                hdf5_datasets.add(name)
+    except FetchError:
+        raise
+    except Exception as exc:
+        raise FetchError(f"{relpath}: failed to inspect HDF5/NetCDF4 structure: {exc}") from exc
+    return hdf5_datasets
 
 
 def _open_dataset(path: Path, fmt: str, what: str) -> xr.Dataset:
@@ -557,96 +734,116 @@ def _safe_extract_archive(
     max_members: int = DEFAULT_MAX_MEMBERS,
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+    max_stream_bytes: int | None = None,
     max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
     max_readme_bytes: int = DEFAULT_MAX_README_BYTES,
     min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
 ) -> set[str]:
-    """Stream-extract regular files into ``staging_dir`` with strict size/count/disk limits."""
+    """Stream-extract regular files into ``staging_dir`` with pre-parse decompression & size limits."""
     extracted_files: set[str] = set()
     staging_real = staging_dir.resolve(strict=True)
     member_count = 0
     total_written = 0
+    if max_stream_bytes is None:
+        header_overhead = min(max_members * 1024, DEFAULT_MAX_HEADER_OVERHEAD_BYTES)
+        stream_limit = min(DEFAULT_MAX_STREAM_BYTES, max_total_bytes + header_overhead)
+    else:
+        stream_limit = max_stream_bytes
+
     try:
-        with tarfile.open(archive_path, mode="r:*") as tf:
-            for member in tf:
-                member_count += 1
-                if member_count > max_members:
-                    raise FetchError(
-                        f"Archive exceeds maximum allowed member count ({max_members})"
-                    )
-                if member.issym() or member.islnk() or member.isdev() or member.isfifo():
-                    raise FetchError(f"Refusing non-regular tar member: {member.name!r}")
-                if not (member.isfile() or member.isdir()):
-                    raise FetchError(f"Refusing unsupported tar member type: {member.name!r}")
-                clean_name = member.name.rstrip("/")
-                if not clean_name or clean_name == ".":
-                    tf.members = []
-                    continue
-                rel = _validate_relpath(clean_name, f"archive member {member.name!r}")
-                rel_posix = rel.as_posix()
-                dest = (staging_dir / rel).resolve()
-                if not dest.is_relative_to(staging_real):
-                    raise FetchError(f"Archive member escapes staging directory: {member.name!r}")
-                if member.isdir():
-                    dest.mkdir(parents=True, exist_ok=True)
-                    tf.members = []
-                    continue
-                if rel_posix in extracted_files:
-                    raise FetchError(f"Duplicate archive member: {rel_posix!r}")
-                if member.size < 0:
-                    raise FetchError(f"Negative member size in archive: {rel_posix!r}")
-
-                per_limit = max_member_bytes
-                if rel_posix == "MANIFEST.json":
-                    per_limit = min(per_limit, max_manifest_bytes)
-                elif rel_posix == "README.md":
-                    per_limit = min(per_limit, max_readme_bytes)
-                if member.size > per_limit:
-                    raise FetchError(
-                        f"Archive member {rel_posix!r} size {member.size} exceeds limit {per_limit}"
-                    )
-                if total_written + member.size > max_total_bytes:
-                    raise FetchError(
-                        f"Archive expanded size exceeds limit ({max_total_bytes} bytes)"
-                    )
-                free_bytes = shutil.disk_usage(staging_real).free
-                if free_bytes - member.size < min_free_bytes:
-                    raise FetchError(
-                        f"Insufficient staging disk space for {rel_posix!r} "
-                        f"({free_bytes} bytes free)"
-                    )
-
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                src = tf.extractfile(member)
-                if src is None:
-                    raise FetchError(f"Cannot read archive member: {member.name!r}")
-                member_written = 0
-                with src, dest.open("wb") as out_fh:
-                    while True:
-                        chunk = src.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        member_written += len(chunk)
-                        total_written += len(chunk)
-                        if member_written > per_limit:
+        fh, _ = _open_regular_nofollow(archive_path, f"archive {archive_path.name}")
+        with fh:
+            magic = fh.read(2)
+            fh.seek(0)
+            decompressed: Any
+            if magic == b"\x1f\x8b":
+                decompressed = gzip.GzipFile(fileobj=fh, mode="rb")
+            else:
+                decompressed = fh
+            try:
+                bounded = _BoundedStream(decompressed, stream_limit)
+                with tarfile.open(fileobj=bounded, mode="r|") as tf:
+                    for member in tf:
+                        member_count += 1
+                        if member_count > max_members:
                             raise FetchError(
-                                f"Archive member {rel_posix!r} stream exceeded limit {per_limit}"
+                                f"Archive exceeds maximum allowed member count ({max_members})"
                             )
-                        if total_written > max_total_bytes:
+                        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+                            raise FetchError(f"Refusing non-regular tar member: {member.name!r}")
+                        if not (member.isfile() or member.isdir()):
+                            raise FetchError(f"Refusing unsupported tar member type: {member.name!r}")
+                        clean_name = member.name.rstrip("/")
+                        if not clean_name or clean_name == ".":
+                            continue
+                        rel = _validate_relpath(clean_name, f"archive member {member.name!r}")
+                        rel_posix = rel.as_posix()
+                        dest = (staging_dir / rel).resolve()
+                        if not dest.is_relative_to(staging_real):
                             raise FetchError(
-                                f"Archive expanded stream exceeded limit ({max_total_bytes} bytes)"
+                                f"Archive member escapes staging directory: {member.name!r}"
                             )
-                        out_fh.write(chunk)
-                if member_written != member.size:
-                    raise FetchError(
-                        f"Truncated or mismatched stream for {rel_posix!r}: "
-                        f"wrote {member_written}, header {member.size}"
-                    )
-                extracted_files.add(rel_posix)
-                tf.members = []
+                        if member.isdir():
+                            dest.mkdir(parents=True, exist_ok=True)
+                            continue
+                        if rel_posix in extracted_files:
+                            raise FetchError(f"Duplicate archive member: {rel_posix!r}")
+                        if member.size < 0:
+                            raise FetchError(f"Negative member size in archive: {rel_posix!r}")
+
+                        per_limit = max_member_bytes
+                        if rel_posix == "MANIFEST.json":
+                            per_limit = min(per_limit, max_manifest_bytes)
+                        elif rel_posix == "README.md":
+                            per_limit = min(per_limit, max_readme_bytes)
+                        if member.size > per_limit:
+                            raise FetchError(
+                                f"Archive member {rel_posix!r} size {member.size} exceeds limit {per_limit}"
+                            )
+                        if total_written + member.size > max_total_bytes:
+                            raise FetchError(
+                                f"Archive expanded size exceeds limit ({max_total_bytes} bytes)"
+                            )
+                        free_bytes = shutil.disk_usage(staging_real).free
+                        if free_bytes - member.size < min_free_bytes:
+                            raise FetchError(
+                                f"Insufficient staging disk space for {rel_posix!r} "
+                                f"({free_bytes} bytes free)"
+                            )
+
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        src = tf.extractfile(member)
+                        if src is None:
+                            raise FetchError(f"Cannot read archive member: {member.name!r}")
+                        member_written = 0
+                        with src, dest.open("wb") as out_fh:
+                            while True:
+                                chunk = src.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                member_written += len(chunk)
+                                total_written += len(chunk)
+                                if member_written > per_limit:
+                                    raise FetchError(
+                                        f"Archive member {rel_posix!r} stream exceeded limit {per_limit}"
+                                    )
+                                if total_written > max_total_bytes:
+                                    raise FetchError(
+                                        f"Archive expanded stream exceeded limit ({max_total_bytes} bytes)"
+                                    )
+                                out_fh.write(chunk)
+                        if member_written != member.size:
+                            raise FetchError(
+                                f"Truncated or mismatched stream for {rel_posix!r}: "
+                                f"wrote {member_written}, header {member.size}"
+                            )
+                        extracted_files.add(rel_posix)
+            finally:
+                if decompressed is not fh:
+                    decompressed.close()
     except FetchError:
         raise
-    except (tarfile.TarError, OSError) as exc:
+    except (tarfile.TarError, gzip.BadGzipFile, EOFError, OSError) as exc:
         raise FetchError(f"Failed to read archive {archive_path.name}: {exc}") from exc
     return extracted_files
 
@@ -766,29 +963,27 @@ def verify_staged_bundle(
             staging_dir, relpath, f"staged {kind} {relpath}", must_exist=True
         )
         fmt = entry.get("format")
-        expected_var_dirs: set[str] | None = None
         if fmt == "zarr":
-            expected_var_dirs = _validate_zarr_store(
+            expected_var_names = _validate_zarr_store(
                 staging_dir,
                 relpath,
                 max_chunk_bytes=max_chunk_bytes,
                 max_dataset_bytes=max_dataset_bytes,
             )
         elif fmt == "netcdf":
-            _validate_netcdf_header(staging_dir, relpath)
+            expected_var_names = _validate_netcdf_file(staging_dir, relpath, kind=kind)
         else:
             raise FetchError(f"Unsupported format {fmt!r} for {relpath}")
 
         with _open_dataset(staged_target, fmt, f"{kind} {relpath}") as ds:
             _check_dataset_bounds(ds, relpath, max_dataset_bytes=max_dataset_bytes)
             _check_not_sealed(ds, kind, relpath, cfg)
-            if expected_var_dirs is not None:
-                ds_vars = {str(name) for name in ds.variables}
-                if ds_vars != expected_var_dirs:
-                    raise FetchError(
-                        f"{relpath}: Zarr directories {sorted(expected_var_dirs)} "
-                        f"do not match dataset variables {sorted(ds_vars)}"
-                    )
+            ds_vars = {str(name) for name in ds.variables}
+            if ds_vars != expected_var_names:
+                raise FetchError(
+                    f"{relpath}: container datasets {sorted(expected_var_names)} "
+                    f"do not match xarray variables {sorted(ds_vars)}"
+                )
             actual_content = content_sha256(ds)
         if actual_content != ref_sha256:
             raise FetchError(
@@ -815,6 +1010,78 @@ def _mkdir_contained_no_symlinks(root: Path, rel_parent: Path, what: str) -> Non
             raise FetchError(f"{what}: parent escapes destination root")
 
 
+def _verify_existing_destination_matches_manifest(
+    data_dir: Path,
+    dest: Path,
+    entry: dict[str, Any],
+) -> None:
+    """Require an existing destination to match the manifest's physical file inventory and byte hashes."""
+    relpath = entry["path"]
+    fmt = entry["format"]
+    expected_files: dict[str, tuple[int, str]] = {
+        str(f["path"]): (int(f["size_bytes"]), str(f["sha256"])) for f in entry["files"]
+    }
+    st = os.lstat(dest)
+    if fmt == "netcdf":
+        if not stat.S_ISREG(st.st_mode):
+            raise FetchError(
+                f"Destination {relpath} already exists and is not a regular file; "
+                "re-run with --overwrite to replace it"
+            )
+        exp_size, exp_sha = expected_files[relpath]
+        if st.st_size != exp_size:
+            raise FetchError(
+                f"Destination {relpath} already exists with different bytes "
+                f"(size {st.st_size} != manifest {exp_size}); re-run with --overwrite to replace it"
+            )
+        actual_sha = _sha256_file(dest)
+        if actual_sha != exp_sha:
+            raise FetchError(
+                f"Destination {relpath} already exists with different bytes "
+                f"(byte SHA-256 mismatch vs manifest: found {actual_sha}, expected {exp_sha}); "
+                "re-run with --overwrite to replace it"
+            )
+        return
+
+    if fmt == "zarr":
+        if not stat.S_ISDIR(st.st_mode):
+            raise FetchError(
+                f"Destination {relpath} already exists and is not a directory; "
+                "re-run with --overwrite to replace it"
+            )
+        existing_files: set[str] = set()
+        for dirpath, _dirnames, filenames in os.walk(dest, followlinks=False):
+            dp = Path(dirpath)
+            for fname in filenames:
+                fpath = dp / fname
+                existing_files.add(fpath.relative_to(data_dir).as_posix())
+        if existing_files != set(expected_files):
+            missing = sorted(set(expected_files) - existing_files)
+            extra = sorted(existing_files - set(expected_files))
+            raise FetchError(
+                f"Destination {relpath} already exists with different file inventory "
+                f"(missing={missing[:3]}, extra={extra[:3]}); re-run with --overwrite to replace it"
+            )
+        for frel, (exp_size, exp_sha) in sorted(expected_files.items()):
+            fpath = data_dir / frel
+            fst = os.lstat(fpath)
+            if fst.st_size != exp_size:
+                raise FetchError(
+                    f"Destination {frel} already exists with different bytes "
+                    f"(size {fst.st_size} != manifest {exp_size}); re-run with --overwrite to replace it"
+                )
+            actual_sha = _sha256_file(fpath)
+            if actual_sha != exp_sha:
+                raise FetchError(
+                    f"Destination {frel} already exists with different bytes "
+                    f"(byte SHA-256 mismatch vs manifest: found {actual_sha}, expected {exp_sha}); "
+                    "re-run with --overwrite to replace it"
+                )
+        return
+
+    raise FetchError(f"Unsupported format {fmt!r} for {relpath}")
+
+
 def _publish_staged(
     staging_dir: Path,
     data_dir: Path,
@@ -838,26 +1105,9 @@ def _publish_staged(
         if overwrite:
             actions.append((relpath, "replace"))
             continue
-        fmt = entry["format"]
-        if fmt == "zarr":
-            _validate_zarr_store(
-                data_dir,
-                relpath,
-                max_chunk_bytes=max_chunk_bytes,
-                max_dataset_bytes=max_dataset_bytes,
-            )
-        else:
-            _validate_netcdf_header(data_dir, relpath)
-        with _open_dataset(dest, fmt, f"existing {relpath}") as ds:
-            _check_dataset_bounds(ds, relpath, max_dataset_bytes=max_dataset_bytes)
-            _check_not_sealed(ds, entry["kind"], relpath, cfg)
-            existing_hash = content_sha256(ds)
-        if existing_hash != entry["content_sha256"]:
-            raise FetchError(
-                f"Destination {relpath} already exists with different content "
-                f"(found {existing_hash}, expected {entry['content_sha256']}); "
-                "re-run with --overwrite to replace it"
-            )
+        # Keep an existing destination ONLY when its physical file inventory and byte hashes match
+        # the verified manifest byte for byte (never on logical hash equivalence alone).
+        _verify_existing_destination_matches_manifest(data_dir, dest, entry)
         actions.append((relpath, "keep"))
 
     installed: list[str] = []
@@ -923,6 +1173,7 @@ def fetch_scoring_data(
     max_members: int = DEFAULT_MAX_MEMBERS,
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+    max_stream_bytes: int | None = None,
     max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
     max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
@@ -1005,6 +1256,7 @@ def fetch_scoring_data(
             max_members=max_members,
             max_member_bytes=max_member_bytes,
             max_total_bytes=max_total_bytes,
+            max_stream_bytes=max_stream_bytes,
             max_manifest_bytes=max_manifest_bytes,
         )
         manifest = verify_staged_bundle(

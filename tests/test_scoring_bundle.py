@@ -15,6 +15,7 @@ import tarfile
 from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
@@ -239,7 +240,7 @@ def test_build_and_fetch_roundtrip_reproducible_and_excludes_private_files(synth
 
     # Existing modified file is refused without --overwrite, replaced with --overwrite.
     _make_truth(seed=999).to_netcdf(dest / "truth" / "isd_conus_2024.nc", engine="h5netcdf")
-    with pytest.raises(fetcher.FetchError, match="different content"):
+    with pytest.raises(fetcher.FetchError, match="different bytes"):
         fetcher.fetch_scoring_data(
             year=2024,
             data_dir=dest,
@@ -836,3 +837,204 @@ def test_fetch_resolves_zenodo_record_url_with_mock_transport(synthetic_env, tmp
             config_path=CONFIG_PATH,
             expected_sha256=summary["archive_sha256"],
         )
+
+
+def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp_path):
+    """Re-review item 1: cap decompressed tar stream including PAX extended headers before member yield."""
+    summary = builder.build_bundle(
+        year=2024,
+        data_dir=synthetic_env["data_dir"],
+        out_dir=synthetic_env["out_dir"],
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        min_free_gb=0.0,
+    )
+    manifest_sidecar = Path(summary["manifest_sidecar"])
+
+    # Tiny 2-byte member wrapped in a 100 KiB PAX extended header (member payload is tiny, header is huge).
+    bloated = tmp_path / "pax_bomb.tar.gz"
+    with gzip.open(bloated, "wb") as gz, tarfile.open(
+        fileobj=gz, mode="w", format=tarfile.PAX_FORMAT
+    ) as tf:
+        info = tarfile.TarInfo("README.md")
+        info.size = 2
+        info.pax_headers = {"comment": "X" * 100_000}
+        tf.addfile(info, io.BytesIO(b"ok"))
+
+    with pytest.raises(fetcher.FetchError, match="Decompressed archive stream"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "pax_dest",
+            archive=bloated,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_manifest=manifest_sidecar,
+            max_total_bytes=4096,
+            max_stream_bytes=8192,
+        )
+
+
+def test_builder_public_metadata_allowlist_and_nested_netcdf_group(synthetic_env, tmp_path):
+    """Re-review item 2: refuse unapproved provenance attrs in NetCDF/Zarr and nested NetCDF groups."""
+    data_dir = synthetic_env["data_dir"]
+    truth_path = data_dir / "truth" / "isd_conus_2024.nc"
+    orig_truth_bytes = truth_path.read_bytes()
+
+    # 1. Unapproved root provenance attribute on NetCDF truth refused
+    ds_root_attr = _make_truth(seed=10)
+    ds_root_attr.attrs["hostname"] = "private-build-box"
+    ds_root_attr.to_netcdf(truth_path, engine="h5netcdf")
+    with pytest.raises(builder.BundleError, match="unapproved root NetCDF metadata attributes"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+
+    # 2. Unapproved variable attribute on NetCDF truth refused
+    ds_var_attr = _make_truth(seed=10)
+    ds_var_attr["t2m"].attrs["private_note"] = "internal"
+    ds_var_attr.to_netcdf(truth_path, engine="h5netcdf")
+    with pytest.raises(builder.BundleError, match="unapproved variable NetCDF metadata attributes"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+
+    # 3. Nested HDF5/NetCDF group hidden inside truth file refused
+    truth_path.write_bytes(orig_truth_bytes)
+    with h5py.File(truth_path, "a") as h5f:
+        grp = h5f.create_group("private_group")
+        grp.create_dataset("secret", data=np.array([1, 2, 3], dtype=np.int32))
+    with pytest.raises(builder.BundleError, match="nested NetCDF/HDF5 group refused"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    truth_path.write_bytes(orig_truth_bytes)
+
+    # 4. Unapproved provenance attribute on Zarr store root (.zattrs) refused
+    gefs_path = data_dir / "gate1" / "2024-01_h00-12" / "gefs.zarr"
+    orig_zattrs = (gefs_path / ".zattrs").read_bytes()
+    orig_zmeta = (gefs_path / ".zmetadata").read_bytes()
+    bad_attrs = json.loads(orig_zattrs.decode("utf-8"))
+    bad_attrs["local_source_path"] = "/private/cache"
+    (gefs_path / ".zattrs").write_text(json.dumps(bad_attrs), encoding="utf-8")
+    with pytest.raises(builder.BundleError, match="unapproved metadata attributes refused"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    (gefs_path / ".zattrs").write_bytes(orig_zattrs)
+    (gefs_path / ".zmetadata").write_bytes(orig_zmeta)
+
+    # 5. Unapproved variable attribute inside Zarr array (.zattrs) refused
+    t2m_zattrs_path = gefs_path / "t2m" / ".zattrs"
+    orig_t2m_zattrs = t2m_zattrs_path.read_bytes()
+    bad_var_attrs = json.loads(orig_t2m_zattrs.decode("utf-8"))
+    bad_var_attrs["comment"] = "private note"
+    t2m_zattrs_path.write_text(json.dumps(bad_var_attrs), encoding="utf-8")
+    with pytest.raises(builder.BundleError, match="unapproved metadata attributes refused"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    t2m_zattrs_path.write_bytes(orig_t2m_zattrs)
+
+
+def test_existing_destination_physical_byte_hash_and_inventory_verified(synthetic_env, tmp_path):
+    """Re-review item 3: existing destination differing in bytes (even if logically equal) is refused."""
+    summary = builder.build_bundle(
+        year=2024,
+        data_dir=synthetic_env["data_dir"],
+        out_dir=synthetic_env["out_dir"],
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        min_free_gb=0.0,
+    )
+    archive_path = Path(summary["archive_path"])
+    sha = summary["archive_sha256"]
+    manifest = json.loads(Path(summary["manifest_sidecar"]).read_text(encoding="utf-8"))
+    expected_truth_file_sha = next(
+        e["files"][0]["sha256"] for e in manifest["entries"] if e["path"] == "truth/isd_conus_2024.nc"
+    )
+
+    # Prepopulate destination with logically identical truth written with zlib compression (different bytes).
+    dest = tmp_path / "recompressed_dest"
+    (dest / "truth").mkdir(parents=True)
+    recompressed = dest / "truth" / "isd_conus_2024.nc"
+    _make_truth(seed=10).to_netcdf(
+        recompressed,
+        engine="h5netcdf",
+        encoding={"t2m": {"zlib": True, "complevel": 9}},
+    )
+    with xr.open_dataset(recompressed) as opened:
+        assert content_sha256(opened) == synthetic_env["truth_sha"]
+    assert hashlib.sha256(recompressed.read_bytes()).hexdigest() != expected_truth_file_sha
+
+    # Without --overwrite: must REFUSE (never report as verified or silently keep differing bytes).
+    with pytest.raises(fetcher.FetchError, match="different bytes"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=dest,
+            archive=archive_path,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_sha256=sha,
+        )
+    assert hashlib.sha256(recompressed.read_bytes()).hexdigest() != expected_truth_file_sha
+
+    # With --overwrite: atomically replaces with exact manifest bytes.
+    replaced = fetcher.fetch_scoring_data(
+        year=2024,
+        data_dir=dest,
+        archive=archive_path,
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        expected_sha256=sha,
+        overwrite=True,
+    )
+    assert "truth/isd_conus_2024.nc" in replaced["installed"]
+    assert hashlib.sha256(recompressed.read_bytes()).hexdigest() == expected_truth_file_sha
+
+    # Extra stray file planted inside an existing destination Zarr store is also refused without --overwrite.
+    stray = dest / "gate1" / "2024-01_h00-12" / "gefs.zarr" / "extra.txt"
+    stray.write_text("stray", encoding="utf-8")
+    with pytest.raises(fetcher.FetchError, match="different file inventory"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=dest,
+            archive=archive_path,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_sha256=sha,
+        )
+    fetcher.fetch_scoring_data(
+        year=2024,
+        data_dir=dest,
+        archive=archive_path,
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        expected_sha256=sha,
+        overwrite=True,
+    )
+    assert not stray.exists()
