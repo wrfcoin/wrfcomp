@@ -616,6 +616,15 @@ def test_comments_are_read_with_their_edit_record_and_bad_responses_fail(
             gate.fetch_comments("https://api.test/graphql", "o/r", 7, "secret-token")
 
 
+def test_graphql_address_defaults_to_the_api_address(monkeypatch: pytest.MonkeyPatch, api_env: None) -> None:
+    # Outside Actions there is no GITHUB_GRAPHQL_URL: the gate derives it from the API address.
+    api = FakeApi(files=[LOCKED_CHANGE], comments=[[approval()]], pulls=[pull(), pull()])
+    api.install(monkeypatch)
+    monkeypatch.delenv("GITHUB_GRAPHQL_URL")
+    assert gate.main() == 0
+    assert "graphql comments page 0" in api.seen
+
+
 def test_gate_fails_closed_on_incomplete_or_unreadable_facts(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     harmless = [{"filename": "docs/BASELINES.md"}]
     # GitHub says 5 files changed but listed 1: the locked change may be in the missing part
@@ -636,7 +645,8 @@ def test_gate_fails_closed_on_incomplete_or_unreadable_facts(monkeypatch: pytest
     assert "NOT APPROVED" in capsys.readouterr().out
     env = {"GH_TOKEN": "x", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "1", "EVENT_HEAD_SHA": HEAD}
     env["POLICY_SHA"] = BASE
-    for name, value in {**env, "GITHUB_API_URL": "http://127.0.0.1:1"}.items():
+    env.update(GITHUB_API_URL="http://127.0.0.1:1", GITHUB_GRAPHQL_URL="http://127.0.0.1:1/graphql")
+    for name, value in env.items():
         monkeypatch.setenv(name, value)
     assert gate.main() == 1
     assert "could not read the pull request" in capsys.readouterr().out
@@ -690,7 +700,10 @@ class FakeApi:
 def api_env(monkeypatch: pytest.MonkeyPatch) -> None:
     env = {"GH_TOKEN": "secret-token", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7", "EVENT_HEAD_SHA": HEAD}
     env["POLICY_SHA"] = BASE
-    for name, value in {**env, "GITHUB_API_URL": "https://api.test"}.items():
+    # Both API addresses are set: a GitHub Actions runner already has GITHUB_GRAPHQL_URL in its
+    # environment, and a test must never be pointed at the real API.
+    env.update(GITHUB_API_URL="https://api.test", GITHUB_GRAPHQL_URL="https://api.test/graphql")
+    for name, value in env.items():
         monkeypatch.setenv(name, value)
 
 
