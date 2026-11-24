@@ -654,7 +654,19 @@ def test_origin_and_lock_checks_look_at_the_given_root(base_world: dict, tmp_pat
 def test_evaluations_run_through_uv_locked_on_the_checked_tree(tmp_path: Path) -> None:
     command = tool._eval_command(ROOT, ["--help"])
     assert Path(command[0]).name == "uv"
-    assert command[1:] == ["run", "--locked", "--project", str(ROOT), "wrfcomp-eval", "--help"]
+    script = str(ROOT / "scripts" / "check_promotion.py")
+    assert command[1:] == [
+        "run",
+        "--locked",
+        "--project",
+        str(ROOT),
+        "python",
+        script,
+        "score-one",
+        str(ROOT),
+        "--help",
+    ]
+    assert "wrfcomp-eval" not in command  # the console command's target is set outside the lock
     # a real run of that command: a synthetic forecast scored by the locked environment of this tree
     world = build_world(tmp_path / "repo")
 
@@ -689,6 +701,37 @@ def test_evaluations_run_through_uv_locked_on_the_checked_tree(tmp_path: Path) -
     # the in-process stand-in used by the other tests writes the same bytes as the real command
     assert (tmp_path / "locked.json").read_bytes() == (tmp_path / "in-process.json").read_bytes()
     assert tool._run_eval(ROOT, ["--forecast", "nope.zarr"]) != 0
+
+
+def test_scoring_process_refuses_a_harness_that_is_not_under_the_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capfd: pytest.CaptureFixture
+) -> None:
+    # Regression: the parent used to check its own imports and then start the installed
+    # `wrfcomp-eval` command. Here the child process finds another `wrfcomp` first on its path: a
+    # stand-in evaluator that would write a card. The child must refuse before running it.
+    shadow = tmp_path / "shadow"
+    (shadow / "wrfcomp" / "harness").mkdir(parents=True)
+    marker = tmp_path / "stand-in-ran"
+    for name in ("align", "config", "hashing", "metrics", "schemas", "truth"):
+        (shadow / "wrfcomp" / "harness" / f"{name}.py").write_text("")
+    (shadow / "wrfcomp" / "__init__.py").write_text('__version__ = "0.1.0"\n')
+    (shadow / "wrfcomp" / "harness" / "__init__.py").write_text("")
+    (shadow / "wrfcomp" / "harness" / "evaluate.py").write_text(
+        f"from pathlib import Path\n\n\ndef app(args=None, standalone_mode=True):\n"
+        f"    Path({str(marker)!r}).write_text('ran')\n    return 0\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+    assert tool._run_eval(ROOT, ["--forecast", "x.zarr"]) == tool.EXIT_CHILD_REFUSED
+    assert not marker.exists()
+    err = capfd.readouterr().err
+    assert "the scoring process is not running the harness under" in err
+    assert f"wrfcomp.harness.evaluate is loaded from {shadow}" in err
+    monkeypatch.delenv("PYTHONPATH")
+
+    # the child checks against the root it is given, and `evaluate` turns its refusal into a refusal
+    assert tool.score_one(tmp_path, ["--help"]) == tool.EXIT_CHILD_REFUSED
+    assert tool.main(["score-one", str(tmp_path), "--help"]) == tool.EXIT_CHILD_REFUSED
+    capfd.readouterr()
 
 
 # --------------------------------------------------------------------------- the real repository

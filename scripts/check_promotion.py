@@ -14,8 +14,11 @@ the checkout this script is in:
   2. the two reference forecasts of the period are taken from the data directory, at the places
      named in the tree's `experiments/REFERENCES.json`, and refused unless their content hash is the
      pinned one;
-  3. `wrfcomp-eval` is run twice through `uv run --locked` on that tree, with its locked
-     `configs/splits.yaml`: the candidate against climatology and against NOAA GEFS;
+  3. the evaluation is run twice, with the tree's locked `configs/splits.yaml`: the candidate
+     against climatology and against NOAA GEFS. Each run is a separate process started with
+     `uv run --locked` on that tree. That process is this script again: it checks that the harness
+     it has imported is the one in the tree and then calls the harness entry point
+     (`wrfcomp.harness.evaluate.app`) directly, not the installed `wrfcomp-eval` command;
   4. the two scorecards are judged (rules below). They and `verdict.json` are written in a private
      directory made for the run and published as `<out>/promotion_<period>_<forecast hash>` at the
      end. File names are fixed by this program; the candidate's model id is data inside the files.
@@ -90,6 +93,8 @@ CONTEXT_KEYS = (
 SAME_CANDIDATE_KEYS = ("model_id", "model_version", "forecast_sha256")
 EXIT_NOT_PROMOTED = 1
 EXIT_REFUSED = 2
+EXIT_CHILD_REFUSED = 4  # the scoring process found that its harness is not the one under the root
+CHILD_MODE = "score-one"  # internal: `check_promotion.py score-one <root> <wrfcomp-eval arguments>`
 # Names this program gives the files of one run. Nothing from the candidate goes into a path.
 STAGED_NAMES = {"climatology": "candidate_vs_climatology.json", "noaa-gefs": "candidate_vs_noaa-gefs.json"}
 VERDICT_NAME = "verdict.json"
@@ -382,16 +387,65 @@ def _open_forecast(path: Path, what: str):
 
 
 def _eval_command(root: Path, args: list[str]) -> list[str]:
-    """`wrfcomp-eval` as installed from `root`, with the dependency versions of `root`'s uv.lock."""
+    """The scoring process for one evaluation.
+
+    It is this locked script, run by the interpreter of `root`'s locked environment, in its
+    `score-one` mode: the child itself checks that the harness it imports is the one under `root`
+    and then calls the harness entry point `wrfcomp.harness.evaluate.app` directly. The installed
+    `wrfcomp-eval` console command is not used: what that name runs is decided in pyproject.toml,
+    which is outside the lock.
+    """
     uv = shutil.which("uv")
     if uv is None:
         raise Refused("uv is not installed; evaluations run through `uv run --locked`")
-    return [uv, "run", "--locked", "--project", str(root), "wrfcomp-eval", *args]
+    script = root / "scripts" / "check_promotion.py"
+    return [
+        uv,
+        "run",
+        "--locked",
+        "--project",
+        str(root),
+        "python",
+        str(script),
+        CHILD_MODE,
+        str(root),
+        *args,
+    ]
 
 
 def _run_eval(root: Path, args: list[str]) -> int:
     environment = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}  # uv picks root's own
     return subprocess.run(_eval_command(root, args), cwd=root, env=environment, check=False).returncode
+
+
+def score_one(root: Path, args: list[str]) -> int:
+    """Body of the scoring process: verify where the harness comes from, then run its entry point.
+
+    Returns the exit code of `wrfcomp.harness.evaluate.app` (0 scored, 2 bad input, 3 NaN or
+    coverage rule), or EXIT_CHILD_REFUSED without scoring anything if any harness module of THIS
+    process is not a file under `root`.
+    """
+    import click
+
+    root = root.resolve()
+    try:
+        outside = _modules_outside_root(root)
+    except Exception as exc:  # a harness that cannot even be imported is not the locked one
+        outside = [f"the harness cannot be imported: {type(exc).__name__}: {exc}"]
+    if outside:
+        print(f"REFUSED: the scoring process is not running the harness under {root}:", file=sys.stderr)
+        for line in outside:
+            print(f"  {line}", file=sys.stderr)
+        return EXIT_CHILD_REFUSED
+    app = importlib.import_module("wrfcomp.harness.evaluate").app
+    try:
+        code = app(args=args, standalone_mode=False)
+    except click.exceptions.Exit as exc:
+        return int(exc.exit_code)
+    except click.ClickException as exc:
+        print(f"wrfcomp-eval: {exc.format_message()}", file=sys.stderr)
+        return int(exc.exit_code)
+    return int(code or 0)
 
 
 def _publish(staging: Path, out_dir: Path, name: str) -> Path:
@@ -414,8 +468,9 @@ def evaluate(forecast: Path, data_dir: Path, period: str, out_dir: Path, root: P
 
     Everything the verdict rests on comes from the one tree at `root`: the lock manifest and the
     tree it describes, the harness modules this process imports, the reference inventory, the
-    config, and the `wrfcomp-eval` that `uv run --locked --project root` starts. If any of them is
-    somewhere else, the call is refused.
+    config, and the harness entry point called by the scoring processes, which check their own
+    imports against `root` (see `_eval_command`). If any of them is somewhere else, the call is
+    refused.
 
     The two scorecards and `verdict.json` are written into a private directory made for this run,
     under names this program chooses, and published as `<out_dir>/promotion_<period>_<hash>` when
@@ -483,6 +538,8 @@ def evaluate(forecast: Path, data_dir: Path, period: str, out_dir: Path, root: P
             args += ["--model-id", model_id, "--model-version", model_version]
             args += ["--config", str(root / "configs" / "splits.yaml")]
             code = _run_eval(root, args)
+            if code == EXIT_CHILD_REFUSED:
+                raise Refused(f"the scoring process did not run the harness under {root}; nothing was scored")
             if code != 0 or not target.is_file():
                 target.unlink(missing_ok=True)
                 reasons.append(f"wrfcomp-eval refused the candidate against {name} (exit code {code})")
@@ -533,6 +590,11 @@ def main(argv: list[str] | None = None) -> int:
     look = modes.add_parser("verify", help="compare two existing scorecards with the pinned references")
     look.add_argument("scorecards", type=Path, nargs=2, metavar="SCORECARD")
     look.add_argument("--period", required=True, help="a period pinned in experiments/REFERENCES.json")
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == [CHILD_MODE]:  # internal mode, started by `evaluate` for each of its two evaluations
+        if len(argv) < 2:
+            parser.error(f"{CHILD_MODE} needs the root it scores for")
+        return score_one(Path(argv[1]), argv[2:])
     args = parser.parse_args(argv)
 
     try:

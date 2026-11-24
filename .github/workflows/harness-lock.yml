@@ -6,7 +6,7 @@ name: harness-lock
 # This workflow checks out nothing: it fetches its gate script from the same base commit through
 # the API and reads the pull request through the API. Code from the pull request is never run here.
 # It has no write permission and no shared concurrency group: each run judges the head it was
-# started for and nothing else.
+# started for, on the base commit its own policy was fetched from, and nothing else.
 #
 # Approval is a comment by the project owner naming the exact head commit. After the owner has
 # commented, run this check again (re-run the job, or add or remove any label on the pull request).
@@ -46,4 +46,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          POLICY_SHA: ${{ github.sha }}
         run: python3 "$RUNNER_TEMP/harness_lock_gate.py"

@@ -5,20 +5,33 @@ branch, and the workflow fetches THIS file from that same base commit through th
 the pull request is checked out or executed: the change under review cannot alter its own gate.
 
 Rule
-    A pull request that changes, adds, removes or renames a locked path passes only if an approver
-    listed below has posted a comment on the pull request whose whole first line is exactly
+    A pull request that changes, adds, removes or renames a locked path passes only if, at the time
+    this check runs, there is a comment on the pull request by an approver listed below whose whole
+    first line is exactly
 
         APPROVE-HARNESS-CHANGE <full 40-character sha of the pull request's current head commit>
 
-    and that comment has never been edited. The approval names the commit, so it needs no dates and
-    no label: after a new push the head is another commit and the old comment no longer matches.
+    and GitHub's edit record for that comment is empty (`lastEditedAt` is null and the creation
+    was not itself an edit). The approval names the commit, so it needs no dates and no label:
+    after a new push the head is another commit and the old comment no longer matches.
     A pull request that touches no locked path passes.
 
-    The pull request is read twice, before and after the file list and the comments are paged
-    through. If its head or base moved in between, or the head is not the one the run was started
-    for, the run fails, whatever the file list says.
+    The decision is about one head on one base, under one policy:
+      * the pull request is read twice, before and after the file list and the comments are paged
+        through; if its head or base moved in between, the run fails;
+      * the head must be the one the run was started for;
+      * the base must be the commit this policy file was fetched from (`POLICY_SHA`). A run, or a
+        re-run, whose policy is older or newer than the pull request's base fails: update the
+        pull request onto the current base branch and run again.
+    All three are checked before either way of passing.
 
-It fails closed: an API error or a file list GitHub cut off count as "not approved".
+    A file list that GitHub cut off is treated as touching the locked set: the pull request then
+    needs the owner's approval of its head like any locked change.
+
+    Approval is observed when the check runs. Editing or deleting the comment afterwards does not
+    start a new run and does not take back a result already given.
+
+An API error is "not approved".
 
 What this cannot do: tell the owner from an agent acting through the owner's GitHub account. See
 docs/HARNESS_LOCK.md. Standard library only. This workflow needs no write permission.
@@ -84,7 +97,11 @@ def approval_line(head_sha: str) -> str:
 
 
 def approving_comment(comments: list[dict], head_sha: str) -> tuple[dict | None, list[str]]:
-    """The comment that approves `head_sha`, if any, and notes on comments that came close."""
+    """The comment that approves `head_sha`, if any, and notes on comments that came close.
+
+    `comments` are in the form `fetch_comments` returns: body, url, login, type (GitHub's
+    `__typename` of the author), last_edited_at and includes_created_edit.
+    """
     wanted = approval_line(head_sha)
     notes: list[str] = []
     for comment in comments:
@@ -94,14 +111,18 @@ def approving_comment(comments: list[dict], head_sha: str) -> tuple[dict | None,
         first_line = body.split("\n", 1)[0].removesuffix("\r")
         if not first_line.startswith(APPROVAL_WORD):
             continue
-        user = comment.get("user") or {}
-        login, where = user.get("login"), comment.get("html_url") or f"comment {comment.get('id')}"
+        login, where = comment.get("login"), comment.get("url") or "a comment"
+        never_edited = (
+            "last_edited_at" in comment
+            and comment["last_edited_at"] is None
+            and comment.get("includes_created_edit") is False
+        )
         if first_line != wanted:
             notes.append(f"{where}: first line is not exactly the approval of this head")
-        elif login not in APPROVERS or user.get("type") != "User":
+        elif login not in APPROVERS or comment.get("type") != "User":
             notes.append(f"{where}: written by {login!r}, who is not an approver")
-        elif not comment.get("created_at") or comment.get("created_at") != comment.get("updated_at"):
-            notes.append(f"{where}: the comment was edited after it was posted")
+        elif not never_edited:
+            notes.append(f"{where}: GitHub records an edit of this comment (or no edit record at all)")
         else:
             return comment, notes
     return None, notes
@@ -114,11 +135,13 @@ def decide(
     files: list[dict],
     comments: list[dict],
     event_head_sha: str,
+    policy_sha: str,
 ) -> tuple[bool, list[str]]:
     """Return (passes, lines to print). Pure: all GitHub data is passed in.
 
     `pull_before` is the pull request as read before the file list and the comments were fetched,
-    `pull_after` as read after. The decision is about one commit: the head both of them name.
+    `pull_after` as read after. `policy_sha` is the base-branch commit this policy was fetched
+    from. The decision is about one head on one base under that policy.
     """
     lines: list[str] = []
     head, base = _sha(pull_after, "head"), _sha(pull_after, "base")
@@ -137,7 +160,12 @@ def decide(
         )
     if event_head_sha != head:
         return refuse(f"this run was started for head {event_head_sha}, the pull request is now at {head}")
-    lines.append(f"Evaluated head {head} on base {base}.")
+    if policy_sha != base:
+        return refuse(
+            f"this run's policy comes from base-branch commit {policy_sha}, but the pull request's base is "
+            f"{base}. Update the pull request onto the current base branch, then run the check again"
+        )
+    lines.append(f"Evaluated head {head} on base {base}, with the policy of that base.")
 
     declared = pull_after.get("changed_files")
     paths = changed_paths(files)
@@ -145,7 +173,7 @@ def decide(
     if not isinstance(declared, int) or declared != len(files) or declared >= MAX_LISTED_FILES:
         lines.append(
             f"GitHub reports {declared!r} changed files but listed {len(files)}; the list may be cut off. "
-            "Treating the pull request as touching the locked harness."
+            "It is treated as touching the locked harness: it needs the owner's approval of this head."
         )
         locked = locked or ["<file list incomplete>"]
     if not locked:
@@ -165,8 +193,8 @@ def decide(
         lines.append("Then run this check again. A new push needs a new comment. See docs/HARNESS_LOCK.md.")
         return refuse(f"no approval comment for head {head}")
     lines.append(
-        f"APPROVED: {comment['user']['login']} approved head {head} in "
-        f"{comment.get('html_url') or 'comment ' + str(comment.get('id'))}."
+        f"APPROVED: {comment['login']} approved head {head} in {comment.get('url') or 'a comment'} "
+        "(as seen now; a later edit or deletion of the comment does not re-run this check)."
     )
     return True, lines
 
@@ -208,6 +236,69 @@ def get_all(url: str, token: str) -> list[dict]:
     return out
 
 
+COMMENTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { url body lastEditedAt includesCreatedEdit author { __typename login } }
+      }
+    }
+  }
+}
+"""
+
+
+def _graphql(url: str, token: str, query: str, variables: dict) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "harness-lock-gate",
+        },
+        method="POST",  # GraphQL reads are POST requests; this query changes nothing
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    if not isinstance(body, dict) or body.get("errors") or not isinstance(body.get("data"), dict):
+        raise ValueError(f"unexpected GraphQL response: {str(body)[:200]}")
+    return body["data"]
+
+
+def fetch_comments(graphql_url: str, repository: str, number: int, token: str) -> list[dict]:
+    """Every conversation comment of the pull request, with GitHub's own edit record for each."""
+    owner, name = repository.split("/", 1)
+    out: list[dict] = []
+    cursor: str | None = None
+    for _ in range(200):
+        variables = {"owner": owner, "name": name, "number": number, "cursor": cursor}
+        data = _graphql(graphql_url, token, COMMENTS_QUERY, variables)
+        try:
+            page = data["repository"]["pullRequest"]["comments"]
+            nodes, info = page["nodes"], page["pageInfo"]
+            for node in nodes:
+                author = node.get("author") or {}
+                out.append(
+                    {
+                        "url": node["url"],
+                        "body": node["body"],
+                        "login": author.get("login"),
+                        "type": author.get("__typename"),
+                        "last_edited_at": node["lastEditedAt"],
+                        "includes_created_edit": node["includesCreatedEdit"],
+                    }
+                )
+            if not info["hasNextPage"]:
+                return out
+            cursor = info["endCursor"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError(f"unexpected GraphQL response shape: {exc}") from exc
+    raise ValueError("too many pages of comments")
+
+
 def _pull(base_url: str, number: int, token: str) -> dict:
     pull, _ = _get(f"{base_url}/pulls/{number}", token)
     if not isinstance(pull, dict):
@@ -221,11 +312,13 @@ def main() -> int:
         repository = os.environ["GITHUB_REPOSITORY"]
         number = int(os.environ["PR_NUMBER"])
         event_head_sha = os.environ["EVENT_HEAD_SHA"]
+        policy_sha = os.environ["POLICY_SHA"]
         api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+        graphql_url = os.environ.get("GITHUB_GRAPHQL_URL", f"{api}/graphql")
         base_url = f"{api}/repos/{repository}"
         pull_before = _pull(base_url, number, token)
         files = get_all(f"{base_url}/pulls/{number}/files?per_page=100", token)
-        comments = get_all(f"{base_url}/issues/{number}/comments?per_page=100", token)
+        comments = fetch_comments(graphql_url, repository, number, token)
         pull_after = _pull(base_url, number, token)  # read again: the snapshot must not have moved
         passes, lines = decide(
             pull_before=pull_before,
@@ -233,6 +326,7 @@ def main() -> int:
             files=files,
             comments=comments,
             event_head_sha=event_head_sha,
+            policy_sha=policy_sha,
         )
     except (KeyError, ValueError, OSError, urllib.error.URLError) as exc:
         # Fail closed: without the facts there is no approval.

@@ -377,15 +377,16 @@ def pull(*, changed_files: int = 1, head: str = HEAD, base: str = BASE) -> dict:
 
 
 def comment(
-    body: str, *, login: str = OWNER, kind: str = "User", edited: bool = False, number: int = 1
+    body: str, *, login: str | None = OWNER, kind: str = "User", edited: bool = False, number: int = 1
 ) -> dict:
+    """A conversation comment in the form `gate.fetch_comments` returns."""
     return {
-        "id": number,
-        "html_url": f"https://github.test/pr/1#issuecomment-{number}",
+        "url": f"https://github.test/pr/1#issuecomment-{number}",
         "body": body,
-        "user": {"login": login, "type": kind},
-        "created_at": T1,
-        "updated_at": T2 if edited else T1,
+        "login": login,
+        "type": kind,
+        "last_edited_at": T2 if edited else None,
+        "includes_created_edit": False,
     }
 
 
@@ -397,6 +398,7 @@ def decide(files: list[dict], comments: list[dict], **kwargs) -> tuple[bool, str
     kwargs.setdefault("pull_before", pull(changed_files=len(files)))
     kwargs.setdefault("pull_after", kwargs["pull_before"])
     kwargs.setdefault("event_head_sha", HEAD)
+    kwargs.setdefault("policy_sha", BASE)
     passes, lines = gate.decide(files=files, comments=comments, **kwargs)
     return passes, "\n".join(lines)
 
@@ -412,7 +414,8 @@ HARMLESS = [
 def test_gate_passes_a_pull_request_that_touches_nothing_locked() -> None:
     passes, text = decide(HARMLESS, [])
     assert passes and "No locked path" in text
-    assert f"Evaluated head {HEAD} on base {BASE}." in text  # the verdict names the commit it is about
+    # the verdict names the commit it is about and the base whose policy judged it
+    assert f"Evaluated head {HEAD} on base {BASE}, with the policy of that base." in text
 
 
 @pytest.mark.parametrize(
@@ -521,7 +524,14 @@ def test_only_an_unedited_comment_by_the_owner_account_approves() -> None:
         passes, text = decide(LOCKED_CHANGE, [approval(login=login, kind=kind)])
         assert not passes and "is not an approver" in text, (login, kind)
     passes, text = decide(LOCKED_CHANGE, [approval(edited=True)])
-    assert not passes and "was edited after it was posted" in text
+    assert not passes and "GitHub records an edit of this comment" in text
+    # GitHub's edit record must be there and empty: a creation that was itself an edit, or a comment
+    # record without the edit fields, does not approve
+    assert not decide(LOCKED_CHANGE, [{**approval(), "includes_created_edit": True}])[0]
+    assert not decide(LOCKED_CHANGE, [{**approval(), "includes_created_edit": None}])[0]
+    without_record = {k: v for k, v in approval().items() if k != "last_edited_at"}
+    assert not decide(LOCKED_CHANGE, [without_record])[0]
+    assert not decide(LOCKED_CHANGE, [{**approval(), "last_edited_at": ""}])[0]
     # someone else's attempt does not spoil the owner's approval, in either order
     stranger = approval(login="someone-else", number=2)
     assert decide(LOCKED_CHANGE, [stranger, approval(number=3)])[0]
@@ -530,7 +540,7 @@ def test_only_an_unedited_comment_by_the_owner_account_approves() -> None:
     broken = [
         {"body": None},
         {"body": f"{gate.APPROVAL_WORD} {HEAD}"},
-        {"body": f"{gate.APPROVAL_WORD} {HEAD}", "user": {}},
+        {"body": f"{gate.APPROVAL_WORD} {HEAD}", "login": OWNER},
     ]
     assert not decide(LOCKED_CHANGE, broken)[0]
     # a label plays no part: with or without one, the answer is the same
@@ -563,6 +573,49 @@ def test_gate_fails_if_the_pull_request_moved_while_it_was_read() -> None:
         assert not passes and "NOT APPROVED" in text
 
 
+def test_gate_applies_only_the_policy_of_the_base_being_judged(
+    monkeypatch: pytest.MonkeyPatch, api_env: None, capsys
+) -> None:
+    older, newer = "9" * 40, "8" * 40
+    # A re-run of an old run carries the old policy commit while the pull request now sits on a newer
+    # base (or the other way round). Neither way of passing is open: not "nothing locked", not "approved".
+    for files, comments in ((HARMLESS, []), (LOCKED_CHANGE, [approval()])):
+        assert decide(files, comments)[0]  # same base and policy: passes
+        for policy in (older, newer, "", BASE[:39]):
+            passes, text = decide(files, comments, policy_sha=policy)
+            assert not passes and "Update the pull request onto the current base branch" in text, policy
+            assert "No locked path" not in text
+            assert not any(line.startswith("APPROVED:") for line in text.splitlines())
+    # through the command: the policy commit comes from the environment the workflow sets
+    api = FakeApi(files=[HARMLESS], comments=[[]], pulls=[pull(changed_files=3), pull(changed_files=3)])
+    api.install(monkeypatch)
+    assert gate.main() == 0
+    monkeypatch.setenv("POLICY_SHA", older)
+    api = FakeApi(files=[HARMLESS], comments=[[]], pulls=[pull(changed_files=3), pull(changed_files=3)])
+    api.install(monkeypatch)
+    assert gate.main() == 1
+    assert f"policy comes from base-branch commit {older}" in capsys.readouterr().out
+    monkeypatch.delenv("POLICY_SHA")
+    assert gate.main() == 1  # no policy commit given: not approved
+
+
+def test_comments_are_read_with_their_edit_record_and_bad_responses_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = FakeApi(files=[], comments=[[approval(number=1)], [approval(edited=True, number=2)]], pulls=[])
+    api.install(monkeypatch)
+    got = gate.fetch_comments("https://api.test/graphql", "o/r", 7, "secret-token")
+    assert got == [approval(number=1), approval(edited=True, number=2)]
+    assert got[0]["last_edited_at"] is None and got[1]["last_edited_at"] == T2
+    deleted_author = FakeApi(files=[], comments=[[approval(login=None)]], pulls=[])
+    deleted_author.install(monkeypatch)
+    assert gate.fetch_comments("https://api.test/graphql", "o/r", 7, "secret-token")[0]["login"] is None
+    for bad in ({}, {"repository": None}, {"repository": {"pullRequest": {"comments": {"nodes": [{}]}}}}):
+        monkeypatch.setattr(gate, "_graphql", lambda *a, bad=bad: bad)
+        with pytest.raises(ValueError, match="unexpected GraphQL response shape"):
+            gate.fetch_comments("https://api.test/graphql", "o/r", 7, "secret-token")
+
+
 def test_gate_fails_closed_on_incomplete_or_unreadable_facts(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     harmless = [{"filename": "docs/BASELINES.md"}]
     # GitHub says 5 files changed but listed 1: the locked change may be in the missing part
@@ -577,11 +630,12 @@ def test_gate_fails_closed_on_incomplete_or_unreadable_facts(monkeypatch: pytest
     many = [{"filename": f"docs/{i}.md"} for i in range(gate.MAX_LISTED_FILES)]
     assert not decide(many, [])[0]
     # the command itself: no environment, or an API that cannot be reached
-    for name in ("GH_TOKEN", "PR_NUMBER", "EVENT_HEAD_SHA"):
+    for name in ("GH_TOKEN", "PR_NUMBER", "EVENT_HEAD_SHA", "POLICY_SHA"):
         monkeypatch.delenv(name, raising=False)
     assert gate.main() == 1
     assert "NOT APPROVED" in capsys.readouterr().out
     env = {"GH_TOKEN": "x", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "1", "EVENT_HEAD_SHA": HEAD}
+    env["POLICY_SHA"] = BASE
     for name, value in {**env, "GITHUB_API_URL": "http://127.0.0.1:1"}.items():
         monkeypatch.setenv(name, value)
     assert gate.main() == 1
@@ -592,11 +646,8 @@ class FakeApi:
     """Stands in for the GitHub API. The pull request can change between the first and second read."""
 
     def __init__(self, *, files: list[list[dict]], comments: list[list[dict]], pulls: list[dict]) -> None:
-        self.pulls, self.seen = list(pulls), []
-        self.pages = {
-            "/repos/o/r/pulls/7/files?per_page=100": files,
-            "/repos/o/r/issues/7/comments?per_page=100": comments,
-        }
+        self.pulls, self.seen, self.comments = list(pulls), [], comments
+        self.pages = {"/repos/o/r/pulls/7/files?per_page=100": files}
 
     def get(self, url: str, token: str):
         assert token == "secret-token"
@@ -610,10 +661,35 @@ class FakeApi:
         nxt = f"https://api.test{base}#page{index + 1}" if index + 1 < len(pages) else None
         return pages[index], nxt
 
+    def graphql(self, url: str, token: str, query: str, variables: dict) -> dict:
+        assert token == "secret-token" and url == "https://api.test/graphql"
+        assert "lastEditedAt" in query and "includesCreatedEdit" in query and "mutation" not in query
+        assert (variables["owner"], variables["name"], variables["number"]) == ("o", "r", 7)
+        index = int(variables["cursor"] or 0)
+        self.seen.append(f"graphql comments page {index}")
+        nodes = [
+            {
+                "url": c["url"],
+                "body": c["body"],
+                "lastEditedAt": c["last_edited_at"],
+                "includesCreatedEdit": c["includes_created_edit"],
+                "author": {"login": c["login"], "__typename": c["type"]} if c["login"] else None,
+            }
+            for c in self.comments[index]
+        ]
+        more = index + 1 < len(self.comments)
+        info = {"hasNextPage": more, "endCursor": str(index + 1) if more else None}
+        return {"repository": {"pullRequest": {"comments": {"pageInfo": info, "nodes": nodes}}}}
+
+    def install(self, patch: pytest.MonkeyPatch) -> None:
+        patch.setattr(gate, "_get", self.get)
+        patch.setattr(gate, "_graphql", self.graphql)
+
 
 @pytest.fixture
 def api_env(monkeypatch: pytest.MonkeyPatch) -> None:
     env = {"GH_TOKEN": "secret-token", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7", "EVENT_HEAD_SHA": HEAD}
+    env["POLICY_SHA"] = BASE
     for name, value in {**env, "GITHUB_API_URL": "https://api.test"}.items():
         monkeypatch.setenv(name, value)
 
@@ -627,17 +703,17 @@ def test_gate_main_pages_through_files_and_comments_and_reads_the_pull_twice(
         comments=[[comment("nice work")], [approval(number=2)]],
         pulls=[pull(changed_files=2), pull(changed_files=2)],
     )
-    monkeypatch.setattr(gate, "_get", api.get)
+    api.install(monkeypatch)
     assert gate.main() == 0
     out = capsys.readouterr().out
     assert f"APPROVED: {OWNER} approved head {HEAD}" in out and "secret-token" not in out
     assert api.seen[0] == api.seen[-1] == "/repos/o/r/pulls/7"  # read before and after paging
-    assert sum("#page1" in key for key in api.seen) == 2
+    assert sum("#page1" in key for key in api.seen) == 1 and "graphql comments page 1" in api.seen
     assert api.pulls == []
 
     # the same pull request without the approval comment
     api = FakeApi(files=[LOCKED_CHANGE], comments=[[comment("nice work")]], pulls=[pull(), pull()])
-    monkeypatch.setattr(gate, "_get", api.get)
+    api.install(monkeypatch)
     assert gate.main() == 1
     assert f"{gate.APPROVAL_WORD} {HEAD}" in capsys.readouterr().out
 
@@ -649,12 +725,12 @@ def test_gate_main_fails_when_a_push_lands_between_the_two_reads(
     # The file list already shows nothing locked, so only the second read can catch it.
     for second in (pull(head="d" * 40, changed_files=3), pull(base="e" * 40, changed_files=3)):
         api = FakeApi(files=[HARMLESS], comments=[[]], pulls=[pull(changed_files=3), second])
-        monkeypatch.setattr(gate, "_get", api.get)
+        api.install(monkeypatch)
         assert gate.main() == 1
         assert "moved while it was being read" in capsys.readouterr().out
     # and an approval of the old head does not carry over to a head pushed during the run
     api = FakeApi(files=[LOCKED_CHANGE], comments=[[approval()]], pulls=[pull(), pull(head="d" * 40)])
-    monkeypatch.setattr(gate, "_get", api.get)
+    api.install(monkeypatch)
     assert gate.main() == 1
 
 
@@ -716,7 +792,8 @@ def test_approval_workflow_runs_from_the_base_branch_reads_only_and_never_checks
     assert "contents/.github/harness_lock_gate.py?ref=${WORKFLOW_SHA}" in fetch["run"]
     assert fetch["env"]["WORKFLOW_SHA"] == "${{ github.sha }}"  # the base commit the workflow came from
     assert run["env"]["EVENT_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
-    assert set(run["env"]) == {"GH_TOKEN", "PR_NUMBER", "EVENT_HEAD_SHA"}
+    assert run["env"]["POLICY_SHA"] == "${{ github.sha }}"  # the same commit the policy was fetched from
+    assert set(run["env"]) == {"GH_TOKEN", "PR_NUMBER", "EVENT_HEAD_SHA", "POLICY_SHA"}
 
 
 def test_ci_workflow_keeps_only_the_hash_check_lint_and_tests() -> None:

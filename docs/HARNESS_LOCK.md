@@ -62,12 +62,24 @@ APPROVE-HARNESS-CHANGE <full 40-character sha of the pull request's current head
 
 - The approval names the commit. After a new push the head is a different commit, so the old comment no longer
   matches and a new one is needed. No dates and no label are involved.
-- The comment must come from the owner's account, be a normal user comment (not a bot's), and never have been
-  edited. Anything after the first line is free text.
-- The gate reads the pull request before and after it pages through the files and the comments. If the head or
-  the base moved in between, or the head is not the one the run was started for, it fails, whatever the file
-  list says. It prints the head and base it evaluated.
-- It fails closed: an API error or a file list GitHub cut off count as not approved.
+- The comment must come from the owner's account and be a normal user comment (not a bot's), and GitHub's own
+  edit record for it must be empty (`lastEditedAt` is null and the creation was not itself an edit; read
+  through the GraphQL API). Anything after the first line is free text.
+- **Approval is observed when the check runs.** If the comment is edited or deleted after a green run, no new
+  run starts and the earlier result stands. The gate does not revoke.
+- The decision is about one head, on one base, under one policy, and all three are checked before either way
+  of passing ("nothing locked" or "approved"):
+  - the pull request is read before and after the files and the comments are paged through; if its head or
+    base moved in between, the run fails;
+  - the head must be the one the run was started for;
+  - the pull request's base commit must be the base-branch commit the policy was fetched from. A re-run of an
+    old run cannot apply an older policy to a newer base. In practice this means **a pull request whose base
+    is behind the base branch fails `harness-lock` until it is updated onto the current base branch**, whether
+    or not it touches a locked path.
+- It prints the head and base it evaluated.
+- A file list that GitHub cut off (more files than the API lists) is **treated as touching the locked set**:
+  such a pull request needs the owner's approval of its head like any locked change. It does not fail outright.
+- An API error is "not approved".
 
 A comment does not start a new run of this check. After commenting, the owner re-runs the `harness-lock` job,
 or adds or removes any label on the pull request, which starts a run. The label
@@ -84,12 +96,16 @@ Everything the verdict rests on comes from one tree, the checkout the script is 
 
 - that tree must pass check 1, and the harness modules the running Python has imported must be files of that
   tree (a harness installed from somewhere else is refused);
-- the reference inventory and the config are read from that tree, and `wrfcomp-eval` is started with
-  `uv run --locked` on that tree, so the dependency versions are the ones in its `uv.lock`;
+- the reference inventory and the config are read from that tree;
+- each of the two evaluations runs in its own process, started with `uv run --locked` on that tree (so the
+  dependency versions are the ones in its `uv.lock`). That process is the locked script itself: it checks
+  that the harness modules *it* has imported are files of the tree, refuses otherwise, and then calls the
+  harness entry point `wrfcomp.harness.evaluate.app` directly. The installed `wrfcomp-eval` console command
+  is not used, because what that name runs is set in `pyproject.toml`, which is not locked;
 - the two reference forecasts of the period are taken from the places named in `experiments/REFERENCES.json`
   under the data directory, and a store whose content hash is not the pinned one is refused.
 
-It then runs `wrfcomp-eval` twice itself and judges the two scorecards it has just produced:
+It then judges the two scorecards those processes produced:
 
 - each validates as a harness scorecard, has all five primary variables, and its gates and `passed_gate` are
   what the harness computes from its own metrics;
@@ -126,8 +142,13 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
   before merging for the `test` result to describe what lands.
 - **The pull request that introduces or changes the gate is not judged by the new gate.** `harness-lock` runs
   the base branch's version. The first installation, and any later change to the gate, is reviewed by people.
-- **A comment does not re-run the check.** Until someone re-runs it, the check shows the result from before
-  the approval. That delays a merge; it cannot let one through.
+- **A comment does not re-run the check, and neither does editing or deleting one.** Until someone re-runs
+  it, the check shows the result from before the approval, which delays a merge. In the other direction, an
+  approval withdrawn after a green run leaves that green result in place: approval is a fact at check time,
+  not a standing condition.
+- **`pyproject.toml` is not locked.** The promotion check does not go through the console command it
+  defines, but anyone who runs `wrfcomp-eval` by name from a shell runs whatever `pyproject.toml` points
+  it at.
 - **No isolated, artifact-pinned runtime.** `evaluate` checks that the harness modules it imports are files
   of the locked tree and runs the evaluations with `uv run --locked`, which pins dependency *versions*. It
   does not verify the installed packages byte for byte, and it does not run in a clean container built from
