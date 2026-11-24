@@ -15,10 +15,15 @@ The privacy rules are those of :mod:`wrfcomp.assimilation.citizen_obs`, by const
 
 Arrival time (Amendment 1 of ``docs/PHASE3_DESIGN.md``). A record is kept only if it was both measured
 and received at or before the first issue time (00Z or 12Z) at or after its measurement. That is
-decided on the archive's own timestamps, at their full precision, **before** repeated records are
-merged and before any time is converted: a late repeat of a report can therefore never displace the
-timely one, and nothing that arrived after an issue time is in a table at all. Stored times are rounded
-up to the whole second, which cannot move a time to or before an issue time it was after.
+decided on the archive's own timestamps, **before** repeated records are merged: a late repeat of a
+report can never displace the timely one, and nothing that arrived after an issue time is in a table.
+
+Timestamps keep their precision. Measurement and arrival times are stored as whole nanoseconds
+(:func:`seconds_to_ns`), which keeps every archive timestamp distinct and on the same side of every
+whole second, so the arrival test and the 15-minute window give the same answer on stored times as on
+the archive's. Two records are the same report only if their measurement times are exactly equal.
+Which version of a report is kept does not depend on the order of the records: the one that arrived
+last, and among those the one with the largest content key.
 """
 
 from __future__ import annotations
@@ -42,9 +47,11 @@ from .citizen_obs import (
 
 CONUS_BOX = (24.5, -125.0, 49.5, -66.5)  # lat south, lon west, lat north, lon east
 ISSUE_STEP_S = 12 * 3600  # issue times are 00Z and 12Z
+ISSUE_STEP_NS = ISSUE_STEP_S * 10**9
 # Written into every stored table. A file without exactly this text is refused on load.
 ARRIVAL_POLICY = (
-    "amendment-1.v2: measured and received at or before the first 00Z/12Z at or after measurement"
+    "amendment-1.v3: measured and received at or before the first 00Z/12Z at or after measurement; "
+    "nanosecond times"
 )
 # Archive name -> (table column, required ``units`` attribute).
 VALUE_FIELDS = {
@@ -54,6 +61,7 @@ VALUE_FIELDS = {
     "windDir": ("wind_dir", "degree"),
 }
 VALUE_COLUMNS = tuple(column for column, _ in VALUE_FIELDS.values())
+CONTENT_COLUMNS = (*VALUE_COLUMNS, "lat", "lon", "elevation_m")
 _SEALED_MESSAGE = "refusing observation at or after the sealed split start"
 _MISSING_ABOVE = 1e30
 _MISSING_BELOW = -9000.0
@@ -67,10 +75,21 @@ class StaleTableError(ValueError):
     """A stored table was not written under the current arrival policy."""
 
 
+def seconds_to_ns(seconds) -> np.ndarray:
+    """Archive seconds (float64) to whole nanoseconds, without moving a time across a whole second.
+
+    The whole seconds are converted exactly; the fraction is rounded up to the nanosecond. A time
+    after a whole second stays after it, a time before stays before, and distinct archive timestamps
+    stay distinct (float64 seconds near today resolve about 240 ns).
+    """
+    seconds = np.asarray(seconds, dtype=np.float64)
+    whole = np.floor(seconds)
+    return whole.astype(np.int64) * 10**9 + np.ceil((seconds - whole) * 1e9).astype(np.int64)
+
+
 def arrived_by_next_issue(measured_s, received_s) -> np.ndarray:
-    """Amendment 1. True where a report was received at or before the first issue time at or after
-    its measurement. Works on the archive's float seconds and on stored whole seconds alike; a
-    missing time is never eligible."""
+    """Amendment 1 on the archive's float seconds. True where a report was received at or before the
+    first issue time at or after its measurement. A missing time is never eligible."""
     measured = np.asarray(measured_s, dtype=np.float64)
     received = np.asarray(received_s, dtype=np.float64)
     with np.errstate(invalid="ignore"):
@@ -78,12 +97,20 @@ def arrived_by_next_issue(measured_s, received_s) -> np.ndarray:
         return np.isfinite(measured) & np.isfinite(received) & (received <= next_issue)
 
 
+def arrived_by_next_issue_ns(measured_ns, received_ns) -> np.ndarray:
+    """The same test on stored nanosecond times (exact integer arithmetic)."""
+    measured = np.asarray(measured_ns).astype(np.int64)
+    received = np.asarray(received_ns).astype(np.int64)
+    return received <= -(-measured // ISSUE_STEP_NS) * ISSUE_STEP_NS
+
+
 @dataclass(frozen=True, repr=False)
 class ReportTable:
     """One row per (station, measurement time). Array contents are omitted from repr."""
 
     station_id: np.ndarray  # U11 keyed tokens
-    obs_time: np.ndarray  # datetime64[s], UTC, measurement time rounded up to the second
+    obs_time: np.ndarray  # datetime64[ns], UTC, measurement time
+    received_time: np.ndarray  # datetime64[ns], UTC, arrival time
     lat: np.ndarray  # float32, 0.1 degree
     lon: np.ndarray  # float32, 0.1 degree
     elevation_m: np.ndarray  # float32, 10 m
@@ -91,19 +118,16 @@ class ReportTable:
     td2m: np.ndarray  # float32 K
     wind_speed: np.ndarray  # float32 m/s
     wind_dir: np.ndarray  # float32 degrees, direction the wind comes from
-    received_delay_s: np.ndarray  # int32: arrival (rounded up to the second) minus obs_time
 
     def __len__(self) -> int:
         return len(self.station_id)
-
-    def received_time_s(self) -> np.ndarray:
-        return self.obs_time.astype("datetime64[s]").astype(np.int64) + self.received_delay_s.astype(np.int64)
 
 
 def empty_table() -> ReportTable:
     return ReportTable(
         station_id=np.empty(0, dtype="U11"),
-        obs_time=np.empty(0, dtype="datetime64[s]"),
+        obs_time=np.empty(0, dtype="datetime64[ns]"),
+        received_time=np.empty(0, dtype="datetime64[ns]"),
         lat=np.empty(0, dtype=np.float32),
         lon=np.empty(0, dtype=np.float32),
         elevation_m=np.empty(0, dtype=np.float32),
@@ -111,23 +135,32 @@ def empty_table() -> ReportTable:
         td2m=np.empty(0, dtype=np.float32),
         wind_speed=np.empty(0, dtype=np.float32),
         wind_dir=np.empty(0, dtype=np.float32),
-        received_delay_s=np.empty(0, dtype=np.int32),
     )
 
 
-def latest_arrival_rows(station, obs_time_s, received_s) -> np.ndarray:
-    """Row indices, one per (station, time): the version that arrived last; on a tie, the later row.
+def latest_version_rows(station, obs_ns, received_ns, content) -> np.ndarray:
+    """Row indices, one per (station, exact measurement time), sorted by station and time.
 
-    Every row passed in is already eligible, so whichever version is kept had arrived by the issue
-    time, and so had the ones it replaces. Result is sorted by station, then time.
+    Of several versions of one report the one that arrived last is kept; among versions that arrived
+    at the same instant, the one whose content (``content``: the value and position columns, in a
+    fixed order) sorts last, with a missing value sorting first. The choice depends on the records
+    only, never on the order they came in. Every row passed in has already passed the arrival test,
+    so the version kept had arrived in time, and so had the ones it replaces.
     """
     station = np.asarray(station)
-    obs = np.asarray(obs_time_s).astype(np.int64)
-    received = np.asarray(received_s).astype(np.int64)
-    order = np.lexsort((np.arange(station.size), received, obs, station))
+    obs = np.asarray(obs_ns).astype(np.int64)
+    received = np.asarray(received_ns).astype(np.int64)
+    if not station.size:
+        return np.empty(0, dtype=np.int64)
+    keys = [np.where(np.isnan(c), -np.inf, c) for c in (np.asarray(c, dtype=np.float64) for c in content)]
+    order = np.lexsort((*reversed(keys), received, obs, station))
     s, t = station[order], obs[order]
-    last = np.r_[(s[1:] != s[:-1]) | (t[1:] != t[:-1]), True] if station.size else np.empty(0, bool)
+    last = np.r_[(s[1:] != s[:-1]) | (t[1:] != t[:-1]), True]
     return order[last]
+
+
+def _content(columns: dict) -> list:
+    return [columns[name] for name in CONTENT_COLUMNS]
 
 
 def _text_column(nc: netcdf_file, name: str) -> np.ndarray:
@@ -215,7 +248,7 @@ def parse_archive_hour(
             raise ValueError(_SEALED_MESSAGE)
         start_s = float(np.datetime64(not_before, "s").astype(np.int64))
         in_year = readable & (measured >= start_s)
-        # The arrival rule, on the source timestamps, before repeats are merged or times converted.
+        # The arrival rule, on the source timestamps, before repeats are merged.
         ok = in_year & arrived_by_next_issue(measured, received)
     if counts is not None:
         for name, n in (
@@ -227,11 +260,11 @@ def parse_archive_hour(
     if not ok.any():
         return empty_table()
     raw_id, lat, lon, elev, measured, received = (a[ok] for a in (raw_id, lat, lon, elev, measured, received))
-    values = {column: a[ok] for column, a in values.items()}
-
-    # Rounded up: a time after an issue time stays after it.
-    obs_s = np.ceil(measured).astype(np.int64)
-    received_s = np.ceil(received).astype(np.int64)
+    columns = {column: a[ok].astype(np.float32) for column, a in values.items()}
+    columns["lat"] = np.round(lat, COORD_DECIMALS).astype(np.float32)
+    columns["lon"] = np.round(lon, COORD_DECIMALS).astype(np.float32)
+    columns["elevation_m"] = (np.round(elev / ELEVATION_STEP_M) * ELEVATION_STEP_M).astype(np.float32)
+    obs_ns, received_ns = seconds_to_ns(measured), seconds_to_ns(received)
 
     cache = token_cache if token_cache is not None else {}
     unique, inverse = np.unique(raw_id, return_inverse=True)
@@ -243,33 +276,30 @@ def parse_archive_hour(
         tokens[j] = token
     station = tokens[inverse]
 
-    pick = latest_arrival_rows(station, obs_s, received_s)
+    pick = latest_version_rows(station, obs_ns, received_ns, _content(columns))
     if counts is not None:
         counts["repeats_merged"] = counts.get("repeats_merged", 0) + int(station.size - pick.size)
     return ReportTable(
         station_id=station[pick],
-        obs_time=obs_s[pick].astype("datetime64[s]"),
-        lat=np.round(lat[pick], COORD_DECIMALS).astype(np.float32),
-        lon=np.round(lon[pick], COORD_DECIMALS).astype(np.float32),
-        elevation_m=(np.round(elev[pick] / ELEVATION_STEP_M) * ELEVATION_STEP_M).astype(np.float32),
-        received_delay_s=(received_s[pick] - obs_s[pick]).astype(np.int32),
-        **{column: a[pick].astype(np.float32) for column, a in values.items()},
+        obs_time=obs_ns[pick].astype("datetime64[ns]"),
+        received_time=received_ns[pick].astype("datetime64[ns]"),
+        **{name: a[pick] for name, a in columns.items()},
     )
 
 
 def merge_tables(tables: list[ReportTable]) -> ReportTable:
-    """Concatenate; of a repeated (station, time) keep the version that arrived last; sort."""
+    """Concatenate; of the versions of one report keep one (see :func:`latest_version_rows`); sort."""
     tables = [t for t in tables if len(t)]
     if not tables:
         return empty_table()
     columns = {f.name: np.concatenate([getattr(t, f.name) for t in tables]) for f in fields(ReportTable)}
     if np.any(columns["obs_time"] >= SEALED_START):
         raise ValueError(_SEALED_MESSAGE)
-    obs = columns["obs_time"].astype("datetime64[s]").astype(np.int64)
-    received = obs + columns["received_delay_s"].astype(np.int64)
-    if not arrived_by_next_issue(obs, received).all():
+    if not arrived_by_next_issue_ns(columns["obs_time"], columns["received_time"]).all():
         raise ValueError("a table holds a report that had not arrived by its issue time")
-    pick = latest_arrival_rows(columns["station_id"], obs, received)
+    pick = latest_version_rows(
+        columns["station_id"], columns["obs_time"], columns["received_time"], _content(columns)
+    )
     return ReportTable(**{name: a[pick] for name, a in columns.items()})
 
 
@@ -277,14 +307,13 @@ def save_table(table: ReportTable, path: Path, *, attrs: dict | None = None) -> 
     """Write an anonymised table. Positions are rounded again here, whatever built the table."""
     if len(table) and np.any(table.obs_time >= SEALED_START):
         raise ValueError(_SEALED_MESSAGE)
-    if not arrived_by_next_issue(
-        table.obs_time.astype("datetime64[s]").astype(np.int64), table.received_time_s()
-    ).all():
+    if not arrived_by_next_issue_ns(table.obs_time, table.received_time).all():
         raise ValueError("refusing to store a report that had not arrived by its issue time")
     ds = xr.Dataset(
         {
             "station_id": ("obs", np.asarray(table.station_id, dtype="U11")),
-            "obs_time": ("obs", table.obs_time.astype("datetime64[s]").astype(np.int64)),
+            "obs_time": ("obs", table.obs_time.astype("datetime64[ns]").astype(np.int64)),
+            "received_time": ("obs", table.received_time.astype("datetime64[ns]").astype(np.int64)),
             "lat": ("obs", np.round(table.lat.astype(np.float64), COORD_DECIMALS).astype(np.float32)),
             "lon": ("obs", np.round(table.lon.astype(np.float64), COORD_DECIMALS).astype(np.float32)),
             "elevation_m": (
@@ -293,14 +322,13 @@ def save_table(table: ReportTable, path: Path, *, attrs: dict | None = None) -> 
                     np.float32
                 ),
             ),
-            "received_delay_s": ("obs", table.received_delay_s.astype(np.int32)),
             **{column: ("obs", getattr(table, column).astype(np.float32)) for column in VALUE_COLUMNS},
         },
         attrs={
             **(attrs or {}),
             "source": "NOAA MADIS public mesonet archive (APRSWXNET / CWOP only)",
             "privacy": "station_id is a keyed 11-char token; lat/lon rounded to 0.1 deg, elevation to 10 m",
-            "obs_time": "seconds since 1970-01-01T00:00:00Z, measurement time rounded up to the second",
+            "times": "obs_time and received_time are nanoseconds since 1970-01-01T00:00:00Z",
             "arrival_policy": ARRIVAL_POLICY,
         },
     )
@@ -320,7 +348,8 @@ def load_table(path: Path, *, with_attrs: bool = False):
     with xr.open_dataset(path, engine="h5netcdf", decode_times=False) as ds:
         if ds.attrs.get("arrival_policy") != ARRIVAL_POLICY:
             raise StaleTableError(f"{Path(path).name} was not written under the current arrival policy")
-        obs_time = ds["obs_time"].values.astype(np.int64).astype("datetime64[s]")
+        obs_time = ds["obs_time"].values.astype(np.int64).astype("datetime64[ns]")
+        received_time = ds["received_time"].values.astype(np.int64).astype("datetime64[ns]")
         if obs_time.size and np.any(obs_time >= SEALED_START):
             raise ValueError(_SEALED_MESSAGE)
         raw = ds["station_id"].values
@@ -328,13 +357,13 @@ def load_table(path: Path, *, with_attrs: bool = False):
         table = ReportTable(
             station_id=station.astype("U11"),
             obs_time=obs_time,
+            received_time=received_time,
             lat=ds["lat"].values.astype(np.float32),
             lon=ds["lon"].values.astype(np.float32),
             elevation_m=ds["elevation_m"].values.astype(np.float32),
-            received_delay_s=ds["received_delay_s"].values.astype(np.int32),
             **{column: ds[column].values.astype(np.float32) for column in VALUE_COLUMNS},
         )
         attrs = dict(ds.attrs)
-    if not arrived_by_next_issue(obs_time.astype(np.int64), table.received_time_s()).all():
+    if not arrived_by_next_issue_ns(obs_time, received_time).all():
         raise StaleTableError(f"{Path(path).name} holds a report that had not arrived by its issue time")
     return (table, attrs) if with_attrs else table

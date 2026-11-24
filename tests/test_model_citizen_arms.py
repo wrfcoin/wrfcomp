@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 import xarray as xr
 
+from wrfcomp.assimilation import phase3_qc as p3
 from wrfcomp.baselines.io import UNITS, layout
 from wrfcomp.models import citizen_arms as arms
 
@@ -362,15 +365,37 @@ def data_dir(tmp_path_factory):
 
 
 def _extract(root, cat, times, ids, **attrs):
+    import json
+
+    from wrfcomp.assimilation import phase3_qc as p3
+
     qc = _load("run_phase3_qc")
-    base = {"complete": 1, "year": 2024, "run_digest": "synthetic", "tiles_digest": "synthetic"}
+    base = {
+        "complete": 1,
+        "year": 2024,
+        "run_digest": "synthetic-run",
+        "tiles_digest": "synthetic",
+        "truth_sha256": p3.sha256_file(root / "truth" / "isd_conus_2024.nc"),
+    }
     path = root / "citizen" / "conus" / "issue_extract_2024.nc"
     path.unlink(missing_ok=True)
     qc.write_extract(path, cat, times, ids, {**base, **attrs})
+    summary = {"extract_sha256": p3.sha256_file(path)}
+    path.with_name("issue_extract_2024.summary.json").write_text(json.dumps(summary))
     return path
 
 
-def test_build_refuses_incomplete_stale_or_off_schedule_inputs(data_dir):
+@pytest.fixture
+def current_run(monkeypatch):
+    """Stands in for recomputing the QC run record from tiles, truth, GEFS and code."""
+    from wrfcomp.assimilation import phase3_qc as p3
+
+    state = {"digest": "synthetic-run"}
+    monkeypatch.setattr(p3, "current_run_record", lambda data, year: dict(state))
+    return state
+
+
+def test_build_refuses_incomplete_stale_or_off_schedule_inputs(data_dir, current_run):
     """Review finding 2 and reading 8: nothing is written unless every input is complete and on schedule."""
     root, cat, times, ids, _ = data_dir
     script = _load("build_phase3_arms")
@@ -396,6 +421,9 @@ def test_build_refuses_incomplete_stale_or_off_schedule_inputs(data_dir):
         stale.attrs.update(attrs)
         path.unlink()
         stale.to_netcdf(path, engine="h5netcdf")
+        path.with_name("issue_extract_2024.summary.json").write_text(
+            json.dumps({"extract_sha256": p3.sha256_file(path)})
+        )
         with pytest.raises(script.BuildRefusedError, match=message):
             script.build(root, 2024, **args)
     _extract(root, cat, times[:-1], ids)  # an extract with one issue fewer
@@ -409,6 +437,38 @@ def test_build_refuses_incomplete_stale_or_off_schedule_inputs(data_dir):
         script.build(root, 2024, stations=ids)
     with pytest.raises(script.BuildRefusedError, match="registered official stations"):  # the registered 500
         script.build(root, 2024, issues=times)
+    # Review case: the extract is current in format but stale against what is on disk.
+    path = _extract(root, cat, times, ids)
+    summary = path.with_name("issue_extract_2024.summary.json")
+    summary.write_text(json.dumps({"extract_sha256": "0" * 64}))
+    with pytest.raises(script.BuildRefusedError, match="published summary"):
+        script.build(root, 2024, **args)
+    summary.unlink()
+    with pytest.raises(script.BuildRefusedError, match="published summary"):
+        script.build(root, 2024, **args)
+    _extract(root, cat, times, ids)
+    truth_path = root / "truth" / "isd_conus_2024.nc"
+    original = truth_path.read_bytes()
+    with xr.open_dataset(truth_path) as ds:
+        changed = ds.load()
+    changed.t2m.values[50, 0] += 1  # one official reading is different now
+    truth_path.unlink()
+    changed.to_netcdf(truth_path)
+    with pytest.raises(script.BuildRefusedError, match="official readings have changed"):
+        script.build(root, 2024, **args)
+    truth_path.write_bytes(original)
+    current_run["digest"] = "another-run"  # other tiles, GEFS content or QC code than the extract's
+    with pytest.raises(script.BuildRefusedError, match="tiles, truth, GEFS and QC code now present"):
+        script.build(root, 2024, **args)
+    current_run["digest"] = "synthetic-run"
+
+    def broken(data, year):
+        raise p3.IncompleteError("tiles: 1 tile-month files are missing and 0 are not in the manifest")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(p3, "current_run_record", broken)
+        with pytest.raises(script.BuildRefusedError, match="not intact"):
+            script.build(root, 2024, **args)
     # The v3 stores must be exactly the schedule: one store set aside is a refusal, not a short build.
     february = root / "candidates" / "gefs-station-corrected-v3" / "2024-02.zarr"
     february.rename(root / "aside.zarr")
@@ -420,7 +480,7 @@ def test_build_refuses_incomplete_stale_or_off_schedule_inputs(data_dir):
     assert len(script.registered_stations()) == 500
 
 
-def test_monthly_publication_equals_the_uninterrupted_replay(data_dir):
+def test_monthly_publication_equals_the_uninterrupted_replay(data_dir, current_run):
     """The registered month-boundary check: stores published month by month are the one replay, cut."""
     root, cat, times, ids, (truth, issues, snapshots) = data_dir
     script = _load("build_phase3_arms")

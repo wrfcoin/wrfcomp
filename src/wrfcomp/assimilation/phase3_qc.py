@@ -13,7 +13,9 @@ and forecasts issued strictly before it.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +40,116 @@ from .trust import StationState, advance_state, suspected_copy, veto_recent_copy
 
 THERMAL = ("t2m", "td2m")
 YEAR_END = {2024: "2024-12-17T12"}  # the last issue of each year that may be built
-EXTRACT_FORMAT = "phase3-extract.v2"
+EXTRACT_FORMAT = "phase3-extract.v3"
+NEIGHBOUR_KM = 50.0  # docs/PHASE3_DESIGN.md, rule 4
+WINDOW_MIN = 15  # rule 3
+_REPO = Path(__file__).resolve().parents[3]
+# The code a QC result depends on. A change to any of these files makes earlier results stale.
+QC_CODE = (
+    "scripts/run_phase3_qc.py",
+    "scripts/run_qc_trial.py",
+    "src/wrfcomp/assimilation/phase3_qc.py",
+    "src/wrfcomp/assimilation/madis_archive.py",
+    "src/wrfcomp/assimilation/qc.py",
+    "src/wrfcomp/assimilation/trust.py",
+    "src/wrfcomp/assimilation/tokens.py",
+)
+
+
+class IncompleteError(RuntimeError):
+    """A product is missing, partial, or made from other inputs than the ones present."""
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def digest_of(*parts) -> str:
+    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
+
+
+def code_digest() -> str:
+    return digest_of([(name, sha256_file(_REPO / name)) for name in QC_CODE])
+
+
+def read_manifest(path: Path, what: str) -> dict:
+    if not Path(path).is_file():
+        raise IncompleteError(f"{what}: no manifest; the step has not completed")
+    return json.loads(Path(path).read_text())
+
+
+def verify_tiles(tiles_dir: Path) -> dict:
+    """The tile manifest, after checking that every tile-month file it lists is present and unchanged
+    and that there is no file it does not list. A tile set with a missing or altered part is refused."""
+    manifest = read_manifest(Path(tiles_dir) / "manifest.json", "tiles")
+    present = {str(p.relative_to(tiles_dir)) for p in Path(tiles_dir).glob("*/*.npz")}
+    listed = manifest["parts"]
+    if present != set(listed):
+        missing, extra = len(set(listed) - present), len(present - set(listed))
+        raise IncompleteError(
+            f"tiles: {missing} tile-month files are missing and {extra} are not in the manifest"
+        )
+    changed = [name for name, digest in listed.items() if sha256_file(Path(tiles_dir) / name) != digest]
+    if changed:
+        raise IncompleteError(f"tiles: {len(changed)} tile-month files are not the ones the manifest lists")
+    return manifest
+
+
+def forecasts_digest(forecasts) -> str:
+    """Content of the GEFS inputs as the QC reads them: every cycle's times and ensemble means."""
+    digest = hashlib.sha256()
+    digest.update(np.ascontiguousarray(forecasts.issued.astype("datetime64[ns]").astype(np.int64)).tobytes())
+    digest.update(np.ascontiguousarray(forecasts.valid.astype("datetime64[ns]").astype(np.int64)).tobytes())
+    for name in sorted(forecasts.means):
+        digest.update(name.encode())
+        digest.update(np.ascontiguousarray(forecasts.means[name], dtype=np.float64).tobytes())
+    return digest.hexdigest()
+
+
+def load_year_inputs(data_dir: Path, year: int):
+    """Truth and GEFS for one year's QC, as the QC reads them: (trial module, truth, forecasts)."""
+    start = np.datetime64(f"{year}-01-01T00", "ns")
+    issues = issue_times(year)
+    trial = load_trial_module(start)
+    with xr.open_dataset(Path(data_dir) / "truth" / f"isd_conus_{year}.nc") as ds:
+        # No label before 1 January, and no reading measured before it.
+        truth = within_year(ds.sel(valid_time=slice(start, issues[-1])).load(), start)
+    forecasts = load_forecasts(
+        Path(data_dir) / "baselines" / "gefs", truth.station_id.values, start, issues[-1], trial
+    )
+    cycles = np.unique(forecasts.issued)
+    if len(cycles) != len(issues) or not np.array_equal(cycles, issues.astype("datetime64[ns]")):
+        raise IncompleteError("the GEFS cycles present are not exactly the year's issue times")
+    return trial, truth, forecasts
+
+
+def run_record(data_dir: Path, year: int, tiles_manifest: dict, forecasts) -> dict:
+    """What a QC run is made from. Its digest names the run."""
+    record = {
+        "tiles_digest": tiles_manifest["digest"],
+        "tiles_content_digest": digest_of(sorted(tiles_manifest["parts"].items())),
+        "code_digest": code_digest(),
+        "truth_sha256": sha256_file(Path(data_dir) / "truth" / f"isd_conus_{year}.nc"),
+        "gefs_digest": forecasts_digest(forecasts),
+        "issues": len(issue_times(year)),
+        "window_minutes": WINDOW_MIN,
+        "neighbour_km": NEIGHBOUR_KM,
+    }
+    record["digest"] = digest_of("qc", year, record)
+    return record
+
+
+def current_run_record(data_dir: Path, year: int) -> dict:
+    """The record a QC run would have if it were made now from the files present (tiles verified)."""
+    manifest = verify_tiles(Path(data_dir) / "citizen" / "conus" / f"{year}-tiles")
+    _, _, forecasts = load_year_inputs(data_dir, year)
+    return run_record(data_dir, year, manifest, forecasts)
+
+
 WIND = ("u10", "v10", "wind_speed")
 HALF_HOUR_NS = 1_800_000_000_000
 _TRIAL_PATH = Path(__file__).resolve().parents[3] / "scripts" / "run_qc_trial.py"

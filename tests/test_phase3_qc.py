@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -240,7 +241,7 @@ def test_reports_after_the_issue_time_change_nothing_at_or_before_it(world):
 
 
 def _channel(seconds_before, values, weights, issue):
-    when = (issue + np.array(seconds_before) * S).astype("datetime64[ns]")
+    when = issue.astype("datetime64[ns]") + (np.array(seconds_before, float) * 1e9).astype("timedelta64[ns]")
     n = len(when)
     return p3.ChannelResult(
         when,
@@ -267,6 +268,11 @@ def test_issue_snapshot_takes_the_latest_positive_weight_report_of_the_last_15_m
     earlier = _channel([-40 * 60, -16 * 60, -15 * 60, -4 * 60], [1, 2, 3, 4], [0.5, 0.4, 0.3, 0.0], issue)
     has, value, weight, _, _ = p3.issue_snapshot(earlier, [issue + M])
     assert not has[0] and np.isnan(value[0]) and weight[0] == 0  # 16 minutes old does not count
+    # Review case: 900.25 s before T is outside the inclusive 15 minutes; 900 s exactly is inside.
+    edge = _channel([-900.25], [7], [0.5], issue)
+    assert not p3.issue_snapshot(edge, [issue])[0][0]
+    assert p3.issue_snapshot(_channel([-900], [7], [0.5], issue), [issue])[0][0]
+    assert not p3.issue_snapshot(_channel([0.25], [7], [0.5], issue), [issue])[0][0]  # measured after T
     only_zero = _channel([-300, -100], [1, 2], [0.0, 0.0], issue)
     assert not p3.issue_snapshot(only_zero, [issue])[0][0]
     newest = _channel([-600, -100], [1, 2], [0.4, 0.2], issue)
@@ -310,7 +316,8 @@ def _day_table(day, n=4):
     base = np.datetime64(day + "T06:00:00", "s")
     return ReportTable(
         station_id=np.array([f"CW{i:09d}" for i in range(n)]),
-        obs_time=base + np.arange(n) * 60,
+        obs_time=(base + np.arange(n) * 60 * np.timedelta64(1, "s")).astype("datetime64[ns]"),
+        received_time=(base + (np.arange(n) * 60 + 300) * np.timedelta64(1, "s")).astype("datetime64[ns]"),
         lat=np.float32([40.0, 40.1, 41.2, 40.0][:n]),
         lon=np.float32([-100.0, -99.9, -101.3, -100.0][:n]),
         elevation_m=np.full(n, 500, dtype=np.float32),
@@ -318,7 +325,6 @@ def _day_table(day, n=4):
         td2m=np.full(n, 275, dtype=np.float32),
         wind_speed=np.full(n, 2, dtype=np.float32),
         wind_dir=np.full(n, 90, dtype=np.float32),
-        received_delay_s=np.full(n, 300, dtype=np.int32),
     )
 
 
@@ -371,6 +377,9 @@ def test_partition_refuses_tiles_made_from_other_files_and_stale_day_files(tmp_p
     assert not (citizen / "conus" / "2024-tiles").exists()
 
 
+GEFS: dict = {}
+
+
 def _fake_run(tmp_path, script, monkeypatch, tiles):
     citizen = _year_dir(tmp_path, script, monkeypatch)
     manifest = script.partition(citizen, 2024)
@@ -379,8 +388,12 @@ def _fake_run(tmp_path, script, monkeypatch, tiles):
     )
     (tmp_path / "truth").mkdir()
     truth.to_netcdf(tmp_path / "truth" / "isd_conus_2024.nc")
-    (tmp_path / "baselines" / "gefs").mkdir(parents=True)
-    record = script.run_inputs(tmp_path, 2024, manifest)
+    # Stand-in GEFS content: the real loader is replaced, the content digest is the real one.
+    GEFS["t2m"] = np.zeros((2, 1))
+    cycle = np.array(["2024-01-01T00"], dtype="datetime64[ns]")
+    fake = lambda *_: (None, None, SimpleNamespace(issued=cycle, valid=cycle + 3 * H, means=dict(GEFS)))  # noqa: E731
+    monkeypatch.setattr(p3, "load_year_inputs", fake)
+    record = p3.current_run_record(tmp_path, 2024)
     out = citizen / "conus" / "2024-qc"
     out.mkdir()
     (out / "run.json").write_text(__import__("json").dumps(record))
@@ -439,6 +452,32 @@ def test_merge_refuses_a_partial_run_and_a_run_from_other_inputs(tmp_path, monke
         assert ds.sizes["issue"] == 704 and ds.official_station_id.values.astype(str).tolist() == [
             "00000000001"
         ]
+    # A GEFS store with the same name and other content: refused (the digest is of content, not names).
+    GEFS["t2m"] = np.ones((2, 1))
+    with pytest.raises(script.IncompleteError, match="other inputs or code"):
+        script.merge(tmp_path, 2024)
+    GEFS["t2m"] = np.zeros((2, 1))
+    # A tile-month set aside, altered or added after partition: refused by partition, run and merge.
+    tiles = tmp_path / "citizen" / "conus" / "2024-tiles"
+    part = sorted(tiles.glob("*/*.npz"))[0]
+    part.rename(tmp_path / "aside.npz")
+    for step in (
+        lambda: script.partition(tmp_path / "citizen", 2024),
+        lambda: script.merge(tmp_path, 2024),
+        lambda: script.run(tmp_path, 2024, 1, None),
+        lambda: p3.verify_tiles(tiles),
+    ):
+        with pytest.raises(script.IncompleteError, match="1 tile-month files are missing"):
+            step()
+    part.write_bytes((tmp_path / "aside.npz").read_bytes() + b"x")
+    with pytest.raises(script.IncompleteError, match="not the ones the manifest lists"):
+        script.merge(tmp_path, 2024)
+    (tmp_path / "aside.npz").replace(part)
+    (part.parent / "2031-01.npz").write_bytes(b"unlisted")
+    with pytest.raises(script.IncompleteError, match="1 are not in the manifest"):
+        p3.verify_tiles(tiles)
+    (part.parent / "2031-01.npz").unlink()
+    assert script.merge(tmp_path, 2024)["run_digest"] == record["digest"]
     # The truth file changes after the run: what is on disk no longer describes the outputs.
     xr.Dataset(
         coords={"valid_time": [np.datetime64("2024-01-02", "ns")], "station_id": ["00000000001"]}

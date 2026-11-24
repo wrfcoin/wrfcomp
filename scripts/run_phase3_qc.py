@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -39,32 +38,21 @@ import xarray as xr
 from wrfcomp.assimilation import phase3_qc as p3
 from wrfcomp.assimilation.madis_archive import (
     ARRIVAL_POLICY,
+    CONTENT_COLUMNS,
     VALUE_COLUMNS,
-    arrived_by_next_issue,
-    latest_arrival_rows,
+    arrived_by_next_issue_ns,
+    latest_version_rows,
     load_table,
 )
 from wrfcomp.assimilation.qc import distances_km
 
-NEIGHBOUR_KM = 50.0  # docs/PHASE3_DESIGN.md, rule 4
-WINDOW_MIN = 15  # rule 3
+NEIGHBOUR_KM = p3.NEIGHBOUR_KM
+WINDOW_MIN = p3.WINDOW_MIN
 YEAR_END = p3.YEAR_END
 EXTRACT_FORMAT = p3.EXTRACT_FORMAT
-_REPO = Path(__file__).resolve().parents[1]
-_CODE = (
-    "scripts/run_phase3_qc.py",
-    "scripts/run_qc_trial.py",
-    "src/wrfcomp/assimilation/phase3_qc.py",
-    "src/wrfcomp/assimilation/madis_archive.py",
-    "src/wrfcomp/assimilation/qc.py",
-    "src/wrfcomp/assimilation/trust.py",
-    "src/wrfcomp/assimilation/tokens.py",
-)
+IncompleteError = p3.IncompleteError
+sha256_file, digest_of, read_manifest = p3.sha256_file, p3.digest_of, p3.read_manifest
 _G: dict = {}
-
-
-class IncompleteError(RuntimeError):
-    """A product is missing, partial, or made from other inputs than the ones present."""
 
 
 def issue_times(year: int) -> np.ndarray:
@@ -85,28 +73,6 @@ def tile_of(lat, lon):
     return np.floor(lat).astype(int), np.floor(lon).astype(int)
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def digest_of(*parts) -> str:
-    return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()
-
-
-def code_digest() -> str:
-    return digest_of([(name, sha256_file(_REPO / name)) for name in _CODE])
-
-
-def read_manifest(path: Path, what: str) -> dict:
-    if not path.is_file():
-        raise IncompleteError(f"{what}: no manifest; the step has not completed")
-    return json.loads(path.read_text())
-
-
 # ----------------------------------------------------------------------------- partition
 
 
@@ -118,7 +84,7 @@ def partition(citizen_dir: Path, year: int) -> dict:
         raise IncompleteError(
             f"{len(absent)} of {len(days)} day files are missing (first: {absent[0]}); fetch them first"
         )
-    start = np.datetime64(f"{year}-01-01T00:00:00", "s")
+    start = np.datetime64(f"{year}-01-01T00:00:00", "ns")
     inputs = [(d, sha256_file(src / f"{d}.nc")) for d in days]
     digest = digest_of("tiles", year, ARRIVAL_POLICY, inputs)
     if dst.exists():
@@ -126,13 +92,14 @@ def partition(citizen_dir: Path, year: int) -> dict:
             raise IncompleteError(
                 "the tiles were made from other daily files; remove them and partition again"
             )
+        manifest = p3.verify_tiles(dst)  # every tile-month present and unchanged, or refused
         print("tiles already match the daily files", flush=True)
-        return read_manifest(dst / "manifest.json", "tiles")
+        return manifest
     building = dst.with_name(dst.name + ".building")
     if building.exists():
         shutil.rmtree(building)  # an interrupted run of this step
-    missing_hours, tiles, n_reports = {}, set(), 0
-    columns = ("station_id", "obs_time", "lat", "lon", "elevation_m", "received_delay_s", *VALUE_COLUMNS)
+    missing_hours, tiles, n_reports, parts = {}, set(), 0, {}
+    columns = ("station_id", "obs_time", "received_time", "lat", "lon", "elevation_m", *VALUE_COLUMNS)
     for month in sorted({d[:7] for d in days}):
         tables = []
         for d in (d for d in days if d.startswith(month)):
@@ -143,9 +110,9 @@ def partition(citizen_dir: Path, year: int) -> dict:
                 missing_hours[d] = str(attrs["hours_missing"]).split(",")
             tables.append(table)
         cols = {name: np.concatenate([getattr(t, name) for t in tables]) for name in columns}
-        obs = cols["obs_time"].astype("datetime64[s]").astype(np.int64)
-        received = obs + cols["received_delay_s"].astype(np.int64)
-        if np.any(cols["obs_time"] < start) or not arrived_by_next_issue(obs, received).all():
+        obs = cols["obs_time"].astype("datetime64[ns]").astype(np.int64)
+        received = cols["received_time"].astype("datetime64[ns]").astype(np.int64)
+        if np.any(cols["obs_time"] < start) or not arrived_by_next_issue_ns(obs, received).all():
             raise IncompleteError(
                 "a daily file holds a report from before the year or one not arrived in time"
             )
@@ -161,7 +128,8 @@ def partition(citizen_dir: Path, year: int) -> dict:
             # A station that changes its stored position is a new station (token and position together).
             key = pd.DataFrame({k: cols[k][rows] for k in ("station_id", "lat", "lon", "elevation_m")})
             ident = key.groupby(["station_id", "lat", "lon", "elevation_m"], sort=True).ngroup().to_numpy()
-            pick = latest_arrival_rows(ident, obs[rows], received[rows])  # sorted by station, then time
+            content = [cols[c][rows] for c in CONTENT_COLUMNS]
+            pick = latest_version_rows(ident, obs[rows], received[rows], content)  # by station, time
             rows, ident = rows[pick], ident[pick]
             head = rows[np.r_[True, ident[1:] != ident[:-1]]]
             np.savez_compressed(
@@ -172,9 +140,10 @@ def partition(citizen_dir: Path, year: int) -> dict:
                 ident_elevation_m=cols["elevation_m"][head],
                 row_ident=ident.astype(np.int32),
                 obs_time=obs[rows],
-                received_delay_s=cols["received_delay_s"][rows],
+                received_time=received[rows],
                 **{c: cols[c][rows] for c in VALUE_COLUMNS},
             )
+            parts[f"{name}/{month}.npz"] = sha256_file(folder / f"{month}.npz")
             tiles.add(name)
             n_reports += len(rows)
         print(f"partitioned {month}: {len(obs)} reports", flush=True)
@@ -185,6 +154,7 @@ def partition(citizen_dir: Path, year: int) -> dict:
         "days": len(days),
         "missing_source_hours": missing_hours,
         "tiles": sorted(tiles),
+        "parts": dict(sorted(parts.items())),
         "reports": n_reports,
     }
     (building / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
@@ -228,7 +198,7 @@ def run_tile(name: str) -> dict:
                 raise IncompleteError(f"tile output {name} was made from other inputs")
         return {"tile": name, "skipped": True}
     trial, official, forecasts, issues = _G["trial"], _G["official"], _G["forecasts"], _G["issues"]
-    start_s = int(_G["start"].astype("datetime64[s]").astype(np.int64))
+    start_ns = int(_G["start"].astype("datetime64[ns]").astype(np.int64))
     # Station tables first; report rows are read only for the stations that are needed.
     index: dict[tuple, int] = {}
     part_ids = []
@@ -266,12 +236,12 @@ def run_tile(name: str) -> dict:
             continue
         with np.load(path) as z:
             gid = ids[z["row_ident"]]
-            obs, delay = z["obs_time"], z["received_delay_s"].astype(np.int64)
+            obs, received = z["obs_time"], z["received_time"]
             # Year isolation and Amendment 1 again, on what is actually read.
-            ok = wanted[gid] & (obs >= start_s) & arrived_by_next_issue(obs, obs + delay)
+            ok = wanted[gid] & (obs >= start_ns) & arrived_by_next_issue_ns(obs, received)
             keep = np.flatnonzero(ok)
             gid = gid[keep]
-            arrays = [obs[keep], (obs + delay)[keep], *(z[c][keep] for c in VALUE_COLUMNS)]
+            arrays = [obs[keep], received[keep], *(z[c][keep] for c in VALUE_COLUMNS)]
         if not keep.size:
             continue
         cuts = np.flatnonzero(np.r_[True, gid[1:] != gid[:-1], True])
@@ -286,9 +256,9 @@ def run_tile(name: str) -> dict:
     def station(k: int) -> p3.StationData:
         parts = chunks.pop(k)
         cols = [np.concatenate([c[i] for c in parts]) for i in range(2 + len(VALUE_COLUMNS))]
-        # A report repeated across months: the version that arrived last (all had arrived in time).
-        pick = latest_arrival_rows(np.zeros(len(cols[0]), dtype=np.int8), cols[0], cols[1])
-        when = cols[0][pick].astype("datetime64[s]").astype("datetime64[ns]")
+        # A report repeated across months: one version, chosen as everywhere else (all arrived in time).
+        pick = latest_version_rows(np.zeros(len(cols[0]), dtype=np.int8), cols[0], cols[1], cols[2:])
+        when = cols[0][pick].astype("datetime64[ns]")
         return p3.StationData(lat[k], lon[k], height[k], when, *(c[pick] for c in cols[2:]))
 
     data, sun, source = {}, {}, {}
@@ -349,33 +319,15 @@ def run_tile(name: str) -> dict:
     }
 
 
-def run_inputs(data_dir: Path, year: int, tiles_manifest: dict) -> dict:
-    issues = issue_times(year)
-    cycles = sorted(
-        p.name
-        for p in (data_dir / "baselines" / "gefs").glob(f"{year}*.zarr")
-        if np.datetime64(f"{p.stem[:4]}-{p.stem[4:6]}-{p.stem[6:8]}T{p.stem[8:10]}") <= issues[-1]
-    )
-    record = {
-        "tiles_digest": tiles_manifest["digest"],
-        "arrival_policy": ARRIVAL_POLICY,
-        "code_digest": code_digest(),
-        "truth_sha256": sha256_file(data_dir / "truth" / f"isd_conus_{year}.nc"),
-        "gefs_cycles": len(cycles),
-        "gefs_cycles_digest": digest_of(cycles),
-        "issues": len(issues),
-        "window_minutes": WINDOW_MIN,
-        "neighbour_km": NEIGHBOUR_KM,
-    }
-    record["digest"] = digest_of("qc", year, record)
-    return record
-
-
 def run(data_dir: Path, year: int, processes: int, only: int | None) -> None:
     citizen = data_dir / "citizen" / "conus"
     tiles_dir = citizen / f"{year}-tiles"
-    manifest = read_manifest(tiles_dir / "manifest.json", "tiles")
-    inputs = run_inputs(data_dir, year, manifest)
+    manifest = p3.verify_tiles(tiles_dir)  # every tile-month present and unchanged, or refused
+    start = np.datetime64(f"{year}-01-01T00", "ns")
+    issues = issue_times(year)
+    t0 = time.monotonic()
+    trial, truth, forecasts = p3.load_year_inputs(data_dir, year)
+    inputs = p3.run_record(data_dir, year, manifest, forecasts)
     # A run on some tiles is for timing only. It has its own folder and can never be merged.
     out = citizen / (f"{year}-qc" if only is None else f"{year}-qc.timing")
     out.mkdir(parents=True, exist_ok=True)
@@ -383,18 +335,6 @@ def run(data_dir: Path, year: int, processes: int, only: int | None) -> None:
     if record_path.exists() and json.loads(record_path.read_text())["digest"] != inputs["digest"]:
         raise IncompleteError("the QC outputs present were made from other inputs or code; remove them first")
     record_path.write_text(json.dumps(inputs, indent=1) + "\n")
-    start = np.datetime64(f"{year}-01-01T00", "ns")
-    issues = issue_times(year)
-    trial = p3.load_trial_module(start)
-    t0 = time.monotonic()
-    with xr.open_dataset(data_dir / "truth" / f"isd_conus_{year}.nc") as ds:
-        # No label before 1 January, and no reading measured before it.
-        truth = p3.within_year(ds.sel(valid_time=slice(start, issues[-1])).load(), start)
-    forecasts = p3.load_forecasts(
-        data_dir / "baselines" / "gefs", truth.station_id.values, start, issues[-1], trial
-    )
-    if len(forecasts.issued) != inputs["gefs_cycles"] * 5:
-        raise IncompleteError("the GEFS cycles read are not the cycles listed")
     official = p3.official_from_truth(truth, forecasts, trial)
     print(
         f"official series and {len(forecasts.issued)} forecast entries ready in {time.monotonic() - t0:.0f}s",
@@ -465,9 +405,9 @@ def write_extract(path: Path, cat: dict, issues: np.ndarray, official_ids, attrs
 def merge(data_dir: Path, year: int) -> dict:
     citizen = data_dir / "citizen" / "conus"
     out = citizen / f"{year}-qc"
-    manifest = read_manifest(citizen / f"{year}-tiles" / "manifest.json", "tiles")
     record = read_manifest(out / "run.json", "QC run")
-    current = run_inputs(data_dir, year, manifest)
+    current = p3.current_run_record(data_dir, year)  # verifies the tiles, hashes truth and GEFS content
+    manifest = read_manifest(citizen / f"{year}-tiles" / "manifest.json", "tiles")
     if record["digest"] != current["digest"]:
         raise IncompleteError("the QC outputs were made from other inputs or code than the ones present")
     absent = [name for name in manifest["tiles"] if not (out / f"{name}.npz").is_file()]
@@ -506,6 +446,9 @@ def merge(data_dir: Path, year: int) -> dict:
             "year": year,
             "run_digest": record["digest"],
             "tiles_digest": manifest["digest"],
+            "truth_sha256": record["truth_sha256"],
+            "gefs_digest": record["gefs_digest"],
+            "code_digest": record["code_digest"],
             "tiles": len(manifest["tiles"]),
             "days": manifest["days"],
             "missing_source_hours": json.dumps(manifest["missing_source_hours"], sort_keys=True),

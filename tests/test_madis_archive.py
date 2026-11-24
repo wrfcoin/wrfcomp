@@ -20,13 +20,16 @@ from wrfcomp.assimilation.madis_archive import (
     ArchiveFormatError,
     StaleTableError,
     arrived_by_next_issue,
+    arrived_by_next_issue_ns,
     load_table,
     merge_tables,
     parse_archive_hour,
     save_table,
+    seconds_to_ns,
 )
 
 KEY = bytes(range(32))
+NS = 10**9
 FILL = np.float32(3.4028235e38)
 YEAR = np.datetime64("2024-01-01T00:00:00", "s")
 ISSUE = int(np.datetime64("2024-03-01T12:00:00", "s").astype(np.int64))  # an issue time, T
@@ -108,11 +111,13 @@ def test_only_citizen_records_inside_conus_are_kept_and_anonymised():
 def test_of_two_timely_versions_the_one_that_arrived_last_is_kept():
     table = parse(compress=False)
     one = table.station_id == anonymize_station_id("SYN001", key=KEY)
-    np.testing.assert_array_equal(table.obs_time[one].astype(np.int64), [T0 + 600, T0 + 1205])
+    np.testing.assert_array_equal(table.obs_time[one].astype(np.int64), [(T0 + 600) * NS, (T0 + 1205) * NS])
     np.testing.assert_array_equal(table.t2m[one], np.float32([299.0, 291.0]))
-    np.testing.assert_array_equal(table.received_delay_s[one], [400, 295])
+    np.testing.assert_array_equal(
+        (table.received_time - table.obs_time)[one].astype(np.int64), [400 * NS, 295 * NS]
+    )
     assert np.isnan(table.td2m[~one]).all() and np.isnan(table.wind_speed[~one]).all()
-    assert table.obs_time.dtype == np.dtype("datetime64[s]")
+    assert table.obs_time.dtype == table.received_time.dtype == np.dtype("datetime64[ns]")
     counts: dict = {}
     parse_archive_hour(archive_bytes(), key=KEY, not_before=YEAR, counts=counts)
     assert counts == {"records": 4, "before_start": 0, "not_arrived": 0, "repeats_merged": 1}
@@ -140,10 +145,11 @@ def test_arrival_is_judged_on_the_source_timestamps_at_full_precision():
     assert len(parse([row("SYN001", ISSUE - 600.75, ISSUE)])) == 1
     assert len(parse([row("SYN001", ISSUE - 0.5, ISSUE - 0.25)])) == 1
     long_delay = parse([row("SYN001", ISSUE - 34100, ISSUE - 100)])
-    assert len(long_delay) == 1 and long_delay.received_delay_s[0] == 34000
+    assert len(long_delay) == 1
+    assert (long_delay.received_time - long_delay.obs_time)[0] == np.timedelta64(34000, "s")
     # Measured a quarter second after T: it belongs to the next issue, and its stored time is after T.
     after = parse([row("SYN001", ISSUE + 0.25, ISSUE + 300)])
-    assert len(after) == 1 and after.obs_time[0].astype(np.int64) == ISSUE + 1
+    assert len(after) == 1 and after.obs_time[0].astype(np.int64) == ISSUE * NS + NS // 4
     assert len(parse([row("SYN001", ISSUE - 600, FILL)])) == 0  # no arrival time
     with pytest.raises(ArchiveFormatError):
         parse([row("SYN001", ISSUE - 600, ISSUE - 100)], received=False)
@@ -153,6 +159,58 @@ def test_arrival_is_judged_on_the_source_timestamps_at_full_precision():
         ),
         [True, False, True, True, False],
     )
+
+
+def test_sub_second_times_are_kept_and_never_cross_a_whole_second():
+    """Review case: measured 900.25 s before T must stay more than 900 s before T after storage."""
+    table = parse([row("SYN001", ISSUE - 900.25, ISSUE - 100), row("SYN002", ISSUE - 900, ISSUE - 100)])
+    age = ISSUE * NS - table.obs_time.astype(np.int64)
+    by_station = dict(zip(table.station_id.tolist(), age.tolist(), strict=True))
+    assert by_station[anonymize_station_id("SYN001", key=KEY)] == 900 * NS + NS // 4
+    assert by_station[anonymize_station_id("SYN002", key=KEY)] == 900 * NS
+    seconds = np.array([ISSUE - 900.25, ISSUE - 900, ISSUE - 0.001, ISSUE, ISSUE + 0.001, ISSUE + 0.25])
+    ns = seconds_to_ns(seconds)
+    assert np.all(np.diff(ns) > 0)  # distinct times stay distinct and in order
+    np.testing.assert_array_equal(ns <= ISSUE * NS, seconds <= ISSUE)
+    np.testing.assert_array_equal(ns >= (ISSUE - 900) * NS, seconds >= ISSUE - 900)
+    np.testing.assert_array_equal(
+        seconds_to_ns([float(ISSUE), ISSUE + 0.25]), [ISSUE * NS, ISSUE * NS + NS // 4]
+    )
+    # The stored-time test agrees with the source-time test.
+    measured = ISSUE - np.array([600.0, 600.0, 0.5, 0.0])
+    received = ISSUE + np.array([0.0, 0.25, -0.25, 0.001])
+    np.testing.assert_array_equal(
+        arrived_by_next_issue_ns(seconds_to_ns(measured), seconds_to_ns(received)),
+        arrived_by_next_issue(measured, received),
+    )
+    # Two reports a quarter of a second apart are two reports, not versions of one.
+    two = parse(
+        [row("SYN001", ISSUE - 600.25, ISSUE - 100, 290.0), row("SYN001", ISSUE - 600, ISSUE - 100, 291.0)]
+    )
+    assert len(two) == 2 and two.t2m.tolist() == [290.0, 291.0]
+
+
+def test_the_version_kept_does_not_depend_on_the_order_of_the_records(tmp_path):
+    """Review case: two timely revisions arriving at T-100.9 s and T-100.1 s, in either row order."""
+    early = row("SYN001", ISSUE - 600, ISSUE - 100.9, temperature=290.0)
+    late = row("SYN001", ISSUE - 600, ISSUE - 100.1, temperature=291.0)
+    for rows in ([early, late], [late, early]):
+        table = parse(rows)
+        assert len(table) == 1 and table.t2m[0] == 291.0  # the one that arrived last
+        assert table.received_time[0].astype(np.int64) == seconds_to_ns(ISSUE - 100.1)
+    # Same arrival instant, different content: still one answer, whatever the order.
+    a = row("SYN001", ISSUE - 600, ISSUE - 100, temperature=290.0)
+    b = row("SYN001", ISSUE - 600, ISSUE - 100, temperature=291.0)
+    c = ("SYN001", "APRSWXNET", *HERE, ISSUE - 600, FILL, 280.0, 2.0, 90.0, ISSUE - 100)  # no temperature
+    kept = {tuple(parse(list(rows)).t2m.tolist()) for rows in ([a, b, c], [c, b, a], [b, c, a], [b, a, c])}
+    assert kept == {(291.0,)}
+    # Across files and across the merge of tables, in either order.
+    one, two = parse([early]), parse([late])
+    for tables in ([one, two], [two, one]):
+        merged = merge_tables(tables)
+        assert len(merged) == 1 and merged.t2m[0] == 291.0
+    save_table(merge_tables([two, one]), tmp_path / "x.nc")
+    assert load_table(tmp_path / "x.nc").t2m[0] == 291.0
 
 
 def test_nothing_measured_before_the_start_of_the_year_is_kept():
@@ -165,6 +223,7 @@ def test_nothing_measured_before_the_start_of_the_year_is_kept():
     counts: dict = {}
     table = parse_archive_hour(archive_bytes(rows), key=KEY, not_before=YEAR, counts=counts)
     assert len(table) == 1 and table.obs_time[0] == YEAR + np.timedelta64(1, "s")
+    assert table.obs_time.dtype == np.dtype("datetime64[ns]")
     assert counts["before_start"] == 2
 
 
@@ -212,7 +271,7 @@ def test_a_table_from_before_the_amendment_or_with_a_late_report_is_refused(tmp_
         stale.to_netcdf(tmp_path / "stale.nc", engine="h5netcdf")
         with pytest.raises(StaleTableError):
             load_table(tmp_path / "stale.nc")
-    late = type(table)(**{**table.__dict__, "received_delay_s": table.received_delay_s + 86400})
+    late = type(table)(**{**table.__dict__, "received_time": table.received_time + np.timedelta64(1, "D")})
     with pytest.raises(ValueError, match="not arrived"):
         save_table(late, tmp_path / "late.nc")
     with pytest.raises(ValueError, match="not arrived"):

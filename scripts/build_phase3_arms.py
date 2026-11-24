@@ -97,6 +97,29 @@ def load_extract(path: Path, year: int, issues: np.ndarray, stations: list[str])
     return ds, snapshot
 
 
+def verify_extract_is_current(data: Path, year: int, extract_path: Path, extract: xr.Dataset) -> None:
+    """Refuse an extract that is not the published one or was not made from the files now present.
+
+    Old QC weights must never be combined with other official readings, other GEFS inputs, other
+    citizen tiles or other QC code than the ones they were computed with.
+    """
+    summary = extract_path.with_name(f"issue_extract_{year}.summary.json")
+    if not summary.is_file() or json.loads(summary.read_text()).get("extract_sha256") != sha256_file(
+        extract_path
+    ):
+        raise BuildRefusedError("the extract is not the one its published summary describes")
+    if extract.attrs.get("truth_sha256") != sha256_file(data / "truth" / f"isd_conus_{year}.nc"):
+        raise BuildRefusedError("the official readings have changed since the QC that made the extract")
+    try:
+        current = p3.current_run_record(data, year)
+    except p3.IncompleteError as exc:
+        raise BuildRefusedError(f"the QC inputs behind the extract are not intact: {exc}") from None
+    if current["digest"] != extract.attrs.get("run_digest"):
+        raise BuildRefusedError(
+            "the extract was not made from the tiles, truth, GEFS and QC code now present"
+        )
+
+
 def publish(parts, directory: Path, period: str) -> dict:
     store = xr.concat(parts, dim="init_time", coords="minimal", compat="identical", join="exact")
     for var in store.variables.values():
@@ -124,6 +147,7 @@ def build(data: Path, year: int, *, issues=None, stations=None) -> dict:
     stations = registered_stations() if stations is None else list(stations)
     extract_path = data / "citizen" / "conus" / f"issue_extract_{year}.nc"
     extract, snapshot = load_extract(extract_path, year, issues, stations)
+    verify_extract_is_current(data, year, extract_path, extract)
     months = sorted((data / "candidates" / A_DIR).glob(f"{year}-??.zarr"))
     seen = []
     for path in months:
