@@ -96,6 +96,17 @@ def spatial_series(values, neighbours, official, independent, sigma, cfg):
     return flags, medians
 
 
+def citizen_trust_median(neighbours, official, independent, cfg):
+    """Keep the rolling comparison citizen-only even when an official spatial anchor is available."""
+    citizens = neighbours[:, ~official]
+    present = np.isfinite(citizens)
+    usable = (present.sum(axis=1) >= cfg.minimum_buddies) & present[:, independent[~official]].any(axis=1)
+    result = np.full(len(neighbours), np.nan)
+    if usable.any():
+        result[usable] = np.nanmedian(citizens[usable], axis=1)
+    return result
+
+
 def _has_separated_pair(lats, lons, cfg):
     for j in range(len(lats) - 1):
         if np.any(distances_km(lats[j], lons[j], lats[j + 1 :], lons[j + 1 :]) >= cfg.independence_km):
@@ -223,7 +234,12 @@ def quality_control(
     states=None,
     cfg=QCConfig(),
 ):
-    """Process simultaneous reports together, retaining the original input row order."""
+    """Process simultaneous reports together, retaining the original input row order.
+
+    A reference supplied without a measurement stamp is a synchronous observation. For an
+    as-of match, supply reference_time_ns so that the first match alone enters rolling evidence.
+    The returned buddy_median is the immediate spatial comparator, including official authority.
+    """
     size = len(batch.values)
 
     def column(value, dtype=float):
@@ -353,7 +369,7 @@ def quality_control(
                 states.get(key, StationState()),
                 time_ns=time_ns,
                 value=float(batch.values[i]),
-                buddy=medians[i],
+                buddy=citizen_trust_median(adjusted[None, :], official[near], independent, cfg)[0],
                 reference=reference[i],
                 innovation=float(innovations[i]),
                 day=bool(daytime),

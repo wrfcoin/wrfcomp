@@ -131,3 +131,19 @@ def test_trial_citizen_join_uses_distinct_stations_and_available_reports(tmp_pat
         counts = trial.trial_region(path, official, forecasts, series)["counts"]["wind_speed"]
         assert counts["spatial_applied"] == (7 if mixed else 0)
         assert counts["FEW_BUDDIES"] == (1 if mixed else 8)
+
+
+def test_official_evidence_counts_each_measurement_once_for_rolling_statistics():
+    rng = np.random.default_rng(144)
+    measured = trial.START + np.arange(18) * trial.HOUR
+    when = np.repeat(measured, 2) + np.tile([0, 10], len(measured)) * trial.MINUTE
+    official = rng.normal(8, 2, len(measured))
+    first = official + rng.uniform(-0.2, 0.2, len(measured))
+    reports = np.repeat(first, 2)
+    reports[1::2] += 5
+    raw, stamps, r, rms = trial.official_evidence((measured, official, np.zeros(18)), when, reports)
+    np.testing.assert_array_equal(stamps, np.repeat(measured.astype(np.int64), 2))
+    np.testing.assert_array_equal(raw, np.repeat(official, 2))
+    assert np.isnan(r[: 2 * (trial.CFG.min_pairs - 1)]).all()
+    np.testing.assert_allclose(r[-2:], np.corrcoef(first, official)[0, 1])
+    np.testing.assert_allclose(rms[-2:], np.sqrt(np.mean((first - official) ** 2)))

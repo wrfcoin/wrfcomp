@@ -27,6 +27,8 @@ class StationState:
     # Completed and current UTC days: [day, count, sum of signed reference errors, adverse evidence].
     verification_days: list[list] = field(default_factory=list)
     last_verified_ns: int | None = None
+    last_reference_ns: int | None = None
+    distinct_reference_history: bool = False
     last_copycat_ns: int | None = None
     earned: bool = False
     official_site: list[float] | None = None
@@ -44,6 +46,11 @@ def correlation(pairs):
     if np.ptp(x) == 0:
         return 0.0
     return float(np.corrcoef(x, y)[0, 1])
+
+
+def fresh_reference(old, value, stamp):
+    """Use the first available pair for each advancing official measurement timestamp."""
+    return np.isfinite(value) and (old.last_reference_ns is None or stamp > old.last_reference_ns)
 
 
 def update_state(
@@ -67,15 +74,21 @@ def update_state(
 ):
     if old.last_ns is not None and time_ns <= old.last_ns:
         raise ValueError("station-variable timestamps must increase")
+    if not old.distinct_reference_history and old.pairs:
+        # Older checkpoints interleaved official anchors with citizen medians and lack the
+        # measurement stamps needed to deduplicate them. Warm up only the correlation series.
+        old = replace(old, pairs=[], correlation_guard=1.0, last_reference_ns=None)
     cutoff = time_ns - cfg.window_days * 86400 * 10**9
     pairs = [p for p in old.pairs if p[0] > cutoff]
-    if np.isfinite(value) and (np.isfinite(buddy) or np.isfinite(reference)):
+    stamp = time_ns if reference_time_ns is None else reference_time_ns
+    fresh = fresh_reference(old, reference, stamp)
+    if np.isfinite(value) and (np.isfinite(buddy) or fresh):
         pairs.append(
             [
                 time_ns,
                 value,
                 float(buddy) if np.isfinite(buddy) else None,
-                float(reference) if np.isfinite(reference) else None,
+                float(reference) if fresh else None,
             ]
         )
     buddies = [(p[1], p[2]) for p in pairs if p[2] is not None]
@@ -99,6 +112,7 @@ def update_state(
         hard_fail=hard_fail,
         cfg=cfg,
         buddy_r=buddy_r,
+        buddy_fresh=np.isfinite(buddy),
         ref_r=ref_r,
         ref_rmse=ref_rmse,
         learn_bias=learn_bias,
@@ -124,6 +138,7 @@ def advance_state(
     hard_fail,
     cfg,
     buddy_r,
+    buddy_fresh=True,
     ref_r,
     ref_rmse,
     learn_bias=True,
@@ -131,11 +146,17 @@ def advance_state(
     reference_time_ns=None,
 ):
     """Shared transition; evidence statistics include only the trailing seven days up to this report."""
+    stamp = time_ns if reference_time_ns is None else reference_time_ns
+    ref_fresh = np.isfinite(value) and fresh_reference(old, reference, stamp)
+    evidence_fresh = buddy_fresh
     guard_r = buddy_r
     if solar_sensitive and (guard_r is None or not np.isfinite(guard_r)):
         guard_r = ref_r
+        evidence_fresh = ref_fresh
     low = guard_r is not None and guard_r < cfg.low_correlation
-    guard = old.correlation_guard * cfg.guard_decay if low else 1.0
+    guard = 1.0
+    if low:
+        guard = old.correlation_guard * cfg.guard_decay if evidence_fresh else old.correlation_guard
     copycat = bool(
         ref_r is not None and ref_r > cfg.copy_correlation and ref_rmse <= cfg.copy_residual_sigma * sigma_bg
     )
@@ -148,6 +169,8 @@ def advance_state(
     new = replace(
         old,
         last_ns=time_ns,
+        distinct_reference_history=True,
+        last_reference_ns=stamp if ref_fresh else old.last_reference_ns,
         last_usable=bool(not hard_fail and huber > 0 and not copycat),
         recent=recent,
         copycat=copycat,

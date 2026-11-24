@@ -16,6 +16,7 @@ from wrfcomp.assimilation.qc import (
     Flag,
     background_gate,
     cells,
+    citizen_trust_median,
     distances_km,
     official_hour_bias,
     solar_elevation,
@@ -162,6 +163,22 @@ def trailing_correlation(times, values, comparison):
     return corr.to_numpy(), rms.to_numpy()
 
 
+def official_evidence(series, times, values):
+    """Align the reference for instantaneous gates; keep one pair per official time for rolling trust."""
+    measured, observations, _ = series
+    indices = latest_indices(measured, times)
+    matched = np.flatnonzero(indices >= 0)
+    reference = np.full(len(times), np.nan)
+    stamps = np.full(len(times), -1, dtype=np.int64)
+    reference[matched] = observations[indices[matched]]
+    stamps[matched] = measured[indices[matched]].astype(np.int64)
+    distinct = np.full(len(times), np.nan)
+    first = matched[np.r_[True, np.diff(indices[matched]) > 0]] if matched.size else matched
+    distinct[first] = reference[first]
+    r, rms = trailing_correlation(times, values, distinct)
+    return reference, stamps, r, rms
+
+
 def citizen_sources(wides, geo, official, forecasts, series):
     """Prepare each neighbour's own time-ordered series. Failed reports supersede stale good ones."""
     out = {}
@@ -183,8 +200,7 @@ def citizen_sources(wides, geo, official, forecasts, series):
             reference = z.copy()
             copycat = np.zeros(len(rows), bool)
             if var in SUPPORTED:
-                reference, _ = align(series[var][nearest], when)
-                r, rms = trailing_correlation(when, values, reference)
+                reference, _, r, rms = official_evidence(series[var][nearest], when, values)
                 copycat = (r > CFG.copy_correlation) & (rms <= SIGMA * CFG.copy_residual_sigma)
                 if copycat.any():
                     fault_times[station].extend(when[copycat].astype(np.int64).tolist())
@@ -312,7 +328,7 @@ def aggregate_station(
                     modes["indoor_evaluable"].add(station)
                 if indoor:
                     modes["indoor_screen"].add(station)
-            reference, _ = align(series[var][nearest], when)
+            reference, ref_times, ref_r, ref_rmse = official_evidence(series[var][nearest], when, values)
             comparison, _ = align(series[var][other], when)
             official_pair = np.isfinite(reference) & np.isfinite(comparison)
             counts["official_pairs"] += int(official_pair.sum())
@@ -337,16 +353,12 @@ def aggregate_station(
                     correction[:] = np.nan
                 counts["corrected"] += int(np.isfinite(correction).sum())
                 background += correction
-            measured = series[var][nearest][0]
-            rix = latest_indices(measured, when)
-            ref_times = np.full(len(when), -1, dtype=np.int64)
-            ref_times[rix >= 0] = measured[rix[rix >= 0]].astype(np.int64)
-            ref_r, ref_rmse = trailing_correlation(when, values, reference)
         spatial_sigma = {"precip": 1.0, "station_pressure": 200.0}.get(var, SIGMA)
-        spatial_flags, medians = spatial_series(values, adjusted, is_official, external, spatial_sigma, CFG)
+        spatial_flags, _ = spatial_series(values, adjusted, is_official, external, spatial_sigma, CFG)
         decided = spatial_flags != int(Flag.FEW_BUDDIES)
         counts["spatial_applied"] += int(decided.sum())
         any_spatial[rows] |= decided
+        medians = citizen_trust_median(adjusted, is_official, external, CFG)
         buddy_r, _ = trailing_correlation(when, values, medians)
         for j, row in enumerate(rows):
             value = float(values[j])
@@ -380,6 +392,7 @@ def aggregate_station(
                     time_ns=ns,
                     value=value,
                     buddy_r=buddy_r[j],
+                    buddy_fresh=np.isfinite(median),
                     ref_r=ref_r[j] if np.isfinite(ref_r[j]) else None,
                     ref_rmse=ref_rmse[j],
                     verify_temperature=var == "t2m" and dist[nearest] <= CFG.radius_km,
