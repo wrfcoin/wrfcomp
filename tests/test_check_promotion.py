@@ -464,6 +464,41 @@ def test_stand_in_reference_store_is_refused(base_world: dict, locked: None, tmp
         tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, tmp_path / "out", root)
 
 
+@pytest.mark.parametrize("reference", ["climatology", "gefs"])
+def test_reference_store_with_a_sealed_valid_time_is_refused_before_it_is_hashed(
+    base_world: dict, locked: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reference: str
+) -> None:
+    """A store in the data directory under a reference's pinned name, with a valid time in the
+    sealed split: refused on its coordinates. Its content hash is never taken, so no value is read."""
+    import wrfcomp.harness.hashing as hashing
+
+    root = tmp_path / "repo"
+    shutil.copytree(base_world["root"], root)
+    sealed_start = tool._load_locked_config(root).splits.sealed_test.start
+    store = root / f"data/refs/{reference}.zarr"
+    misplaced = open_zarr(store).load()
+    # init times stay in March 2024; the longest lead now ends on the first sealed instant
+    leads = misplaced["lead_time"].values.copy()
+    leads[-1] = sealed_start - misplaced["init_time"].values.max()
+    misplaced = misplaced.assign_coords(lead_time=leads)
+    assert misplaced["init_time"].values.max() < sealed_start
+    shutil.rmtree(store)
+    write_zarr(misplaced, store)
+
+    real = hashing.content_sha256
+
+    def sentinel(ds):
+        latest = ds["init_time"].values.max() + ds["lead_time"].values.max()
+        assert latest < sealed_start, "a store with sealed valid times was hashed"
+        return real(ds)
+
+    monkeypatch.setattr(hashing, "content_sha256", sentinel)
+    name = {"climatology": "climatology", "gefs": "noaa-gefs"}[reference]
+    with pytest.raises(tool.Refused, match=f"reference {name} at .* refused before it is read.*sealed split"):
+        tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, tmp_path / "out", root)
+    assert not (tmp_path / "out").exists()
+
+
 def test_tampered_inventory_or_reference_scorecard_is_refused(base_world: dict, tmp_path: Path) -> None:
     def world() -> Path:
         root = tmp_path / f"repo{len(list(tmp_path.iterdir()))}"

@@ -26,7 +26,8 @@ script is in:
      this process has imported must be files of that tree;
   2. the two reference forecasts of the period are taken from the data directory, at the places
      named in the tree's `experiments/REFERENCES.json`, and refused unless their content hash is the
-     pinned one;
+     pinned one their time coordinates are checked against the sealed split before
+     they are hashed;
   3. the evaluation is run twice, with the tree's locked `configs/splits.yaml`: the candidate
      against climatology and against NOAA GEFS. Each run is a separate process started with
      `uv run --locked` on that tree. That process is this script again: it checks that the harness
@@ -639,6 +640,24 @@ def _validate_input(ds, path: Path, cfg) -> None:
         raise Refused(f"candidate {path}: its init times are not in time order")
 
 
+def _check_reference_times(ds, store: Path, name: str, cfg) -> None:
+    """Refuse a reference store whose init or valid times reach the sealed split. Coordinates only.
+
+    The store is whatever lies in the caller's data directory under the pinned name. Its content
+    hash decides whether it is the pinned forecast, but hashing reads every value, so the time
+    coordinates are checked first.
+    """
+    from wrfcomp.harness.align import check_forecast_not_sealed
+
+    for coord, kind in ((JOIN_DIM, "M"), ("lead_time", "m")):
+        if coord not in ds.coords or ds[coord].dtype.kind != kind:
+            raise Refused(f"reference {name} at {store} has no {coord} time coordinate")
+    try:
+        check_forecast_not_sealed(ds, what=f"reference {name}", sealed_start=cfg.splits.sealed_test.start)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Refused(f"reference {name} at {store} is refused before it is read: {exc}") from exc
+
+
 def _combine_forecasts(forecasts: list[Path], staging: Path, cfg) -> tuple[Path, list[dict], str, str]:
     """The candidate store to score, the description of every input, and the model id and version.
 
@@ -778,6 +797,7 @@ def evaluate(forecast: Path | list[Path], data_dir: Path, period: str, out_dir: 
         record = entry["references"][name]
         store = data_dir / record["store"]
         with _open_forecast(store, f"reference {name}") as ds:
+            _check_reference_times(ds, store, name, cfg)  # coordinates only, before any value is read
             digest = content_sha256(ds)
         if digest != record["forecast_sha256"]:
             raise Refused(
