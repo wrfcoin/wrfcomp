@@ -210,7 +210,7 @@ def test_report_type_fm12_copy_rejected_and_synoptic_fallback() -> None:
     #   - msl stays NaN (no QC bypass via FM-12)
     #   - variable wind with direction 190 is preserved!
     mixed_csv = io.StringIO(
-        'DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n'
+        "DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n"
         '"2024-06-01T05:53:00","FM-15","+0200,5","+0100,5","10077,6","190,5,V,0041,5"\n'
         '"2024-06-01T06:00:00","FM-12","+0200,1","+0100,1","10077,1","190,1,V,0041,1"\n'
         '"2024-06-01T06:00:00","FM-16","+0205,5","+0100,5","99999,9","200,5,N,0050,5"\n'
@@ -227,7 +227,7 @@ def test_report_type_fm12_copy_rejected_and_synoptic_fallback() -> None:
 
     # Also verify pure FM-15 + FM-12 pair without FM-16 gives offset -7 (never 0 from FM-12)
     pair_csv = io.StringIO(
-        'DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n'
+        "DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n"
         '"2024-06-01T05:53:00","FM-15","+0200,5","+0100,5","10077,6","190,5,V,0041,5"\n'
         '"2024-06-01T06:00:00","FM-12","+0200,1","+0100,1","10077,1","190,1,V,0041,1"\n'
     )
@@ -242,7 +242,7 @@ def test_report_type_fm12_copy_rejected_and_synoptic_fallback() -> None:
 
     # Case 2: Station-year with NO FM-15/FM-16/SY-MT falls back to FM-12 only (dropping SOD)
     synoptic_only = io.StringIO(
-        'DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n'
+        "DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n"
         '"2024-06-01T00:00:00","FM-12","+0150,1","+0050,1","10132,1","180,1,N,0050,1"\n'
         '"2024-06-01T03:00:00","FM-12","+0160,1","+0060,1","10135,1","180,1,N,0050,1"\n'
         '"2024-06-01T05:59:00","SOD  ","+9999,9","+9999,9","99999,9","999,9,9,9999,9"\n'
@@ -256,7 +256,7 @@ def test_report_type_fm12_copy_rejected_and_synoptic_fallback() -> None:
 
     # Case 3: SY-MT alongside FM-12 keeps SY-MT and drops FM-12
     symt_and_fm12 = io.StringIO(
-        'DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n'
+        "DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n"
         '"2024-06-01T02:53:00","SY-MT","+0160,5","+0060,5","10135,5","180,5,N,0050,5"\n'
         '"2024-06-01T03:00:00","FM-12","+0160,1","+0060,1","10135,1","180,1,N,0050,1"\n'
     )
@@ -563,7 +563,7 @@ def test_anti_leakage_guards_reject_2025(tmp_path: Path) -> None:
         build_truth(["72363023047"], "2024-12-31T23:00:00", "2025-01-01T00:00:00", tmp_path)
 
     buf = io.StringIO(
-        'DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n'
+        "DATE,REPORT_TYPE,TMP,DEW,SLP,WND\n"
         '"2024-12-31T23:53:00","FM-15","+0050,5","+0010,5","10132,5","180,5,N,0030,5"\n'
         '"2025-01-01T00:00:00","FM-15","+0060,1","+0020,1","10130,1","180,1,N,0030,1"\n'
     )

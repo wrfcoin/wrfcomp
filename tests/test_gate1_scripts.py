@@ -697,3 +697,40 @@ def test_runner_refuses_sealed_and_short_truth(base_world: dict[str, Path], tmp_
     assert "needs" in capsys.readouterr().err
     assert run(base_world, out, "--thresholds", str(tmp_path / "missing.nc"), periods=("2024-01",)) == 2
     assert not (base_world["data"] / "gate1").exists()
+
+
+def test_quarter_assembly_checks_the_sealed_split_before_loading_a_month_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = load_config()
+    quarter = run_gate1.parse_period("2024-Q4", [0, 12], cfg)
+    months = [run_gate1.parse_period(m, [0, 12], cfg) for m in quarter.months]
+    # October's own init times, but with a lead that carries its valid times into 2025
+    leads = np.array([48, 24 * 100], dtype="timedelta64[h]").astype("timedelta64[ns]")
+    shape = (months[0].init_times.size, leads.size, 1, 1)
+    store = xr.Dataset(
+        {"t2m": (("init_time", "lead_time", "station_id", "ens_member"), np.zeros(shape, dtype="float32"))},
+        coords={
+            "init_time": months[0].init_times,
+            "lead_time": leads,
+            "station_id": ["S0"],
+            "ens_member": [0],
+        },
+        attrs={"model_id": "noaa-gefs", "model_version": "1"},
+    )
+    store.to_zarr(tmp_path / "october.zarr", mode="w")
+
+    def no_values(self, **kwargs):
+        raise AssertionError("a month store was loaded before the sealed-split check")
+
+    monkeypatch.setattr(xr.Dataset, "load", no_values)
+    with pytest.raises(run_gate1.ModelFailed, match="refused before it is read.*sealed split"):
+        run_gate1.assemble_quarter(
+            tmp_path / "q4.zarr",
+            quarter,
+            [tmp_path / "october.zarr"] * 3,
+            months,
+            "gefs",
+            cfg.splits.sealed_test.start,
+        )
+    assert not (tmp_path / "q4.zarr").exists()

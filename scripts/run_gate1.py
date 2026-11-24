@@ -57,6 +57,7 @@ import xarray as xr
 
 from wrfcomp.baselines import climatology, persistence
 from wrfcomp.baselines import io as baseline_io
+from wrfcomp.harness.align import SealedSplitError, check_forecast_not_sealed
 from wrfcomp.harness.config import DEFAULT_CONFIG_PATH, HarnessConfig, load_config
 from wrfcomp.harness.evaluate import app as eval_app
 from wrfcomp.harness.metrics import evaluation_init_times
@@ -303,12 +304,19 @@ def assemble_gefs(path: Path, period: Period, gefs_dir: Path, stations: list[str
 
 
 def assemble_quarter(
-    path: Path, period: Period, month_stores: list[Path], months: list[Period], model: str
+    path: Path,
+    period: Period,
+    month_stores: list[Path],
+    months: list[Period],
+    model: str,
+    sealed_start: np.datetime64,
 ) -> None:
     """A quarter's forecast store: the stores of its months joined along init_time, nothing else.
 
     Every month store must already exist and hold exactly that month's scorable init times, so the
     quarter is made of the same forecasts as the monthly references. Init times end up in time order.
+    A month store whose init or valid times reach `sealed_start` is refused from its coordinates,
+    before any of its values is read.
     """
     parts = []
     for store, month in zip(month_stores, months, strict=True):
@@ -317,6 +325,10 @@ def assemble_quarter(
                 f"{store} is missing: run the months of {period.label} ({', '.join(period.months)}) first"
             )
         with open_store(store, f"{model} forecast {month.label}") as ds:
+            try:
+                check_forecast_not_sealed(ds, what=str(store), sealed_start=sealed_start)
+            except (SealedSplitError, KeyError, TypeError) as exc:
+                raise ModelFailed(f"{store} is refused before it is read: {exc}") from exc
             if ds.sizes.get("init_time") != month.init_times.size or not bool(
                 (np.sort(ds["init_time"].values) == month.init_times).all()
             ):
@@ -466,7 +478,9 @@ def run(args: argparse.Namespace) -> int:
                     month_stores = [
                         data_dir / "gate1" / f"{m}_h{hour_tag}" / f"{model}.zarr" for m in period.months
                     ]
-                    assemble_quarter(stores[model], period, month_stores, months, model)
+                    assemble_quarter(
+                        stores[model], period, month_stores, months, model, cfg.splits.sealed_test.start
+                    )
                     print(f"[{period.label}] {model}: joined the stores of {', '.join(period.months)}")
                 elif model == "gefs":
                     assemble_gefs(stores[model], period, data_dir / "baselines" / "gefs", stations)

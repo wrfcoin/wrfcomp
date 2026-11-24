@@ -50,9 +50,7 @@ def _make_synoptic_fixture(
     gefs_fc = gefs_mean[:, None] + rng.normal(0.0, gefs_err_std, size=(n_obs, n_members))
 
     # Under-dispersed GEFS baseline (spread_skill_ratio ~ 0.25, mirroring Gate 1 GEFS).
-    gefs_under_fc = gefs_mean[:, None] + rng.normal(
-        0.0, 0.25 * gefs_err_std, size=(n_obs, n_members)
-    )
+    gefs_under_fc = gefs_mean[:, None] + rng.normal(0.0, 0.25 * gefs_err_std, size=(n_obs, n_members))
 
     # Two independent honest skilled innovators (mean err std 0.5, calibrated spread).
     innov_err_std = float(np.sqrt(1.0 + 0.5**2))
@@ -64,9 +62,7 @@ def _make_synoptic_fixture(
 
     # Weak/bad forecast strictly worse than GEFS (mean err std 2.2).
     bad_mean = signal + rng.normal(0.0, 2.2, size=n_obs)
-    bad_fc = bad_mean[:, None] + rng.normal(
-        0.0, float(np.sqrt(1.0 + 2.2**2)), size=(n_obs, n_members)
-    )
+    bad_fc = bad_mean[:, None] + rng.normal(0.0, float(np.sqrt(1.0 + 2.2**2)), size=(n_obs, n_members))
 
     return {
         "signal": signal,
@@ -507,9 +503,7 @@ def test_uncalibrated_sharp_forecast_beaten_by_calibrated_equal_mean() -> None:
     """HELD (equal mean): Strictly proper CRPS + twCRPS rejects a sharp clone of a calibrated miner."""
     fx = _make_synoptic_fixture()
     rng = np.random.default_rng(601)
-    sharp_same_mean = fx["innov1_mean"][:, None] + rng.normal(
-        0.0, 0.05, size=fx["innov1_fc"].shape
-    )
+    sharp_same_mean = fx["innov1_mean"][:, None] + rng.normal(0.0, 0.05, size=fx["innov1_fc"].shape)
     assert 0.85 <= _spread_skill_ratio(fx["innov1_fc"], fx["obs"]) <= 1.15
     assert _spread_skill_ratio(sharp_same_mean, fx["obs"]) < 0.15
 
@@ -544,9 +538,9 @@ def test_uncalibrated_sharp_forecast_gated_out_despite_better_mean() -> None:
     fx = _make_synoptic_fixture()
     rng = np.random.default_rng(602)
     # Accurate mean (err std 0.2) but collapsed ensemble spread (0.05) -> spread_skill_ratio < 0.10.
-    sharp_better_mean = (
-        fx["signal"] + rng.normal(0.0, 0.2, size=fx["obs"].size)
-    )[:, None] + rng.normal(0.0, 0.05, size=fx["innov1_fc"].shape)
+    sharp_better_mean = (fx["signal"] + rng.normal(0.0, 0.2, size=fx["obs"].size))[:, None] + rng.normal(
+        0.0, 0.05, size=fx["innov1_fc"].shape
+    )
     assert 0.85 <= _spread_skill_ratio(fx["innov1_fc"], fx["obs"]) <= 1.15
     assert _spread_skill_ratio(sharp_better_mean, fx["obs"]) < 0.15
 

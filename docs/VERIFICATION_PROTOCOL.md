@@ -135,10 +135,10 @@ it says CONSISTENT or INCONSISTENT and is never a promotion. Details and limits:
 only if it passes every gate against both reference baselines in **at least 3 of the 4 calendar quarters** of the
 validation year, each quarter scored as **one period** (`2024-Q1` to `2024-Q4`; Q4 ends with the init of
 2024-12-17T12Z, the last one inside the validation split). `evaluate` says PASSED or NOT PASSED for one period and
-is never a promotion; `python -P scripts/check_promotion.py promote --year 2024 --model-id <id> --model-version <v> <four result directories>`
-combines the four quarter results of one candidate and is the only command that says PROMOTED. A quarter with no
-result, or with a result that is not this check's output for that candidate under the locked harness and pinned
-references, counts as not passed. **Monthly results are diagnostic only**: tail-gate results flip on a month's
+is never a promotion; `python -P scripts/check_promotion.py promote --year 2024 --forecast <the twelve monthly stores> --data-dir <data dir> --out <dir>`
+takes the candidate's forecasts, scores the four quarters itself under the locked harness and pinned references,
+and is the only command that says PROMOTED. It trusts no scorecard or verdict handed to it. A quarter with no
+forecast counts as not passed. **Monthly results are diagnostic only**: tail-gate results flip on a month's
 sample, so no monthly verdict promotes or blocks a candidate. This rule does not change any metric, mask or
 threshold, so `protocol_version` and the pinned reference scorecards are unchanged; the rule has its own number,
 `promotion_rule_version` (1: a single month decided; 2: this rule), recorded in every verdict. The 3-of-4

@@ -13,7 +13,7 @@ Owner decisions 2026-11-23:
     uv run --locked python -P scripts/check_promotion.py evaluate \\
         --forecast JAN.zarr FEB.zarr MAR.zarr --data-dir D --period 2024-Q1 --out DIR
     uv run --locked python -P scripts/check_promotion.py promote --year 2024 \\
-        --model-id M --model-version V DIR/promotion_2024-Q1_... DIR/promotion_2024-Q2_... ...
+        --forecast 2024-01.zarr ... 2024-12.zarr --data-dir D --out DIR
     uv run --locked python -P scripts/check_promotion.py verify A.json B.json --period 2024-Q1
 
 Always with `-P`: without it Python would look for modules next to this script first, and the
@@ -33,27 +33,34 @@ script is in:
      it has imported is the one in the tree and then calls the harness entry point
      (`wrfcomp.harness.evaluate.app`) directly, not the installed `wrfcomp-eval` command;
   4. the two scorecards are judged (rules below). They and `verdict.json` are written in a private
-     directory made for the run and published as `<out>/promotion_<period>_<forecast hash>` at the
-     end. File names are fixed by this program; the candidate's model id is data inside the files.
+     directory made for the run and published as `<out>/promotion_<period>_<id>` at the end, where
+     `<id>` is the start of the sha256 of `verdict.json`. That file names the sha256 of both
+     scorecards, so the name identifies the whole result: the same run always lands in the same
+     directory. File names are fixed by this program; the candidate's model id is data inside the
+     files.
+
+Every candidate store is checked before any of its values is read or hashed: its time coordinates
+against the sealed split, its layout with the harness forecast validator, and its init times, which
+must be in time order (the content hash depends on their order, so one forecast must have one
+order).
 
 A quarter's candidate may be given as several stores, for example its three monthly stores. They
-must be one model and version, with the same variables, leads, stations and members and no init
-time in common. They are joined along init time in time order (whatever order they are given in),
-written once into the run's private directory, scored from there and removed. The forecast hash in
-the scorecards is the harness content hash of the joined forecast, which depends only on its
-values, coordinates, dimensions and dtypes, so the same monthly stores always give the same hash.
+must be one model and version, with the same variables, variable attributes (units), leads, stations
+and members, and must not share or interleave init times. They are joined along init time in time
+order (whatever order they are given in), written once into the run's private directory, scored
+from there and removed. The forecast hash in the scorecards is the harness content hash of the
+joined forecast, which depends only on its values, coordinates, dimensions and dtypes, so the same
+monthly stores always give the same hash, and the same hash as the quarter stored whole.
 `verdict.json` lists the content hash of each input store.
 
-`promote` takes the result directories `evaluate` published for the four quarters of a year and one
-candidate (model id and version). For each quarter it checks that the directory is this check's
-output for that candidate under this tree: the two scorecards are judged again against the pinned
-references, and `verdict.json` must be byte for byte what this program writes for them (same
-candidate, rule version, harness and protocol version, the same `REFERENCES.json`, and the sha256
-of each scorecard file). A quarter
-with no result, or with a result that fails any of this, counts as NOT PASSED. It prints PROMOTED
-only when at least 3 of the 4 quarters passed. It is the only mode that can print PROMOTED. It
-checks consistency with the pinned references, NOT provenance: it reads files and cannot know who
-wrote them.
+`promote` takes the candidate's forecast stores for a year (its twelve monthly stores) and does the
+scoring itself. It sorts the stores into the four calendar quarters by their init times, runs
+`evaluate` for each quarter (so every scoring is a separate process on the locked harness, as
+above), and counts the quarters that passed. A quarter with no store has not passed. It prints
+PROMOTED only when at least 3 of the 4 quarters passed, and it is the only mode that can print
+PROMOTED. It reads no scorecard, verdict or result directory supplied by the caller: the verdict
+rests only on what this run computed. The quarter results and a `decision.json` are published
+under `--out` as a record; they are not an input to anything.
 
 `verify` applies the judging rules to two scorecards that already exist. It proves nothing about
 where they came from, so it prints CONSISTENT or INCONSISTENT.
@@ -74,7 +81,7 @@ Both scorecards must describe the same candidate forecast, and both gates must b
 
 Exit codes: 0 PASSED (evaluate), PROMOTED (promote) or CONSISTENT (verify); 1 NOT PASSED,
 NOT PROMOTED or INCONSISTENT; 2 refused (bad input, unpinned or missing references, harness not
-locked or not from this tree, two results for one quarter).
+locked or not from this tree, candidate stores that are not one forecast of one year).
 Locked: see docs/HARNESS_LOCK.md, which also lists what this check does not establish.
 """
 
@@ -149,11 +156,7 @@ PROMOTION_RULE_VERSION = 2
 QUARTERS_REQUIRED = 3
 COMBINED_NAME = "candidate_combined.zarr"  # the joined candidate of one run; removed before publishing
 JOIN_DIM = "init_time"
-PROMOTE_NOTICE = (
-    "promote checks that the quarter results are consistent with the pinned references and with each "
-    "other. It reads files and proves nothing about who wrote them: re-run `evaluate` to be sure."
-)
-HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+DECISION_NAME = "decision.json"
 # Every module the scores come from. `evaluate` requires each to be loaded from the checked tree.
 HARNESS_MODULES = (
     "wrfcomp",
@@ -529,18 +532,30 @@ def score_one(root: Path, args: list[str]) -> int:
 
 
 def _publish(staging: Path, out_dir: Path, name: str) -> Path:
-    """Move the finished run directory into place. An identical earlier result is kept as it is."""
+    """Move the finished run directory into place.
+
+    `name` identifies the contents (it carries the hash of the file that names every other file's
+    hash), so a directory already there under that name is the same result and is kept. One that
+    holds something else was changed after it was written: nothing is overwritten.
+    """
     final = out_dir / name
     if final.exists():
         ours = {p.name: p.read_bytes() for p in sorted(staging.iterdir())}
         theirs = {p.name: p.read_bytes() for p in sorted(final.iterdir())} if final.is_dir() else None
-        if ours == theirs:
-            shutil.rmtree(staging)
-            return final
-        final = out_dir / f"{name}-{staging.name.rsplit('-', 1)[-1]}"  # same candidate, different result
+        if ours != theirs:
+            raise Refused(
+                f"{final} exists and is not the result this run produced; move it away and run again"
+            )
+        shutil.rmtree(staging)
+        return final
     staging.chmod(0o755)
     os.rename(staging, final)
     return final
+
+
+def _result_name(what: str, text: str) -> str:
+    """Directory name of a published result: `text` is its verdict or decision file."""
+    return f"promotion_{what}_{hashlib.sha256(text.encode('ascii')).hexdigest()[:16]}"
 
 
 def _references_sha256(root: Path) -> str:
@@ -591,11 +606,45 @@ def _describe_input(ds, digest: str) -> dict:
     }
 
 
-def _combine_forecasts(forecasts: list[Path], staging: Path) -> tuple[Path, list[dict], str, str]:
+def _load_locked_config(root: Path):
+    from wrfcomp.harness.config import load_config
+
+    return load_config(root / "configs" / "splits.yaml")
+
+
+def _validate_input(ds, path: Path, cfg) -> None:
+    """Refuse a candidate store that must not be read. Coordinates and attributes only.
+
+    Called before any forecast value is read or hashed: the time coordinates are checked against the
+    sealed split first, then the store goes through the harness forecast validator, and its init
+    times must be in time order.
+    """
+    import numpy as np
+
+    from wrfcomp.harness.align import check_forecast_not_sealed
+    from wrfcomp.harness.schemas import validate_forecast_dataset
+
+    for name, kind in ((JOIN_DIM, "M"), ("lead_time", "m")):
+        if name not in ds.dims or ds.sizes[name] == 0 or name not in ds.coords:
+            raise Refused(f"candidate {path} has no {name} dimension or it is empty")
+        if ds[name].dtype.kind != kind:
+            raise Refused(f"candidate {path}: {name} is {ds[name].dtype}, not a time")
+    try:
+        check_forecast_not_sealed(ds, what=f"candidate {path}", sealed_start=cfg.splits.sealed_test.start)
+        validate_forecast_dataset(ds, cfg=cfg)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Refused(f"candidate {path} is refused: {exc}") from exc
+    times = ds[JOIN_DIM].values
+    if times.size > 1 and not bool((np.diff(times) > np.timedelta64(0, "ns")).all()):
+        raise Refused(f"candidate {path}: its init times are not in time order")
+
+
+def _combine_forecasts(forecasts: list[Path], staging: Path, cfg) -> tuple[Path, list[dict], str, str]:
     """The candidate store to score, the description of every input, and the model id and version.
 
-    One store is scored as it is. Several stores (a quarter given as its months) are joined along
-    init time in time order and written once into `staging`; see the module docstring for the rule.
+    Every store is validated (`_validate_input`) before any store is hashed. One store is scored as
+    it is. Several stores (a quarter given as its months) are joined along init time in time order
+    and written once into `staging`; see the module docstring for the rule.
     """
     import numpy as np
     import xarray as xr
@@ -607,8 +656,7 @@ def _combine_forecasts(forecasts: list[Path], staging: Path) -> tuple[Path, list
         for path in forecasts:
             ds = _open_forecast(path, "candidate")
             parts.append((path, ds))
-            if JOIN_DIM not in ds.dims or ds.sizes[JOIN_DIM] == 0:
-                raise Refused(f"candidate {path} has no init_time dimension or no init times")
+            _validate_input(ds, path, cfg)
         identity = {
             (str(ds.attrs.get("model_id", "")), str(ds.attrs.get("model_version", ""))) for _, ds in parts
         }
@@ -631,6 +679,8 @@ def _combine_forecasts(forecasts: list[Path], staging: Path) -> tuple[Path, list
         all_times = np.concatenate([ds[JOIN_DIM].values for _, ds in ordered])
         if np.unique(all_times).size != all_times.size:
             raise Refused("the candidate stores have an init time in common")
+        if not bool((np.diff(all_times) > np.timedelta64(0, "ns")).all()):
+            raise Refused("the candidate stores interleave in time: each must cover its own stretch")
         for path, ds in ordered[1:]:
             if set(ds.variables) != set(first.variables) or set(ds.data_vars) != set(first.data_vars):
                 raise Refused(f"candidate {path} has other variables or coordinates than {first_path}")
@@ -640,16 +690,29 @@ def _combine_forecasts(forecasts: list[Path], staging: Path) -> tuple[Path, list
                     raise Refused(
                         f"candidate {path}: {name} has other dimensions or dtype than in {first_path}"
                     )
+                if json.dumps(dict(ours.attrs), sort_keys=True, default=str) != json.dumps(
+                    dict(theirs.attrs), sort_keys=True, default=str
+                ):
+                    raise Refused(
+                        f"candidate {path}: {name} has other attributes (units) than in {first_path}"
+                    )
                 if JOIN_DIM in theirs.dims:
                     continue  # joined along init time
                 same = np.array_equal(ours.values, theirs.values, equal_nan=theirs.dtype.kind == "f")
                 if not same:
                     raise Refused(f"candidate {path}: {name} differs from {first_path}")
         loaded = [ds.load() for _, ds in ordered]
-        joined = xr.concat(loaded, dim=JOIN_DIM, data_vars="all", coords="minimal", compat="override")
-        joined = joined.sortby(JOIN_DIM)
+        joined = xr.concat(
+            loaded,
+            dim=JOIN_DIM,
+            data_vars="all",
+            coords="minimal",
+            compat="override",
+            combine_attrs="override",
+        )
         joined.attrs = dict(first.attrs)
         for name in joined.variables:
+            joined[name].attrs = dict(first[name].attrs)  # equal in every part, checked above
             joined[name].encoding.clear()
         target = staging / COMBINED_NAME
         joined.to_zarr(target, mode="w-", consolidated=True, zarr_format=2)
@@ -672,9 +735,9 @@ def evaluate(forecast: Path | list[Path], data_dir: Path, period: str, out_dir: 
     refused.
 
     The two scorecards and `verdict.json` are written into a private directory made for this run,
-    under names this program chooses, and published as `<out_dir>/promotion_<period>_<hash>` when
-    the run is complete. The candidate's model id is recorded inside the files; it is never part of
-    a path.
+    under names this program chooses, and published as `<out_dir>/promotion_<period>_<id>` when
+    the run is complete (`_result_name`). The candidate's model id is recorded inside the files; it
+    is never part of a path.
     """
     from wrfcomp.harness.hashing import content_sha256
 
@@ -705,10 +768,10 @@ def evaluate(forecast: Path | list[Path], data_dir: Path, period: str, out_dir: 
         raise Refused("several candidate stores can be given for a quarter only; a month takes one store")
     if len({path.resolve() for path in forecasts}) != len(forecasts):
         raise Refused("a candidate store is listed twice")
-    for path in forecasts:  # refuse a missing or unreadable candidate before anything is created
+    cfg = _load_locked_config(root)
+    for path in forecasts:  # refuse a candidate that must not be read before anything is read or created
         with _open_forecast(path, "candidate") as ds:
-            if not str(ds.attrs.get("model_id", "")) or not str(ds.attrs.get("model_version", "")):
-                raise Refused("the candidate forecast has no model_id or model_version attribute")
+            _validate_input(ds, path, cfg)
 
     stores: dict[str, Path] = {}
     for name in REQUIRED_BASELINES:
@@ -728,7 +791,7 @@ def evaluate(forecast: Path | list[Path], data_dir: Path, period: str, out_dir: 
     out_dir.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".promotion-run-", dir=out_dir))  # private: mode 0700
     try:
-        scored, forecast_inputs, model_id, model_version = _combine_forecasts(forecasts, staging)
+        scored, forecast_inputs, model_id, model_version = _combine_forecasts(forecasts, staging, cfg)
         cards: list[dict] = []
         reasons: list[str] = []
         for name in REQUIRED_BASELINES:
@@ -771,8 +834,7 @@ def evaluate(forecast: Path | list[Path], data_dir: Path, period: str, out_dir: 
             root=root,
         )
         (staging / VERDICT_NAME).write_text(text, encoding="ascii")
-        token = digest[:16] if HEX_DIGEST.fullmatch(digest) else "unscored-" + staging.name.rsplit("-", 1)[-1]
-        return Outcome(reasons=reasons, directory=_publish(staging, out_dir, f"promotion_{period}_{token}"))
+        return Outcome(reasons=reasons, directory=_publish(staging, out_dir, _result_name(period, text)))
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -791,86 +853,37 @@ class Quarter:
     directory: Path | None
 
 
-def _inspect_quarter_result(
-    directory: Path, period: str, model_id: str, model_version: str, inventory: dict, root: Path
-) -> list[str]:
-    """Reasons this directory is NOT a passing result of this check for this candidate and period.
+@dataclass(frozen=True)
+class Decision:
+    """Result of `promote`: the candidate, its four quarters, and where the record was published."""
 
-    The scorecards are judged again against the pinned references, and `verdict.json` must be byte
-    for byte what `evaluate` writes for them under this tree. Empty = the quarter passed.
-    """
-    verdict_path = directory / VERDICT_NAME
-    try:
-        recorded_text = verdict_path.read_text(encoding="ascii")
-        recorded = json.loads(recorded_text)
-    except (OSError, ValueError):
-        return [f"{VERDICT_NAME} cannot be read"]
-    if not isinstance(recorded, dict):
-        return [f"{VERDICT_NAME} is not a JSON object"]
+    year: int
+    model_id: str
+    model_version: str
+    quarters: list[Quarter]
+    directory: Path
 
-    problems: list[str] = []
-    candidate = recorded.get("candidate") if isinstance(recorded.get("candidate"), dict) else {}
-    if (candidate.get("model_id"), candidate.get("model_version")) != (model_id, model_version):
-        problems.append(
-            f"the result is for another candidate ({candidate.get('model_id')!r} version "
-            f"{candidate.get('model_version')!r})"
-        )
-    if recorded.get("promotion_rule_version") != PROMOTION_RULE_VERSION:
-        problems.append(
-            "the result was written under promotion rule version "
-            f"{recorded.get('promotion_rule_version')!r}, not {PROMOTION_RULE_VERSION}"
-        )
-    for key in ("harness_version", "protocol_version"):
-        if recorded.get(key) != inventory[key]:
-            problems.append(f"the result was scored with another {key}: {recorded.get(key)!r}")
-    if recorded.get("references_sha256") != _references_sha256(root):
-        problems.append(f"the result was judged against another {INVENTORY}")
-
-    present = sorted(p.name for p in directory.iterdir())
-    names = recorded.get("scorecards")
-    expected_names = sorted(STAGED_NAMES.values())
-    listed = sorted(names) if isinstance(names, dict) else None
-    if present != sorted([*expected_names, VERDICT_NAME]) or listed != expected_names:
-        problems.append(
-            "the directory does not hold exactly the two scorecards and the verdict of a scored run"
-        )
-        return problems + [
-            f"recorded: {line}" for line in recorded.get("reasons", []) if isinstance(line, str)
-        ]
-
-    cards = [_read_json(directory / name, "scorecard") for name in expected_names]
-    reasons = judge(cards, period, inventory, root)
-    digests = {str(card.get("forecast_sha256")) for card in cards}
-    digest = digests.pop() if len(digests) == 1 else ""
-    inputs = recorded.get("forecast_inputs")
-    expected_text = _verdict_text(
-        period=period,
-        reasons=reasons,
-        model_id=str(cards[0].get("model_id")),
-        model_version=str(cards[0].get("model_version")),
-        digest=digest or None,
-        scorecards={name: _sha256_file(directory / name) for name in expected_names},
-        forecast_inputs=inputs if isinstance(inputs, list) else [],
-        inventory=inventory,
-        root=root,
-    )
-    if recorded_text != expected_text:
-        problems.append(f"{VERDICT_NAME} is not what this check writes for these two scorecards")
-    token = digest[:16] if HEX_DIGEST.fullmatch(digest) else None
-    if directory.name != f"promotion_{period}_{token}":
-        problems.append("the directory name is not the one this check gives this result")
-    return sorted(set(problems)) + reasons
+    @property
+    def promoted(self) -> bool:
+        return sum(q.passed for q in self.quarters) >= QUARTERS_REQUIRED
 
 
-def promote(
-    directories: list[Path], year: int, model_id: str, model_version: str, root: Path
-) -> list[Quarter]:
-    """The four quarters of `year` for one candidate, each passed or not. The caller counts them.
+def _quarters_of(ds) -> set[str]:
+    """The calendar quarters the store's init times fall in (coordinates only)."""
+    months = ds[JOIN_DIM].values.astype("datetime64[M]").astype("int64")  # months since 1970-01
+    return {f"{1970 + int(m) // 12:04d}-Q{int(m) % 12 // 3 + 1}" for m in set(months.tolist())}
 
-    A quarter passes only with a result directory that `_inspect_quarter_result` accepts. A quarter
-    with no directory, or with one that is refused as evidence, has not passed. Refused outright
-    (exit code 2): a tree that is not the locked harness, quarters that are not pinned, a directory
-    that names no quarter of the year, and two directories for the same quarter.
+
+def promote(forecasts: list[Path], data_dir: Path, year: int, out_dir: Path, root: Path) -> Decision:
+    """Score the candidate's stores quarter by quarter and count the quarters that passed.
+
+    The stores (the candidate's twelve monthly stores) are sorted into the four calendar quarters of
+    `year` by their init times, and `evaluate` is run for each quarter that has stores: this
+    function reads no scorecard or verdict that it did not just compute. A quarter with no store
+    has not passed. Refused outright (exit code 2): a tree that is not the locked harness, quarters
+    that are not pinned, no store, a store listed twice, a store that fails `_validate_input`, lies
+    outside the year or spans two quarters, stores that are not one model id and version, and
+    anything `evaluate` refuses for a quarter.
     """
     root = root.resolve()
     problems = _harness_lock_problems(root)
@@ -882,38 +895,75 @@ def promote(
             f"the harness in use is not the one under {root}: " + "; ".join(outside[:3]) + ". "
             "Run this script with `uv run --locked` from that checkout."
         )
-    if not model_id or not model_version:
-        raise Refused("the candidate's model id and model version are both needed")
     inventory = load_inventory(root)
     quarters = [f"{year:04d}-Q{n}" for n in range(1, 5)]
     unpinned = [q for q in quarters if q not in inventory["periods"]]
     if unpinned:
         raise Refused(f"no pinned references for {', '.join(unpinned)}")
+    if not forecasts:
+        raise Refused("no candidate forecast was given")
+    if len({path.resolve() for path in forecasts}) != len(forecasts):
+        raise Refused("a candidate store is listed twice")
 
-    given: dict[str, Path] = {}
-    for directory in directories:
-        directory = directory.resolve()
-        if not directory.is_dir():
-            raise Refused(f"not a result directory: {directory}")
-        try:
-            period = json.loads((directory / VERDICT_NAME).read_text(encoding="ascii")).get("period")
-        except (OSError, ValueError, AttributeError):
-            raise Refused(f"{directory} has no readable {VERDICT_NAME}") from None
-        if period not in quarters:
-            raise Refused(f"{directory} is a result for {period!r}, not for a quarter of {year}")
-        if period in given:
-            raise Refused(f"two results were given for {period}: {given[period]} and {directory}")
-        given[period] = directory
+    cfg = _load_locked_config(root)
+    stores: dict[str, list[Path]] = {q: [] for q in quarters}
+    identity: set[tuple[str, str]] = set()
+    for path in forecasts:
+        with _open_forecast(path, "candidate") as ds:
+            _validate_input(ds, path, cfg)
+            identity.add((str(ds.attrs.get("model_id", "")), str(ds.attrs.get("model_version", ""))))
+            found = sorted(_quarters_of(ds))
+        if len(found) != 1:
+            raise Refused(f"candidate {path} holds init times of {', '.join(found)}: one quarter per store")
+        if found[0] not in stores:
+            raise Refused(f"candidate {path} holds init times of {found[0]}, not of {year}")
+        stores[found[0]].append(path)
+    if len(identity) != 1:
+        raise Refused("the candidate stores are not one model and version")
+    model_id, model_version = identity.pop()
 
-    results = []
+    out_dir = out_dir.resolve()
+    results: list[Quarter] = []
     for period in quarters:
-        directory = given.get(period)
-        if directory is None:
-            results.append(Quarter(period, False, ["no result was given for this quarter"], None))
+        if not stores[period]:
+            results.append(Quarter(period, False, ["no candidate store was given for this quarter"], None))
             continue
-        reasons = _inspect_quarter_result(directory, period, model_id, model_version, inventory, root)
-        results.append(Quarter(period, not reasons, reasons, directory))
-    return results
+        outcome = evaluate(stores[period], data_dir, period, out_dir, root)
+        results.append(Quarter(period, not outcome.reasons, outcome.reasons, outcome.directory))
+
+    decision = Decision(year, model_id, model_version, results, out_dir)
+    record = {
+        "year": year,
+        "decision": "PROMOTED" if decision.promoted else "NOT PROMOTED",
+        "quarters_passed": sum(q.passed for q in results),
+        "quarters_required": QUARTERS_REQUIRED,
+        "candidate": {"model_id": model_id, "model_version": model_version},
+        "quarters": [
+            {
+                "period": q.period,
+                "verdict": "PASSED" if q.passed else "NOT PASSED",
+                "reasons": q.reasons,
+                "result": q.directory.name if q.directory else None,
+                "verdict_sha256": _sha256_file(q.directory / VERDICT_NAME) if q.directory else None,
+            }
+            for q in results
+        ],
+        "baselines": list(REQUIRED_BASELINES),
+        "promotion_rule_version": PROMOTION_RULE_VERSION,
+        "harness_version": inventory["harness_version"],
+        "protocol_version": inventory["protocol_version"],
+        "references_sha256": _references_sha256(root),
+    }
+    text = json.dumps(record, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".promotion-run-", dir=out_dir))
+    try:
+        (staging / DECISION_NAME).write_text(text, encoding="ascii")
+        published = _publish(staging, out_dir, _result_name(f"{year:04d}", text))
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+    return Decision(year, model_id, model_version, results, published)
 
 
 # --------------------------------------------------------------------------- command line
@@ -939,14 +989,23 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--period", required=True, help="a period pinned in experiments/REFERENCES.json")
     run.add_argument("--out", type=Path, required=True, help="directory for the two scorecards")
     decide = modes.add_parser(
-        "promote", help=f"PROMOTED if at least {QUARTERS_REQUIRED} of the 4 quarter results of a year passed"
+        "promote",
+        help=f"score a candidate's year: PROMOTED if at least {QUARTERS_REQUIRED} of the 4 quarters pass",
     )
     decide.add_argument(
-        "results", type=Path, nargs="*", metavar="RESULT_DIR", help="directories from evaluate"
+        "--forecast",
+        type=Path,
+        required=True,
+        nargs="+",
+        help="the candidate's stores for the year (its months)",
+    )
+    decide.add_argument(
+        "--data-dir", type=Path, required=True, help="data directory with truth and references"
     )
     decide.add_argument("--year", type=int, required=True)
-    decide.add_argument("--model-id", required=True, help="the candidate the results must be about")
-    decide.add_argument("--model-version", required=True)
+    decide.add_argument(
+        "--out", type=Path, required=True, help="directory for the quarter results and the record"
+    )
     look = modes.add_parser("verify", help="compare two existing scorecards with the pinned references")
     look.add_argument("scorecards", type=Path, nargs=2, metavar="SCORECARD")
     look.add_argument("--period", required=True, help="a period pinned in experiments/REFERENCES.json")
@@ -959,9 +1018,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.mode == "promote":
-            print(PROMOTE_NOTICE)
-            quarters = promote(args.results, args.year, args.model_id, args.model_version, root=ROOT)
-            return _report_promotion(quarters, args.year, args.model_id, args.model_version)
+            return _report_promotion(promote(args.forecast, args.data_dir, args.year, args.out, root=ROOT))
         if args.mode == "evaluate":
             forecast = args.forecast[0] if len(args.forecast) == 1 else args.forecast
             outcome = evaluate(forecast, args.data_dir, args.period, args.out, root=ROOT)
@@ -1002,15 +1059,18 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _report_promotion(quarters: list[Quarter], year: int, model_id: str, model_version: str) -> int:
+def _report_promotion(decision: Decision) -> int:
+    quarters = decision.quarters
     passed = [q.period for q in quarters if q.passed]
     for quarter in quarters:
         print(f"{quarter.period}: {'PASSED' if quarter.passed else 'NOT PASSED'}")
         for line in quarter.reasons:
             print(f"  - {line}")
-    count = f"{len(passed)} of {len(quarters)} quarters of {year} passed (rule: at least {QUARTERS_REQUIRED})"
-    who = f"{model_id} version {model_version}"
-    if len(passed) >= QUARTERS_REQUIRED:
+    print(f"Quarter results and decision record: {decision.directory.parent}")
+    count = f"{len(passed)} of {len(quarters)} quarters of {decision.year} passed"
+    count += f" (rule: at least {QUARTERS_REQUIRED})"
+    who = f"{decision.model_id} version {decision.model_version}"
+    if decision.promoted:
         print(f"PROMOTED: {who}. {count}, each against {' and '.join(REQUIRED_BASELINES)}.")
         return 0
     print(f"NOT PROMOTED: {who}. {count}.")
