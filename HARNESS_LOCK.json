@@ -1,25 +1,118 @@
 {
-  "files": {
-    "configs/splits.yaml": "5363b9dec556967e3913c316f471029cad73754761de793c887d8a67980d4244",
-    "configs/stations_conus.csv": "a21832e211ab4232e844b0bba633223588cbd7964d7367d49284dd9bbd27a819",
-    "docs/VERIFICATION_PROTOCOL.md": "fb12164635b578410a4e7179bba5ba997daa8cf8e85c10afbbccf852fe708b4b",
-    "scripts/check_promotion.py": "e0772f61bf92405619679ed56c87e8919ccf3cda0e1e407b77fb16ca9a9ce939",
-    "src/wrfcomp/harness/__init__.py": "ae51a905c745f257da1c1e26b34b8ff62473cc07b93a744cbdfbe692cf8eb205",
-    "src/wrfcomp/harness/align.py": "26e45bf17ed71c507deaab2f6419aaae910121f5d1ecdbb3443d351fae2dcdb7",
-    "src/wrfcomp/harness/config.py": "27bb2d9fc071ddff3d6abf88d1b09c4bf8b7e8daabc1383680a08c626555928e",
-    "src/wrfcomp/harness/evaluate.py": "165b301d351033546811691ba2d89e3939a47df0a5bc43425ad40367a804bf27",
-    "src/wrfcomp/harness/hashing.py": "9053a91e2815948752019ae8df435c96e346e19aa63abca4d59cf01c149f6703",
-    "src/wrfcomp/harness/metrics.py": "360e245fd92d671706a94c9025568bc54e1bdb8f65b0eb27df65b63f5aba32dd",
-    "src/wrfcomp/harness/schemas.py": "850de36a6574f92d5b14e199e0f47165c4b0319f8be1a95a373d79bfd860f4b3",
-    "src/wrfcomp/harness/truth.py": "b1e769728142ffe83bb60cbcb2b1e879dd63982db3426938162f9f0050f3b1ae"
+  "entries": {
+    "configs/splits.yaml": {
+      "blob": "2849076026621b8782900396a9c85e5a8dcfe4b4",
+      "mode": "100644"
+    },
+    "configs/stations_conus.csv": {
+      "blob": "8013fb285169f937ec4f207f6055021b10d6f4aa",
+      "mode": "100644"
+    },
+    "docs/VERIFICATION_PROTOCOL.md": {
+      "blob": "63db5ac099cd8e0817794b33fe31ff5c5b4495c4",
+      "mode": "100644"
+    },
+    "experiments/REFERENCES.json": {
+      "blob": "22f9b4430ab07e841ccbe5573bc59c68884de444",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-01.json": {
+      "blob": "a2317c5e2b9e22bdb36837906b02ff1841ec6c8d",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-07.json": {
+      "blob": "a0c150fbd72769e7707c60c4c9105cdb734b3fcd",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-01.json": {
+      "blob": "c0010e0826824b8f1c4f4bfbb7913d5b840c2d35",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-07.json": {
+      "blob": "9c4ca13de18473e9a5c31106985329e01c997328",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-01.json": {
+      "blob": "827ebd2de897aa96caa71b84975dc03cc5813813",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-07.json": {
+      "blob": "f17e00e65d8433a712a84bf1ecde51f7b97219cd",
+      "mode": "100644"
+    },
+    "scripts/check_promotion.py": {
+      "blob": "1640d590245b9313205dfdb28ed6a3eb626d53bd",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/__init__.py": {
+      "blob": "96ab8290cfe8750f8f054ef4357d1862f50ab6a9",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/align.py": {
+      "blob": "6084d96e6ca04af399ed902d1a73a64bb8564bf0",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/config.py": {
+      "blob": "e97956226d2eccbb0626dd0570d9d5e4d2a9678d",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/evaluate.py": {
+      "blob": "b8a8133fa8cf711c9fbe5ab737b92a728e533cdd",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/hashing.py": {
+      "blob": "7a8a66804c2c1fc04d0adff9ac884753985d81f1",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/metrics.py": {
+      "blob": "9b05053dd65f8cb2452a4c03f49fa8884f1e5ce3",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/schemas.py": {
+      "blob": "d2eda298db100b0be60eb540cdc2c059b00d95a6",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/truth.py": {
+      "blob": "6d07076f40d68b7ca2416015a792f70a307a93be",
+      "mode": "100644"
+    }
   },
   "harness_version": "0.1.0",
-  "locked_dirs": [
-    "src/wrfcomp/harness",
-    "configs"
-  ],
-  "locked_files": [
-    "docs/VERIFICATION_PROTOCOL.md",
-    "scripts/check_promotion.py"
-  ]
+  "manifest_version": 2,
+  "scope": {
+    "dirs": [
+      "src/wrfcomp/harness",
+      "configs"
+    ],
+    "files": [
+      "docs/VERIFICATION_PROTOCOL.md",
+      "scripts/check_promotion.py",
+      "experiments/REFERENCES.json",
+      "experiments/climatology_2024-01.json",
+      "experiments/climatology_2024-07.json",
+      "experiments/gefs_2024-01.json",
+      "experiments/gefs_2024-07.json",
+      "experiments/persistence_2024-01.json",
+      "experiments/persistence_2024-07.json"
+    ]
+  },
+  "scoring_dependencies": {
+    "numpy": [
+      "2.4.6",
+      "2.5.5"
+    ],
+    "pandas": [
+      "3.1.1"
+    ],
+    "scipy": [
+      "1.17.1",
+      "1.18.1"
+    ],
+    "scores": [
+      "2.7.0"
+    ],
+    "xarray": [
+      "2026.9.0"
+    ]
+  }
 }

@@ -1,14 +1,15 @@
 name: ci
 
+# Hash check, lint and tests. The owner-approval gate for the locked harness is NOT here: it lives
+# in harness-lock.yml, which runs from the base branch (docs/HARNESS_LOCK.md).
+
 on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
-  pull-requests: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,35 +21,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Harness lock, hashes
+      - name: Harness lock, tree and dependency pins
         run: python3 scripts/harness_lock.py check
-      - name: Harness lock, owner approval for locked paths
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASE_REF: ${{ github.base_ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          changed=$(git diff --name-only "origin/${BASE_REF}...HEAD" -- \
-            src/wrfcomp/harness configs HARNESS_LOCK.json scripts/harness_lock.py \
-            tests/test_harness_lock.py .github docs/VERIFICATION_PROTOCOL.md \
-            scripts/check_promotion.py tests/test_check_promotion.py docs/HARNESS_LOCK.md)
-          if [ -z "$changed" ]; then
-            echo "No locked path touched."
-            exit 0
-          fi
-          echo "Locked paths touched:"
-          echo "$changed"
-          if gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name' \
-            | grep -qx 'owner-approved-harness-change'; then
-            echo "Label owner-approved-harness-change is present."
-          else
-            echo "This pull request changes the locked harness. It needs the project owner's approval:"
-            echo "the label owner-approved-harness-change, applied by the owner. See docs/HARNESS_LOCK.md."
-            exit 1
-          fi
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true

@@ -121,11 +121,15 @@ Harvey-Leybourne-Newbold form at `h = 1` gave 15–31 %; with HG the lag `h` is 
 autocorrelation and does not change the result on a long series (details in `wrfcomp.harness.metrics`).
 
 **Two reference baselines (owner decision 2026-11-23):** a candidate is promoted only if it passes the whole gate
-above against **both** reference baselines, climatology and NOAA GEFS, each in its own `wrfcomp-eval` scorecard
-for the same forecast, truth, thresholds and period (raw GEFS is the harder reference in winter, climatology in
-summer). `scripts/check_promotion.py <scorecard A> <scorecard B> experiments/` gives the verdict. It also
-refuses a baseline that is not one of the committed reference forecasts in `experiments/`, so a weakened
-stand-in baseline cannot be used. Against GEFS the scored leads are the ones GEFS has (3 h and longer).
+above against **both** reference baselines, climatology and NOAA GEFS, for the same forecast, truth, thresholds
+and period (raw GEFS is the harder reference in winter, climatology in summer). The verdict comes from
+`scripts/check_promotion.py evaluate --forecast <candidate.zarr> --data-dir <data dir> --period <YYYY-MM> --out <dir>`,
+which runs `wrfcomp-eval` twice itself and judges the two scorecards it produced. The reference forecasts, their
+truth, thresholds, period, init count and leads are pinned per period in `experiments/REFERENCES.json`; a reference
+store whose content hash is not the pinned one is refused, so a weakened stand-in baseline cannot be used, and a
+candidate whose forecast is a copy of a reference is refused. Against climatology every v1 lead is scored; against
+GEFS the leads GEFS has (3 h and longer). The `verify` mode only compares two existing scorecards with the pins:
+it says CONSISTENT or INCONSISTENT and is never a promotion. Details and limits: `docs/HARNESS_LOCK.md`.
 
 **Multiple-Testing Guard (Agentic Research Loops):** When an automated swarm tests `M` candidate architectures on the 2024 validation split within a single research sprint, apply a **Bonferroni-adjusted threshold (`alpha = 0.05 / M`)** or require the winning candidate to hold its gain across at least **3 of 4 calendar quarters** of 2024 before promoting it to a release candidate.
 

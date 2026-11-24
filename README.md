@@ -45,9 +45,11 @@ The `ai` extra (Earth2Studio, torch) needs an NVIDIA GPU and is not required for
 
 ## Harness lock
 
-`src/wrfcomp/harness/` and `configs/` are **locked at harness version 0.1.0** (2026-11-23). A change there
-needs the project owner's approval, a version bump and a re-score of every baseline; CI refuses it otherwise.
-See [docs/HARNESS_LOCK.md](docs/HARNESS_LOCK.md). Everything else merges on green CI.
+`src/wrfcomp/harness/`, `configs/`, the verification protocol, the promotion check and the Gate 1 reference
+scorecards are **locked at harness version 0.1.0** (2026-11-23). A change there needs the project owner's
+approval on the exact commit, a version bump and a re-score of every baseline. A candidate is promoted only if
+it passes the gate against both climatology and NOAA GEFS. What is enforced, and what is not, is in
+[docs/HARNESS_LOCK.md](docs/HARNESS_LOCK.md). Everything else merges on green CI.
 
 ## Data
 
