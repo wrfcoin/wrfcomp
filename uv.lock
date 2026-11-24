@@ -3206,8 +3206,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "dask" },
-    { name = "eccodes" },
-    { name = "eccodeslib" },
     { name = "h5netcdf" },
     { name = "h5py" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -3233,13 +3231,17 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
 ]
+grib = [
+    { name = "eccodes" },
+    { name = "eccodeslib" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "dask", specifier = ">=2024.10.0" },
     { name = "earth2studio", marker = "extra == 'ai'", specifier = ">=0.9.0" },
-    { name = "eccodes", specifier = ">=2.50.1" },
-    { name = "eccodeslib", specifier = ">=2.50.0.34" },
+    { name = "eccodes", marker = "extra == 'grib'", specifier = ">=2.50.1" },
+    { name = "eccodeslib", marker = "extra == 'grib'", specifier = ">=2.50.0.34" },
     { name = "h5netcdf", specifier = ">=1.8.3" },
     { name = "h5py", specifier = ">=3.16.0" },
     { name = "numpy", specifier = ">=2.0.0" },
@@ -3255,7 +3257,7 @@ requires-dist = [
     { name = "xarray", specifier = ">=2024.10.0" },
     { name = "zarr", specifier = ">=2.18.0" },
 ]
-provides-extras = ["ai", "dev"]
+provides-extras = ["ai", "dev", "grib"]
 
 [[package]]
 name = "xarray"

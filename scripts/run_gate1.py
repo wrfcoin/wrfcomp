@@ -47,6 +47,7 @@ import calendar
 import json
 import os
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -167,8 +168,9 @@ def check_data_dir(data_dir: Path, allow_tmp: bool) -> Path:
         raise Refused(f"data dir does not exist: {data_dir}")
     if data_dir.is_relative_to(REPO_ROOT):
         raise Refused("the data dir must be outside the repository")
-    if data_dir.is_relative_to("/tmp") and not allow_tmp:
-        raise Refused("the data dir must not be under /tmp")
+    tmp_roots = (Path(tempfile.gettempdir()).resolve(), Path("/tmp"), Path("/tmp").resolve())
+    if any(data_dir.is_relative_to(root) for root in tmp_roots) and not allow_tmp:
+        raise Refused("the data dir must not be under a temporary directory")
     return data_dir
 
 
