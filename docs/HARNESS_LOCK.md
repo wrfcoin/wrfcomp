@@ -231,11 +231,11 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
   the owner writes an `APPROVE-HARNESS-CHANGE` comment; agents never write one, never ask a tool to write
   one, not even as a test, and never merge a pull request that has one without the owner's explicit yes.**
   Separate accounts for agents would turn this rule into a control.
-- **The repository rule on `main`.** Since 2026-11-24 a GitHub ruleset requires pull requests, makes
-  `harness-lock` and `test` **required status checks**, requires the branch to be up to date with `main`,
-  blocks force-pushes and deletion, and has no bypass list. It was verified with a test pull request that
-  changed a locked file without approval and was refused. The rule is a repository setting, not code in
-  this repository, so it is only as durable as the organisation's admin settings.
+- **Nothing is enforced until the repository rules exist.** As of this change, `main` is not protected.
+  Both `harness-lock` and `test` must be **required status checks** on `main`, with pull requests required,
+  no direct pushes and no bypass. The manager sets that rule after this change merges and verifies it through
+  the API. Until then the checks report but do not block. A pull request must also be up to date with `main`
+  before merging for the `test` result to describe what lands.
 - **The pull request that introduces or changes the gate is not judged by the new gate.** `harness-lock` runs
   the base branch's version. The first installation, and any later change to the gate, is reviewed by people.
 - **A comment does not re-run the check, and neither does editing or deleting one.** Until someone re-runs
@@ -277,8 +277,7 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
   deterministic, so the bytes must match.
 - **The truth and thresholds files are pinned by content hash only through the scorecards.** A wrong file is
   caught after scoring, not before.
-- **Tags.** `harness-v0.1.0` marks the merge that locked the harness; `promotion-rule-v2` marks the merge that
-  added the three-of-four-quarters rule (harness still 0.1.0). Tags can be moved by a repository admin.
+- **The git tag `harness-v0.1.0` does not exist yet.** The owner or manager creates it on the merge commit.
 - **A scorecard value exactly on a gate boundary** can be judged differently after rounding to 10 significant
   digits; the promotion check then refuses, it never promotes.
 
