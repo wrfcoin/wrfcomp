@@ -113,3 +113,8 @@ class QCConfig:
     storm_step_fraction: float = 0.5
     wind_flat_max_gap_minutes: int = 60
     calm_contradiction_ms: float = 5.0
+    close_copy_corr: float = 0.999
+    close_copy_rms_k: float = 0.15
+    close_copy_pairs: int = 48
+    close_copy_hours: int = 24
+    official_storm_gap_minutes: int = 75

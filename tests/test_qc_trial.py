@@ -141,9 +141,23 @@ def test_official_evidence_counts_each_measurement_once_for_rolling_statistics()
     first = official + rng.uniform(-0.2, 0.2, len(measured))
     reports = np.repeat(first, 2)
     reports[1::2] += 5
-    raw, stamps, r, rms = trial.official_evidence((measured, official, np.zeros(18)), when, reports)
+    raw, stamps, r, rms, counts, spans = trial.official_evidence(
+        (measured, official, np.zeros(18)), when, reports
+    )
     np.testing.assert_array_equal(stamps, np.repeat(measured.astype(np.int64), 2))
     np.testing.assert_array_equal(raw, np.repeat(official, 2))
+    assert counts[-1] == len(measured) and spans[-1] == 17
     assert np.isnan(r[: 2 * (trial.CFG.min_pairs - 1)]).all()
     np.testing.assert_allclose(r[-2:], np.corrcoef(first, official)[0, 1])
     np.testing.assert_allclose(rms[-2:], np.sqrt(np.mean((first - official) ** 2)))
+
+
+def test_hourly_storm_support_uses_only_a_new_measurement_inside_the_step():
+    t = trial.START + 8 * trial.HOUR
+    times = t + np.array([-15, 0, 15, 30]) * trial.MINUTE
+    stamps = t + np.array([-60, 0]) * trial.MINUTE
+    series = [(stamps, np.array([298.0, 286.0]), np.zeros(2))]
+    mask = trial.official_storm_support(
+        times, np.array([298.0, 286.0, 298.0, 286.0]), [0], np.zeros(1), 0, series
+    )
+    np.testing.assert_array_equal(mask, [False, True, False, False])

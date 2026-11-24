@@ -86,11 +86,20 @@ def spatial_series(values, neighbours, official, independent, sigma, cfg):
         n_citizen = present[ok].sum(axis=1) - n_official
         # Anchor the distribution (including its MAD) when citizens would overwhelm officials.
         anchor = (n_official >= 2) | ((n_official > 0) & (n_citizen > cfg.official_buddy_weight * n_official))
+        single = anchor & (n_official == 1)
+        # One official can anchor the centre, but cannot estimate neighbourhood dispersion.
+        # Retain the citizen MAD about the citizen centre, not scatter about the airport.
+        if single.any():
+            citizens = pool[single][:, ~official]
+            citizen_mad = np.nanmedian(abs(citizens - np.nanmedian(citizens, axis=1)[:, None]), axis=1)
         pool[np.ix_(anchor, ~official)] = np.nan
         weighted = np.repeat(pool, np.where(official, cfg.official_buddy_weight, 1), axis=1)
         median = np.nanmedian(weighted, axis=1)
         mad = np.nanmedian(abs(weighted - median[:, None]), axis=1)
         scale = np.maximum(cfg.mad_scale * mad, cfg.scale_floor_fraction * sigma)
+        if single.any():
+            # Bound citizen influence on the scale while retaining the official decision centre.
+            scale[single] = np.clip(cfg.mad_scale * citizen_mad, sigma, cfg.huber_cut * sigma)
         medians[ok] = median
         flags[ok] = np.where(abs(values[ok] - median) > cfg.spatial_z * scale, int(Flag.SPATIAL), 0)
     return flags, medians
@@ -195,7 +204,17 @@ def distances_km(lat, lon, lats, lons):
     return 2 * 6371.0088 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
-def _corroborated_steps(batch, pending, candidates, changes, official, cfg):
+def official_step_agrees(previous, current, official_previous, official_current, sigma, cfg):
+    """An hourly witness supports a rapid step only if both endpoint levels and the change agree."""
+    change = current - previous
+    return (
+        (abs(current - official_current) <= sigma)
+        & (abs(previous - official_previous) <= sigma)
+        & (np.sign(change) * (official_current - official_previous) >= cfg.storm_step_fraction * abs(change))
+    )
+
+
+def _corroborated_steps(batch, pending, candidates, changes, official, sigma, cfg):
     """Resolve raw temperature steps from the same time block before excluding temporal outliers."""
     confirmed = set()
     for i in pending:
@@ -203,10 +222,18 @@ def _corroborated_steps(batch, pending, candidates, changes, official, cfg):
         km = distances_km(batch.lat[i], batch.lon[i], batch.lat[near], batch.lon[near])
         agrees = np.sign(changes[i]) * changes[near] >= cfg.storm_step_fraction * abs(changes[i])
         voters = near[(km <= cfg.radius_km) & agrees]
-        if np.any(official[voters]):
+        off = voters[official[voters]]
+        shifted = (
+            batch.values[off] + cfg.lapse_k_per_km * (batch.elevation_m[off] - batch.elevation_m[i]) / 1000
+        )
+        if np.any(
+            official_step_agrees(
+                batch.values[i] - changes[i], batch.values[i], shifted - changes[off], shifted, sigma[i], cfg
+            )
+        ):
             confirmed.add(i)
             continue
-        witnesses = near[(km >= cfg.independence_km) & (km <= cfg.radius_km) & agrees]
+        witnesses = near[(~official[near]) & (km >= cfg.independence_km) & (km <= cfg.radius_km) & agrees]
         if _has_separated_pair(batch.lat[witnesses], batch.lon[witnesses], cfg):
             confirmed.add(i)
     return confirmed
@@ -319,7 +346,8 @@ def quality_control(
                 and old.last_usable
                 and old.recent
                 and not temporal & Flag.FLATLINE
-                and time_ns - old.last_ns <= cfg.step_minutes * 60e9
+                and time_ns - old.last_ns
+                <= (cfg.official_storm_gap_minutes if official[i] else cfg.step_minutes) * 60e9
             ):
                 changes[i] = value - old.recent[-1]
                 witnesses.append(i)
@@ -329,7 +357,9 @@ def quality_control(
             if not (int(flags[i]) & (Flag.STATIC | Flag.TEMPORAL | Flag.COPYCAT)) and not old.copycat:
                 eligible.setdefault(var, []).append(i)
         confirmed = (
-            _corroborated_steps(batch, pending, np.asarray(witnesses, dtype=int), changes, official, cfg)
+            _corroborated_steps(
+                batch, pending, np.asarray(witnesses, dtype=int), changes, official, total, cfg
+            )
             if pending
             else set()
         )
@@ -376,6 +406,7 @@ def quality_control(
                 solar_sensitive=var in ("t2m", "td2m"),
                 huber=huber[i],
                 sigma_bg=bg[i],
+                wind_drift=var in ("wind_speed", "u10", "v10", "wind_gust"),
                 verify_temperature=var == "t2m",
                 learn_bias=bool(bias_available[i]),
                 reference_time_ns=None if reference_times is None else int(reference_times[i]),

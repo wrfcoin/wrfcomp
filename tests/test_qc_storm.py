@@ -92,3 +92,128 @@ def test_reused_official_measurement_does_not_repeat_correlation_decay():
 
     cfg = QCConfig()
     assert state.correlation_guard == pytest.approx(cfg.guard_decay ** (n - cfg.min_pairs + 1))
+
+
+def test_hourly_official_can_confirm_rapid_temperature_step_but_must_match_levels():
+    rng = np.random.default_rng(145)
+    t = np.datetime64("2024-07-11T18:00")
+    stamps = t + np.array([-60, -15, 0, 0]) * np.timedelta64(1, "m")
+    for background_offset, kept in ((0.0, True), (6.0, False)):
+        values = np.array([298.0 + background_offset, 298.0, 286.0, 286.0 + background_offset]) + rng.uniform(
+            -0.1, 0.1, 4
+        )
+        b = ObservationBatch(
+            ["00000000001", "00000000000", "00000000000", "00000000001"],
+            np.zeros(4),
+            [0.12, 0, 0, 0.12],
+            np.zeros(4),
+            stamps,
+            np.zeros(4),
+            ["t2m"] * 4,
+            values,
+        )
+        out = quality_control(
+            b, 298.0, 1.0, 2.0, official=[True, False, False, True], official_background_bias=0
+        )
+        assert bool(out.weights[2] > 0) == kept
+
+
+def test_single_official_anchors_centre_without_forcing_zero_spread():
+    from wrfcomp.assimilation.qc import spatial_gate
+
+    refs = np.array([True, False, False, False, False])
+    values = np.array([280.0, 278.0, 280.0, 282.0, 284.0])
+    flag, center = spatial_gate(285.0, values, 2.0, QCConfig(), official=refs, independent=np.ones(5, bool))
+    assert center == 280 and not flag & Flag.SPATIAL
+
+
+def test_corrected_thermal_innovations_do_not_pay_for_raw_geographic_offset():
+    rng = np.random.default_rng(146)
+    hours = np.arange(24 * 9)
+    times = np.datetime64("2024-07-09T00", "ns") + hours * np.timedelta64(1, "h")
+    bg = 286 + 4 * np.sin(hours * np.pi / 12)
+    values = bg + rng.uniform(-0.1, 0.1, len(hours))
+    b = ObservationBatch(
+        ["00000000000"] * len(hours),
+        np.zeros(len(hours)),
+        np.zeros(len(hours)),
+        np.zeros(len(hours)),
+        times,
+        np.zeros(len(hours)),
+        ["t2m"] * len(hours),
+        values,
+    )
+    # Raw reference separated by 6 K, while elevation-adjusted and bias-corrected forecast is accurate.
+    out = quality_control(
+        b,
+        bg - 3,
+        2,
+        2,
+        reference=bg - 6,
+        official_background_bias=3,
+        reference_time_ns=times.astype(np.int64),
+    )
+    assert np.median(out.weights[-24:]) > 0.45
+
+
+def test_near_copy_with_point_one_kelvin_scatter_needs_sustained_unique_evidence():
+    rng = np.random.default_rng(147)
+    hours = np.arange(24 * 9)
+    times = np.datetime64("2024-07-09T00", "ns") + hours * np.timedelta64(1, "h")
+    reference = 287 + 6 * np.sin(hours * np.pi / 12)
+    values = reference + rng.normal(0.0, 0.1, len(hours))
+    b = ObservationBatch(
+        ["00000000000"] * len(hours),
+        np.zeros(len(hours)),
+        np.zeros(len(hours)),
+        np.zeros(len(hours)),
+        times,
+        np.zeros(len(hours)),
+        ["t2m"] * len(hours),
+        values,
+    )
+    out = quality_control(
+        b,
+        reference,
+        2,
+        2,
+        reference=reference,
+        official_background_bias=0,
+        reference_time_ns=times.astype(np.int64),
+    )
+    assert out.qc_flags[-1] & Flag.COPYCAT
+    assert not out.states[(b.station_ids[0], "t2m")].earned
+    assert out.weights[-1] == 0
+
+
+@pytest.mark.parametrize("has_reference", [False, True])
+def test_wind_drift_falls_in_weight_but_a_stable_exposure_offset_does_not(has_reference):
+    rng = np.random.default_rng(148)
+    n = 24 * 16
+    times = np.datetime64("2024-07-01", "ns") + np.arange(n) * np.timedelta64(1, "h")
+    wind = 10 + np.sin(np.arange(n) * np.pi / 12) + rng.normal(0, 0.25, n)
+
+    def check(offset):
+        b = ObservationBatch(
+            ["00000000000"] * n,
+            np.zeros(n),
+            np.zeros(n),
+            np.zeros(n),
+            times,
+            np.zeros(n),
+            ["wind_speed"] * n,
+            wind + offset,
+        )
+        return quality_control(
+            b,
+            wind,
+            2,
+            2,
+            reference=wind if has_reference else np.nan,
+            reference_time_ns=times.astype(np.int64),
+        )
+
+    drift = check(np.linspace(0, 8, n))
+    stable = check(4.0)
+    assert np.mean(drift.weights[-24:]) < 0.1
+    assert np.mean(stable.weights[-24:]) > 0.4
