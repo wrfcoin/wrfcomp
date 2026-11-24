@@ -2,7 +2,7 @@
 
 This candidate adjusts the bias and spread of each 31-member GEFS station forecast
 using recent verified forecasts. Gate 1 measured large local temperature biases and
-under-dispersion in raw GEFS. The sprint registered one design (M = 1), with a
+under-dispersion in raw GEFS. The project registered one design (M = 1), with a
 30-day window, a ten-pair minimum, and a spread multiplier between 1 and 6.
 [Measured baseline limits](../BASELINES.md#known-limits-on-real-data-january-and-july-2024)
 

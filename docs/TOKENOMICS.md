@@ -7,6 +7,9 @@
 > replace WRFCoin's accepted tokenomics decisions or the skill pay that already exists on the testnet chain.
 > The numbers are starting points for an off-chain paper ledger. Changing any slash or emission parameter
 > here needs the project owner's approval.
+>
+> **This is not an offer of any token, reward or payment, and nothing pays out.** No one can buy, earn or
+> receive anything from this document or from the shadow ledger.
 
 ---
 
