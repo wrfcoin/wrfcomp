@@ -58,6 +58,7 @@ def update_state(
     official,
     hard_fail,
     cfg: QCConfig,
+    learn_bias=True,
     verify_temperature=False,
     reference_time_ns=None,
 ):
@@ -97,6 +98,7 @@ def update_state(
         buddy_r=buddy_r,
         ref_r=ref_r,
         ref_rmse=ref_rmse,
+        learn_bias=learn_bias,
         verify_temperature=verify_temperature,
         reference_time_ns=reference_time_ns,
     )
@@ -121,6 +123,7 @@ def advance_state(
     buddy_r,
     ref_r,
     ref_rmse,
+    learn_bias=True,
     verify_temperature=False,
     reference_time_ns=None,
 ):
@@ -152,13 +155,13 @@ def advance_state(
             reference_time_ns,
             sigma_bg,
             bad=copycat or low or (ref_r is not None and ref_r < cfg.low_correlation),
-            accepted=not hard_fail and huber > 0 and ref_r is not None,
+            accepted=learn_bias and not hard_fail and huber > 0 and ref_r is not None,
             cfg=cfg,
         )
     bias = old.bias_day if day else old.bias_night
     reliability = exp(-sqrt(old.mse_ema) / sigma_bg)
     solar = 1.0
-    if solar_sensitive and day and old.bias_day is not None and old.bias_night is not None:
+    if learn_bias and solar_sensitive and day and old.bias_day is not None and old.bias_night is not None:
         excess = abs(old.bias_day - old.bias_night) - cfg.solar_allowance
         solar = exp(-max(0, excess) / cfg.solar_scale)
     prior = cfg.official_prior if official else (cfg.verified_prior if new.earned else cfg.new_prior)
@@ -167,7 +170,7 @@ def advance_state(
         if hard_fail
         else float(np.clip(prior * huber * reliability * solar * new.correlation_guard, 0, 1))
     )
-    if not hard_fail and huber > 0 and not copycat:
+    if learn_bias and not hard_fail and huber > 0 and not copycat:
         residual = innovation - (bias or 0)
         new.mse_ema += cfg.ema_alpha * (residual**2 - new.mse_ema)
         learned = (bias or 0) + cfg.ema_alpha * residual

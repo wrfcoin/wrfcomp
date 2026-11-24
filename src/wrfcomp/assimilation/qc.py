@@ -206,6 +206,7 @@ def quality_control(
     corrections = None if official_background_bias is None else column(official_background_bias)
     raw = batch.values - background
     innovations = raw.copy()
+    bias_available = np.ones(size, dtype=bool)
     grid = cells(batch.lat, batch.lon)
     reference_times = None if reference_time_ns is None else column(reference_time_ns, np.int64)
     if reference_times is not None and np.any(
@@ -252,9 +253,11 @@ def quality_control(
                     nearest = int(np.argmin(km))
                     if km[nearest] <= cfg.official_bias_radius_km:
                         correction = errors[nearest]
-                innovations[i] -= correction
+                bias_available[i] = np.isfinite(correction)
+                if bias_available[i]:
+                    innovations[i] -= correction
             bias = old.bias_day if daytime else old.bias_night
-            z[i] = (innovations[i] - (bias or 0)) / total[i]
+            z[i] = (innovations[i] - ((bias or 0) if bias_available[i] else 0)) / total[i]
             flags[i] |= int(static_gate(var, value, batch.elevation_m[i], peers[station], cfg))
             flags[i] |= int(temporal_gate(var, value, time_ns, old, cfg, reference=reference[i]))
             if not (int(flags[i]) & (Flag.STATIC | Flag.TEMPORAL | Flag.COPYCAT)) and not old.copycat:
@@ -289,6 +292,7 @@ def quality_control(
                 huber=huber[i],
                 sigma_bg=bg[i],
                 verify_temperature=var == "t2m",
+                learn_bias=bool(bias_available[i]),
                 reference_time_ns=None if reference_times is None else int(reference_times[i]),
                 official=official[i],
                 hard_fail=bool(int(flags[i]) & (Flag.STATIC | Flag.TEMPORAL | Flag.COPYCAT)),
