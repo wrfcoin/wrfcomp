@@ -63,6 +63,296 @@
       "thresholds": "thresholds/tail_p95.nc",
       "truth": "truth/isd_conus_2024.nc"
     },
+    "2024-02": {
+      "other_reference_forecasts": {
+        "72a809af5a3e3da247aad204b32402011e161dfc471ce9ca9132c8b9c4450391": "experiments/persistence_2024-02.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "2dab0dc27250f1099ef0cc09ff63d604e2c14be7da67cea8a47fec55cf351359",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 58,
+          "n_stations": 500,
+          "period_end": "2024-02-29T12:00:00",
+          "period_start": "2024-02-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-02.json",
+          "scorecard_sha256": "d67858497ec7d5aba7f144073d8107b0d3b11b7e059136c6b82ba900c2e25274",
+          "store": "gate1/2024-02_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "dc1ad55dcfc7b9e0fde85c941b9d299b5924d6907f6d04654c206ea4bfd56c2d",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 58,
+          "n_stations": 500,
+          "period_end": "2024-02-29T12:00:00",
+          "period_start": "2024-02-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-02.json",
+          "scorecard_sha256": "0c5d1ac75768cbaaf316878b07eda7bd01ee84a895e63501eaa02bb24477a9d1",
+          "store": "gate1/2024-02_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-03": {
+      "other_reference_forecasts": {
+        "0aa1bd8c1b7cad2e3ef0ab287f1497279a373f4c89486d54b7aad951d6651643": "experiments/persistence_2024-03.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "71da511575092f1bb896848968d1e13d0c4e2687a2819bc2f3e00edd40d46b92",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 62,
+          "n_stations": 500,
+          "period_end": "2024-03-31T12:00:00",
+          "period_start": "2024-03-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-03.json",
+          "scorecard_sha256": "b000360631d127a248bce5ebe66b9d964c6959e123f971e996f5838e31d0a090",
+          "store": "gate1/2024-03_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "e320e905c54ab27b94122d131563efc03835b624bbf26324372d8c01286b1a10",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 62,
+          "n_stations": 500,
+          "period_end": "2024-03-31T12:00:00",
+          "period_start": "2024-03-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-03.json",
+          "scorecard_sha256": "cb32bf7eca79cb66a3b17ea58250737d0ff896c62944faddc2fe1424165c3857",
+          "store": "gate1/2024-03_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-04": {
+      "other_reference_forecasts": {
+        "00b3b156b7774135420d2d5ae7f12a7991aebbedd65e5a9b223d4b86ed599bee": "experiments/persistence_2024-04.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "ed621fdf5a60969c46f9c9086e35247512bc824fad06997e3e7371e6e8b238e5",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 60,
+          "n_stations": 500,
+          "period_end": "2024-04-30T12:00:00",
+          "period_start": "2024-04-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-04.json",
+          "scorecard_sha256": "23eced786dad2ef582b6f0fe87ca70c3aa8a3ccec63491bdc72afb440fcee1df",
+          "store": "gate1/2024-04_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "1f2c145f1c171bcc14b73c3c5ab5150fbe529e6bc3b3d574e361e12562134e5b",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 60,
+          "n_stations": 500,
+          "period_end": "2024-04-30T12:00:00",
+          "period_start": "2024-04-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-04.json",
+          "scorecard_sha256": "ad3aa77152545b48af346f397fca302418f5ad0808a7fcd9aa13bb5d68520786",
+          "store": "gate1/2024-04_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-05": {
+      "other_reference_forecasts": {
+        "3019553a6ff74b24d1c823798cd358e185a9a52c52c8c634648243b08d34d78e": "experiments/persistence_2024-05.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "a3abe4f8671e6076cb6b4c2e704674c0bb7e517d5d42fee1d146e3122ee36305",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 62,
+          "n_stations": 500,
+          "period_end": "2024-05-31T12:00:00",
+          "period_start": "2024-05-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-05.json",
+          "scorecard_sha256": "faac05aba56567130e066e80215cf1c2614f9c05638c24be31a0762cd8503cec",
+          "store": "gate1/2024-05_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "11a286140b27eddc2c423d9a1ae964d7515e59636e888b5c2e3ebbe53b5448b4",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 62,
+          "n_stations": 500,
+          "period_end": "2024-05-31T12:00:00",
+          "period_start": "2024-05-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-05.json",
+          "scorecard_sha256": "c685a414bc4f31ec027dd3a4f6c9370e45faea1531df74527d7b48d1436c9cce",
+          "store": "gate1/2024-05_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-06": {
+      "other_reference_forecasts": {
+        "393d2c5cc2de3454fb5ed704e4b314502b8dc3ee029836b31e6167984e096a1e": "experiments/persistence_2024-06.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "b1891a2342ca0c737de07273915a5d0b155d2ad0422bf316e62c754b3b068438",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 60,
+          "n_stations": 500,
+          "period_end": "2024-06-30T12:00:00",
+          "period_start": "2024-06-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-06.json",
+          "scorecard_sha256": "c2cec4441498d54c6a4373052408a18e05f80db427dae728967fd74704957bba",
+          "store": "gate1/2024-06_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "c325263f76ba6ee1d75be7970a1bd8e641ce7e3714c45e180b75fe248a8f1439",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 60,
+          "n_stations": 500,
+          "period_end": "2024-06-30T12:00:00",
+          "period_start": "2024-06-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-06.json",
+          "scorecard_sha256": "4a163d10d5000d40d367f5a80ac2553c72eb7f74bf37c60d4a3816b4969e5f62",
+          "store": "gate1/2024-06_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
     "2024-07": {
       "other_reference_forecasts": {
         "0acef9dfcd1d58c686a3013214c7ba7ca83362c1c15b3b23a9fb8998689f9499": "experiments/persistence_2024-07.json"
@@ -114,6 +404,296 @@
           "scorecard": "experiments/gefs_2024-07.json",
           "scorecard_sha256": "21c9596181508588c651e1702e81dc049f309ff1f00f49fd6359dbd024c89a84",
           "store": "gate1/2024-07_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-08": {
+      "other_reference_forecasts": {
+        "1f5f1db091b1bfbbf969d8ab5a30ebc88684f10c10c747e0e981c9edbcdf2aa4": "experiments/persistence_2024-08.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "9f62b181730278c0f83007bba2c78606f17eb96385ccb8ccba6912768900c969",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 62,
+          "n_stations": 500,
+          "period_end": "2024-08-31T12:00:00",
+          "period_start": "2024-08-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-08.json",
+          "scorecard_sha256": "c4f2c5651deb4105e6adb52d07e8814d435ebc3eda31684f37d36a2a1560be9f",
+          "store": "gate1/2024-08_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "b22a15449c28ed44afc9f7a47cb42298a8a85bcb82428d4bd3247371c078d066",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 62,
+          "n_stations": 500,
+          "period_end": "2024-08-31T12:00:00",
+          "period_start": "2024-08-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-08.json",
+          "scorecard_sha256": "6a72c6eb1cbbdb4f74300bf9ae66f6ab71739423ba3a68f9e1d7ffdcd7e03061",
+          "store": "gate1/2024-08_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-09": {
+      "other_reference_forecasts": {
+        "69798c4aff78a7b8d7e7e16703b0ed0cb1c49e6d3e740694c4117ca7c5c1db06": "experiments/persistence_2024-09.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "ccf387b8893aec3d3e50555651bbf14ad620c1ba434e48ddb3c37a92ac4661c7",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 60,
+          "n_stations": 500,
+          "period_end": "2024-09-30T12:00:00",
+          "period_start": "2024-09-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-09.json",
+          "scorecard_sha256": "f9257153e23c347d7c5c69c8022ca76764f30650f19e275e2e49f3d1cedfa0b1",
+          "store": "gate1/2024-09_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "152967bf9a83af8db84e1376e3c44afffd4b7e2aaf307fe3ce4bf3a510a1409d",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 60,
+          "n_stations": 500,
+          "period_end": "2024-09-30T12:00:00",
+          "period_start": "2024-09-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-09.json",
+          "scorecard_sha256": "f55956d1e242bda4efacb7ac586b19a11b6457a1b0a2b82ebdc3d770b3f8498f",
+          "store": "gate1/2024-09_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-10": {
+      "other_reference_forecasts": {
+        "755510a79c43b57aa3c2b37629bed59ae55020a01ac82250843e955cd9127a25": "experiments/persistence_2024-10.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "306de5288760c31d83400ba17823109d238dd674de1bd1f5a82853c306a6001f",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 62,
+          "n_stations": 500,
+          "period_end": "2024-10-31T12:00:00",
+          "period_start": "2024-10-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-10.json",
+          "scorecard_sha256": "adceac558ffc41c3cb6517a6c0eec22263588a5c06509feacfffe26f51200495",
+          "store": "gate1/2024-10_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "7ddb7e10627e4bcd03a6e119089759a71c2e33688c1540b98f6948beccb9a8ec",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 62,
+          "n_stations": 500,
+          "period_end": "2024-10-31T12:00:00",
+          "period_start": "2024-10-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-10.json",
+          "scorecard_sha256": "0ee737f6ae4379c27455b9f61eb975ad2c3df4067220a4fb710558e7f1c0c83d",
+          "store": "gate1/2024-10_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-11": {
+      "other_reference_forecasts": {
+        "013573fd21c774c8172049d508d597158fea8a203a090e74623c1de8df8c9018": "experiments/persistence_2024-11.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "f9ce07028ab14b5fdae93f5b40b20beebe4c5944e011ebde61c6dded491c4838",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 60,
+          "n_stations": 500,
+          "period_end": "2024-11-30T12:00:00",
+          "period_start": "2024-11-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-11.json",
+          "scorecard_sha256": "ba08f52d03b81542b94a2aac65e9afe9d360c31c3aff062cc0512d4b745c4a96",
+          "store": "gate1/2024-11_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "f01ee96027c90412a7eeb3df299bd8f7b65a5e5bacd3caf9fa9de1502bc33b08",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 60,
+          "n_stations": 500,
+          "period_end": "2024-11-30T12:00:00",
+          "period_start": "2024-11-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-11.json",
+          "scorecard_sha256": "5d68494cff55c3a71a28a402724842e9392cdaea68ac1414b679fe4f6d4876cb",
+          "store": "gate1/2024-11_h00-12/gefs.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        }
+      },
+      "thresholds": "thresholds/tail_p95.nc",
+      "truth": "truth/isd_conus_2024.nc"
+    },
+    "2024-12": {
+      "other_reference_forecasts": {
+        "8c63a4c485331ca5daf2388080d5fac12d8f69ff759ff1d488b51d5f7f583080": "experiments/persistence_2024-12.json"
+      },
+      "references": {
+        "climatology": {
+          "forecast_sha256": "d4edf03297fa358de53e9123401668571459b2d6ebd27e4c16e8310eb77984f5",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            1,
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "climatology",
+          "n_init_times": 34,
+          "n_stations": 500,
+          "period_end": "2024-12-17T12:00:00",
+          "period_start": "2024-12-01T00:00:00",
+          "scorecard": "experiments/climatology_2024-12.json",
+          "scorecard_sha256": "35e43384a5ff5e7723801d10e87c3d884d9f456e9e826886e92f4349b128c8d2",
+          "store": "gate1/2024-12_h00-12/climatology.zarr",
+          "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
+          "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
+        },
+        "noaa-gefs": {
+          "forecast_sha256": "0067c5e392d2ff4105c20e42f56e44b0962a606dcea0afe3b2bfdcb9eb3118aa",
+          "init_hours_scored": [
+            0,
+            12
+          ],
+          "leads_scored": [
+            3,
+            6,
+            12,
+            24,
+            48
+          ],
+          "model_id": "noaa-gefs",
+          "n_init_times": 34,
+          "n_stations": 500,
+          "period_end": "2024-12-17T12:00:00",
+          "period_start": "2024-12-01T00:00:00",
+          "scorecard": "experiments/gefs_2024-12.json",
+          "scorecard_sha256": "41f8b378d18cfe0789a38518e231bd8c244238906e2918436422e4d3b795b928",
+          "store": "gate1/2024-12_h00-12/gefs.zarr",
           "thresholds_sha256": "7ee7e1e5428d2736ab4f18ef9fe8f7b218c7038d4b377e54b18251336587864c",
           "truth_sha256": "013466cf5348dd9d86ede15fcd847f436050bb7ba754c619f87043d0e1aede05"
         }

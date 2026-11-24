@@ -19,7 +19,7 @@ from an easier test instead of a better forecast. Scores from different harness 
 | `configs/` (split boundaries, station list, gate thresholds) | yes | yes |
 | `src/wrfcomp/__init__.py` (the package initializer and its version) | yes | yes |
 | `docs/VERIFICATION_PROTOCOL.md`, `scripts/check_promotion.py` | yes | yes |
-| `experiments/REFERENCES.json` and the six Gate 1 scorecards (climatology, GEFS, persistence; 2024-01, 2024-07) | yes | yes |
+| `experiments/REFERENCES.json` and the 36 Gate 1 reference scorecards (climatology, GEFS, persistence; every month of 2024) | yes | yes |
 | Versions of `scores`, `numpy`, `xarray`, `scipy`, `pandas` in `uv.lock` | yes (as versions) | yes, through the manifest |
 | The lock itself: `HARNESS_LOCK.json`, `scripts/harness_lock.py`, `tests/test_harness_lock.py`, `tests/test_check_promotion.py`, `docs/HARNESS_LOCK.md`, everything under `.github/` | no | yes |
 
@@ -130,7 +130,7 @@ It then judges the two scorecards those processes produced:
 - both gates are passed.
 
 It prints `PROMOTED` only then, and only in this mode. Promotion is per period: run it for each pinned period
-(`2024-01` and `2024-07`). No reference directory, reference file or config can be passed in.
+(the twelve months `2024-01` to `2024-12`; December covers the init times up to 2024-12-17T12Z). No reference directory, reference file or config can be passed in.
 
 The two scorecards and a `verdict.json` are written in a private directory created for the run and published
 at the end as `<out>/promotion_<period>_<first 16 hex digits of the forecast hash>/`. The file names are

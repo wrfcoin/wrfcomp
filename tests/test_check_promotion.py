@@ -831,9 +831,12 @@ def test_scoring_packages_must_come_from_the_environment(monkeypatch: pytest.Mon
 # --------------------------------------------------------------------------- the real repository
 
 
+MONTHS = [f"2024-{month:02d}" for month in range(1, 13)]
+
+
 def test_committed_inventory_pins_the_committed_reference_scorecards() -> None:
     inventory = tool.load_inventory(ROOT)
-    assert sorted(inventory["periods"]) == ["2024-01", "2024-07"]
+    assert sorted(inventory["periods"]) == MONTHS  # every month of the 2024 validation split
     assert inventory["harness_version"] == {"scores": "2.7.0", "wrfcomp": "0.1.0"}
     periods = {
         label: {
@@ -851,22 +854,37 @@ def test_committed_inventory_pins_the_committed_reference_scorecards() -> None:
             },
             "others": [f"experiments/persistence_{label}.json"],
         }
-        for label in ("2024-01", "2024-07")
+        for label in MONTHS
     }
     assert tool.build_inventory(ROOT, periods) == json.loads((ROOT / tool.INVENTORY).read_text())
+    truth = {r["truth_sha256"] for e in inventory["periods"].values() for r in e["references"].values()}
+    thresholds = {
+        r["thresholds_sha256"] for e in inventory["periods"].values() for r in e["references"].values()
+    }
+    assert len(truth) == 1 and len(thresholds) == 1  # one truth file and one thresholds file for the year
+    init_times = {}
     for label, entry in inventory["periods"].items():
         references = entry["references"]
         assert references["climatology"]["leads_scored"] == [1, 3, 6, 12, 24, 48]  # all v1 leads
         assert references["noaa-gefs"]["leads_scored"] == [3, 6, 12, 24, 48]  # 3 h and longer
         for record in references.values():
-            assert (record["n_init_times"], record["n_stations"], record["init_hours_scored"]) == (
-                62,
-                500,
-                [0, 12],
-            )
-            assert record["truth_sha256"] == references["climatology"]["truth_sha256"]
+            assert (record["n_stations"], record["init_hours_scored"]) == (500, [0, 12])
+            assert record["period_start"] == f"{label}-01T00:00:00"
+            assert record["n_init_times"] == references["climatology"]["n_init_times"]
+        init_times[label] = references["climatology"]["n_init_times"]
         assert len(entry["other_reference_forecasts"]) == 1, label
-    assert len(tool.reference_forecast_hashes(inventory)) == 6  # no forecast is shared between periods
+    # 00Z and 12Z of every day; December stops at the last init inside the validation split
+    days = {"2024-02": 29, "2024-04": 30, "2024-06": 30, "2024-09": 30, "2024-11": 30, "2024-12": 17}
+    assert init_times == {label: 2 * days.get(label, 31) for label in MONTHS}
+    assert inventory["periods"]["2024-12"]["references"]["noaa-gefs"]["period_end"] == "2024-12-17T12:00:00"
+    assert len(tool.reference_forecast_hashes(inventory)) == 36  # no forecast is shared between periods
+    # the inventory pins exactly the reference scorecards the manifest locks
+    pinned = {r["scorecard"] for e in inventory["periods"].values() for r in e["references"].values()}
+    pinned |= {
+        path for e in inventory["periods"].values() for path in e["other_reference_forecasts"].values()
+    }
+    lock = json.loads((ROOT / "HARNESS_LOCK.json").read_text())["entries"]
+    assert pinned == {path for path in lock if path.startswith("experiments/") and path != tool.INVENTORY}
 
 
 def test_real_reference_scorecards_are_never_a_promotion(capsys: pytest.CaptureFixture) -> None:
@@ -876,6 +894,10 @@ def test_real_reference_scorecards_are_never_a_promotion(capsys: pytest.CaptureF
     out = capsys.readouterr().out
     assert "INCONSISTENT" in out and "two scorecards against the same baseline: climatology" in out
     assert "PROMOTED" not in out
+    # January scorecards do not pass for another pinned month
+    assert tool.main(["verify", *cards, "--period", "2024-02"]) == 1
+    out = capsys.readouterr().out
+    assert "INCONSISTENT" in out and "PROMOTED" not in out
     # a period that is not pinned
-    assert tool.main(["verify", *cards, "--period", "2024-02"]) == 2
+    assert tool.main(["verify", *cards, "--period", "2023-12"]) == 2
     assert "REFUSED" in capsys.readouterr().out

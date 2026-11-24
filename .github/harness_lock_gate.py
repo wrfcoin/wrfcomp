@@ -71,12 +71,12 @@ LOCKED_FILES = (
     "docs/HARNESS_LOCK.md",
     "docs/VERIFICATION_PROTOCOL.md",
     "experiments/REFERENCES.json",
-    "experiments/climatology_2024-01.json",
-    "experiments/climatology_2024-07.json",
-    "experiments/gefs_2024-01.json",
-    "experiments/gefs_2024-07.json",
-    "experiments/persistence_2024-01.json",
-    "experiments/persistence_2024-07.json",
+    # the Gate 1 reference scorecards: three models, every month of the 2024 validation split
+    *(
+        f"experiments/{model}_2024-{month:02d}.json"
+        for month in range(1, 13)
+        for model in ("climatology", "gefs", "persistence")
+    ),
 )
 MAX_LISTED_FILES = 3000  # the pull request files API stops there
 SHA = re.compile(r"[0-9a-f]{40}")

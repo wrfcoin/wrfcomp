@@ -55,12 +55,12 @@ LOCKED_FILES = (
     "docs/VERIFICATION_PROTOCOL.md",
     "scripts/check_promotion.py",
     "experiments/REFERENCES.json",
-    "experiments/climatology_2024-01.json",
-    "experiments/climatology_2024-07.json",
-    "experiments/gefs_2024-01.json",
-    "experiments/gefs_2024-07.json",
-    "experiments/persistence_2024-01.json",
-    "experiments/persistence_2024-07.json",
+    # the Gate 1 reference scorecards: three models, every month of the 2024 validation split
+    *(
+        f"experiments/{model}_2024-{month:02d}.json"
+        for month in range(1, 13)
+        for model in ("climatology", "gefs", "persistence")
+    ),
 )
 # Packages whose versions decide the numbers in a scorecard.
 SCORING_DEPENDENCIES = ("numpy", "pandas", "scipy", "scores", "xarray")

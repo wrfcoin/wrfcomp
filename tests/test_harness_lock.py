@@ -51,9 +51,9 @@ def test_manifest_records_tree_entries_version_scope_and_dependencies() -> None:
         "scripts/check_promotion.py",
         "experiments/REFERENCES.json",
         *(
-            f"experiments/{m}_{p}.json"
+            f"experiments/{m}_2024-{k:02d}.json"
             for m in ("climatology", "gefs", "persistence")
-            for p in ("2024-01", "2024-07")
+            for k in range(1, 13)
         ),
     ):
         assert required in entries, required
@@ -61,6 +61,7 @@ def test_manifest_records_tree_entries_version_scope_and_dependencies() -> None:
         assert entry["mode"] == "100644", path
         assert len(entry["blob"]) == 40 and int(entry["blob"], 16) >= 0, path
     pins = manifest["scoring_dependencies"]
+    assert sum(path.startswith("experiments/") for path in entries) == 37  # 36 scorecards and the inventory
     assert set(pins) == {"scores", "numpy", "xarray", "scipy", "pandas"}
     assert all(isinstance(v, list) and v for v in pins.values())
     assert pins == tool.resolved_dependencies()
