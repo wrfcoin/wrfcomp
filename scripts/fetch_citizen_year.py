@@ -27,10 +27,17 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 import typer
 
 from wrfcomp.assimilation.citizen_obs import load_or_create_station_key
-from wrfcomp.assimilation.madis_archive import ReportTable, merge_tables, parse_archive_hour, save_table
+from wrfcomp.assimilation.madis_archive import (
+    ReportTable,
+    load_table,
+    merge_tables,
+    parse_archive_hour,
+    save_table,
+)
 
 ARCHIVE_URL = (
     "https://madis-data.ncep.noaa.gov/madisPublic1/data/archive/"
@@ -77,7 +84,7 @@ def check_room(data_dir: Path) -> None:
 
 def fetch_hour(
     hour: dt.datetime, *, key: bytes, cache: dict[str, str], retries: int = 4, timeout: float = 300.0
-) -> tuple[ReportTable, int]:
+) -> tuple[ReportTable, int, dict]:
     url = ARCHIVE_URL.format(d=hour)
     last: Exception | None = None
     for attempt in range(retries):
@@ -85,7 +92,11 @@ def fetch_hour(
             request = urllib.request.Request(url, headers={"User-Agent": "research-sample/0.1"})
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 payload = response.read()
-            return parse_archive_hour(payload, key=key, token_cache=cache), len(payload)
+            counts: dict[str, int] = {}
+            # Nothing measured before 1 January of the year may enter that year's state.
+            start = np.datetime64(f"{hour.year:04d}-01-01T00:00:00", "s")
+            table = parse_archive_hour(payload, key=key, not_before=start, token_cache=cache, counts=counts)
+            return table, len(payload), counts
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise HourMissingError from None
@@ -110,22 +121,32 @@ def fetch_day(
         try:
             return hour, *fetch_hour(hour, key=key, cache=cache)
         except HourMissingError:
-            return hour, None, 0
+            return hour, None, 0, {}
 
+    totals: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        for hour, table, n_bytes in pool.map(one, hours):
+        for hour, table, n_bytes, counts in pool.map(one, hours):
             transferred += n_bytes
+            for name, n in counts.items():
+                totals[name] = totals.get(name, 0) + n
             if table is None:
                 missing.append(f"{hour:%H}")
             else:
                 tables.append(table)
     merged = merge_tables(tables)
     path = day_path(citizen_dir, day)
-    save_table(merged, path)
+    # The file says which source hours it holds: a missing source hour is a fact about the archive,
+    # a missing file is work that has not run.
+    save_table(
+        merged,
+        path,
+        attrs={"day": day.isoformat(), "hours_requested": len(hours), "hours_missing": ",".join(missing)},
+    )
     return {
         "day": day.isoformat(),
         "hours_requested": len(hours),
         "hours_missing": missing,
+        "source_counts": totals,
         "reports": len(merged),
         "stations": int(len(set(merged.station_id.tolist()))),
         "transferred_bytes": transferred,
@@ -163,17 +184,19 @@ def main(
         if not hours_of(day):
             break
         if day_path(citizen_dir, day).exists():
+            load_table(day_path(citizen_dir, day))  # refuses a file written under another arrival policy
             day += dt.timedelta(days=1)
             continue
         check_room(root)
         record = fetch_day(day, citizen_dir, key=key, cache=cache, concurrency=concurrency)
         with lock, log_path.open("a") as fh:
             fh.write(json.dumps(record) + "\n")
-        typer.echo(
+        print(
             f"{record['day']}: reports={record['reports']} stations={record['stations']} "
             f"missing_hours={len(record['hours_missing'])} "
             f"transferred={record['transferred_bytes'] / 2**20:.0f} MiB "
-            f"stored={record['stored_bytes'] / 2**20:.1f} MiB in {record['seconds']:.0f}s"
+            f"stored={record['stored_bytes'] / 2**20:.1f} MiB in {record['seconds']:.0f}s",
+            flush=True,
         )
         day += dt.timedelta(days=1)
     typer.echo("done")
