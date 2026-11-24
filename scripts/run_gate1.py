@@ -3,7 +3,11 @@
     uv run python scripts/run_gate1.py --data-dir <dir> --period 2024-01 --period 2024-07 \\
         --init-hours 0 12 --out experiments/
 
-For every period (a calendar month, `YYYY-MM`) it
+A period is a calendar month `YYYY-MM` or a calendar quarter `YYYY-Qn`. A quarter is scored as ONE
+period: its forecast stores are the stores of its months joined along init time (run the months
+first), and its scorecards are `<model>_YYYY-Qn.json`.
+
+For every period it
 
   a. builds the climatology and persistence forecasts for every scorable init time of the month at the
      given hours, through `wrfcomp.baselines`, into `<data dir>/gate1/<period>_h<hours>/<model>.zarr`
@@ -75,9 +79,10 @@ class ModelFailed(RuntimeError):
 
 @dataclass(frozen=True)
 class Period:
-    label: str  # "2024-01"
-    init_times: np.ndarray  # datetime64[ns], every scorable init of the month at the requested hours
-    n_dropped: int = 0  # init times at the end of the month left out by `scorable_init_times`
+    label: str  # "2024-01", or "2024-Q1" for a calendar quarter
+    init_times: np.ndarray  # datetime64[ns], every scorable init of the period at the requested hours
+    n_dropped: int = 0  # init times at the end of the period left out by `scorable_init_times`
+    months: tuple[str, ...] = ()  # a quarter only: its months that have scorable init times, in order
 
     @property
     def cycles(self) -> list[str]:
@@ -105,30 +110,54 @@ def scorable_init_times(inits: np.ndarray, cfg: HarnessConfig) -> np.ndarray:
     return inits[keep]
 
 
-def parse_period(label: str, init_hours: list[int], cfg: HarnessConfig) -> Period:
-    try:
-        year, month = (int(part) for part in label.split("-"))
-        if len(label) != 7 or not 1 <= month <= 12:
-            raise ValueError
-    except ValueError:
-        raise Refused(f"period {label!r}: expected YYYY-MM") from None
+def _month_init_times(year: int, month: int, init_hours: list[int]) -> np.ndarray:
     start = np.datetime64(f"{year:04d}-{month:02d}-01T00", "ns")
     last_day = calendar.monthrange(year, month)[1]
     end = np.datetime64(f"{year:04d}-{month:02d}-{last_day:02d}T23", "ns")
-    month_inits = evaluation_init_times(start, end, init_hours)
+    return evaluation_init_times(start, end, init_hours)
+
+
+def parse_period(label: str, init_hours: list[int], cfg: HarnessConfig) -> Period:
+    """A calendar month `YYYY-MM` or a calendar quarter `YYYY-Qn`, cut by `scorable_init_times`.
+
+    A quarter is ONE period: its init times are those of its three months together, so its scorecard
+    is one evaluation over the whole quarter, not an average of three monthly scorecards.
+    """
+    try:
+        year_text, part = label.split("-")
+        year = int(year_text)
+        if len(year_text) != 4 or not year_text.isdigit():
+            raise ValueError
+        if len(part) == 2 and part[0] == "Q" and part[1] in "1234":
+            first = 3 * int(part[1]) - 2
+            month_numbers = [first, first + 1, first + 2]
+        elif len(part) == 2 and part.isdigit() and 1 <= int(part) <= 12:
+            month_numbers = [int(part)]
+        else:
+            raise ValueError
+    except ValueError:
+        raise Refused(f"period {label!r}: expected YYYY-MM or YYYY-Qn") from None
+    is_quarter = len(month_numbers) == 3
+    per_month = {f"{year:04d}-{m:02d}": _month_init_times(year, m, init_hours) for m in month_numbers}
+    all_inits = np.concatenate(list(per_month.values()))
     validation = cfg.splits.validation
-    if month_inits.min() < validation.start:
+    if all_inits.min() < validation.start:
         raise Refused(
-            f"period {label}: starts at {month_inits.min()}, before the validation split ({validation.start})"
+            f"period {label}: starts at {all_inits.min()}, before the validation split ({validation.start})"
         )
-    inits = scorable_init_times(month_inits, cfg)
+    inits = scorable_init_times(all_inits, cfg)
     if inits.size == 0:
         raise Refused(
             f"period {label}: no init time is inside the validation split (ends {validation.end}) with its "
             f"longest lead ({max(cfg.evaluation.lead_hours)} h) before the sealed split "
             f"({cfg.splits.sealed_test.start})"
         )
-    return Period(label=label, init_times=inits, n_dropped=int(month_inits.size - inits.size))
+    months = (
+        tuple(m for m, times in per_month.items() if scorable_init_times(times, cfg).size)
+        if is_quarter
+        else ()
+    )
+    return Period(label=label, init_times=inits, n_dropped=int(all_inits.size - inits.size), months=months)
 
 
 def check_data_dir(data_dir: Path, allow_tmp: bool) -> Path:
@@ -273,6 +302,47 @@ def assemble_gefs(path: Path, period: Period, gefs_dir: Path, stations: list[str
     baseline_io.write(joined, path)
 
 
+def assemble_quarter(
+    path: Path, period: Period, month_stores: list[Path], months: list[Period], model: str
+) -> None:
+    """A quarter's forecast store: the stores of its months joined along init_time, nothing else.
+
+    Every month store must already exist and hold exactly that month's scorable init times, so the
+    quarter is made of the same forecasts as the monthly references. Init times end up in time order.
+    """
+    parts = []
+    for store, month in zip(month_stores, months, strict=True):
+        if not store.is_dir():
+            raise ModelFailed(
+                f"{store} is missing: run the months of {period.label} ({', '.join(period.months)}) first"
+            )
+        with open_store(store, f"{model} forecast {month.label}") as ds:
+            if ds.sizes.get("init_time") != month.init_times.size or not bool(
+                (np.sort(ds["init_time"].values) == month.init_times).all()
+            ):
+                raise ModelFailed(f"{store} does not hold exactly the init times of {month.label}")
+            if ds.attrs.get("model_id") != MODEL_IDS[model]:
+                raise ModelFailed(f"{store} is not a {MODEL_IDS[model]} forecast")
+            parts.append(ds.assign_coords(station_id=ds["station_id"].values.astype(str)).load())
+    first = parts[0]
+    for store, part in zip(month_stores, parts, strict=True):
+        for dim in ("lead_time", "station_id", "ens_member"):
+            if not part.indexes[dim].equals(first.indexes[dim]):
+                raise ModelFailed(f"{store}: {dim} differs from {month_stores[0]}")
+        if part.attrs != first.attrs or set(part.data_vars) != set(first.data_vars):
+            raise ModelFailed(f"{store}: attributes or variables differ from {month_stores[0]}")
+    joined = xr.concat(parts, dim="init_time", data_vars="all", coords="minimal", compat="override")
+    joined = joined.sortby("init_time")
+    if joined.sizes["init_time"] != period.init_times.size or not bool(
+        (joined["init_time"].values == period.init_times).all()
+    ):
+        raise ModelFailed(f"the month stores of {period.label} do not add up to its init times")
+    joined.attrs = dict(first.attrs)
+    for name in joined.variables:
+        joined[name].encoding.clear()
+    baseline_io.write(joined, path)
+
+
 # --------------------------------------------------------------------------- scoring
 
 
@@ -380,7 +450,7 @@ def run(args: argparse.Namespace) -> int:
         if period.n_dropped:
             print(
                 f"[{period.label}] stops at {pd.Timestamp(period.init_times.max()):%Y-%m-%dT%HZ}: the last "
-                f"{period.n_dropped} init time(s) of the month are left out for every model (after the end "
+                f"{period.n_dropped} init time(s) of the period are left out for every model (after the end "
                 "of the validation split, or with a longest lead that reaches the sealed split)"
             )
         work = data_dir / "gate1" / f"{period.label}_h{hour_tag}"
@@ -391,6 +461,13 @@ def run(args: argparse.Namespace) -> int:
             try:
                 if existing_store_ok(stores[model], period, stations, model):
                     print(f"[{period.label}] {model}: forecast store present, reused")
+                elif period.months:
+                    months = [parse_period(m, hours, cfg) for m in period.months]
+                    month_stores = [
+                        data_dir / "gate1" / f"{m}_h{hour_tag}" / f"{model}.zarr" for m in period.months
+                    ]
+                    assemble_quarter(stores[model], period, month_stores, months, model)
+                    print(f"[{period.label}] {model}: joined the stores of {', '.join(period.months)}")
                 elif model == "gefs":
                     assemble_gefs(stores[model], period, data_dir / "baselines" / "gefs", stations)
                     print(f"[{period.label}] gefs: assembled {len(period.cycles)} cycles")
@@ -558,7 +635,9 @@ def main(argv: list[str] | None = None) -> int:
         epilog="See docs/GATE1.md.",
     )
     parser.add_argument("--data-dir", type=Path, required=True, help="external data directory")
-    parser.add_argument("--period", action="append", required=True, metavar="YYYY-MM", help="repeatable")
+    parser.add_argument(
+        "--period", action="append", required=True, metavar="YYYY-MM|YYYY-Qn", help="repeatable"
+    )
     parser.add_argument(
         "--init-hours", type=int, nargs="+", required=True, metavar="H", help="UTC, e.g. 0 12"
     )
