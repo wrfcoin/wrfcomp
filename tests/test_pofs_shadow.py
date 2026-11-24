@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+from decimal import Decimal
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,11 +15,17 @@ from wrfcomp.pofs_shadow import (
     StationEntry,
     composite_forecast_loss,
     fair_ensemble_crps,
+    load_scorecard,
+    meta_ensemble_loss,
+    miners_from_scorecards,
     settle_compute_pool,
     settle_data_pool,
     settle_epoch,
+    settle_from_scorecards,
     weighted_mixture_crps,
 )
+
+EXPERIMENTS_DIR = Path(__file__).resolve().parents[1] / "experiments"
 
 
 def test_params_frozen_defaults_and_required_alpha_slash() -> None:
@@ -367,3 +375,116 @@ def test_tail_threshold_weighting_and_single_miner_behavior() -> None:
     assert res.payouts[0].reward == pytest.approx(550.0)
     assert res.payouts[0].crpss is not None and res.payouts[0].crpss > 0.0
     assert res.payouts[0].delta_crps is not None and res.payouts[0].delta_crps > 0.0
+
+
+@pytest.mark.parametrize(
+    "bad_threshold",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        np.nan,
+        np.inf,
+        -np.inf,
+        10**400,
+        -(10**400),
+        Decimal("1e400"),
+        np.longdouble("1e400"),
+        np.array([1.0, np.nan, 2.0, 3.0]),
+        np.array([1.0, np.inf, 2.0, 3.0]),
+        np.array([1.0, -np.inf, 2.0, 3.0]),
+        np.array([1.0, 10**400, 2.0, 3.0], dtype=object),
+    ],
+)
+def test_non_finite_and_overflowing_tail_thresholds_are_refused(bad_threshold: object) -> None:
+    obs = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+    fc = np.column_stack([obs - 0.5, obs + 0.5])
+    params = ShadowLedgerParams(alpha_slash=0.5)
+
+    with pytest.raises(ValueError, match="tail_threshold"):
+        composite_forecast_loss(fc, obs, params, tail_threshold=bad_threshold)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="tail_threshold"):
+        meta_ensemble_loss([fc], np.array([100.0]), obs, params, tail_threshold=bad_threshold)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="tail_threshold"):
+        settle_compute_pool(
+            [MinerEntry("m1", stake=100.0, forecast=fc)],
+            pool_amount=550.0,
+            params=params,
+            baseline_loss=1.0,
+            obs=obs,
+            tail_threshold=bad_threshold,  # type: ignore[arg-type]
+        )
+
+
+def test_gate1_scorecards_worked_example_january_and_july() -> None:
+    params = ShadowLedgerParams(alpha_slash=0.5)
+
+    jan_cards = {
+        "climatology": load_scorecard(EXPERIMENTS_DIR / "climatology_2024-01.json"),
+        "persistence": load_scorecard(EXPERIMENTS_DIR / "persistence_2024-01.json"),
+        "noaa-gefs": load_scorecard(EXPERIMENTS_DIR / "gefs_2024-01.json"),
+    }
+    jan_miners, jan_base, jan_vars, jan_leads = miners_from_scorecards(
+        jan_cards, baseline_key="climatology", stakes=100.0
+    )
+    assert jan_vars == ("msl", "t2m", "td2m", "u10", "v10")
+    assert jan_leads == (3, 6, 12, 24, 48)
+    assert jan_base == 1.0
+    assert len(jan_miners) == 3
+
+    jan_res = settle_from_scorecards(
+        jan_cards, baseline_key="climatology", pool_amount=550.0, params=params, stakes=100.0
+    )
+    jan_by_id = {p.miner_id: p for p in jan_res.payouts}
+    # GEFS is severely under-dispersed (failed Gate 1), yet wins 100% of the compute pool in January.
+    assert jan_cards["noaa-gefs"].passed_gate is False
+    assert jan_by_id["noaa-gefs"].reward == pytest.approx(550.0)
+    assert jan_by_id["noaa-gefs"].slash == 0.0
+    # Persistence beats climatology on average (+17.3% CRPSS) yet gets slashed due to negative Delta_CRPS.
+    assert jan_by_id["persistence"].crpss is not None and jan_by_id["persistence"].crpss > 0.15
+    assert jan_by_id["persistence"].reward == 0.0
+    assert jan_by_id["persistence"].slash > 0.0
+    assert jan_by_id["climatology"].reward == 0.0
+    assert jan_by_id["climatology"].slash > 0.0
+    assert jan_res.total_paid + jan_res.unpaid_remainder == pytest.approx(550.0)
+
+    jul_cards = {
+        "climatology": load_scorecard(EXPERIMENTS_DIR / "climatology_2024-07.json"),
+        "persistence": load_scorecard(EXPERIMENTS_DIR / "persistence_2024-07.json"),
+        "noaa-gefs": load_scorecard(EXPERIMENTS_DIR / "gefs_2024-07.json"),
+    }
+    jul_res = settle_from_scorecards(
+        jul_cards, baseline_key="climatology", pool_amount=550.0, params=params, stakes=100.0
+    )
+    jul_by_id = {p.miner_id: p for p in jul_res.payouts}
+    # In July combined 5-variable settlement, uncalibrated GEFS again wins 100% and persistence is slashed.
+    assert jul_cards["noaa-gefs"].passed_gate is False
+    assert jul_by_id["noaa-gefs"].reward == pytest.approx(550.0)
+    assert jul_by_id["persistence"].crpss is not None and jul_by_id["persistence"].crpss < 0.0
+    assert jul_by_id["persistence"].reward == 0.0
+    assert jul_by_id["persistence"].slash > 0.0
+
+    # Per-variable July u10 demonstrates Open Problem #10 on real data: both climatology (CRPSS=0)
+    # and GEFS (CRPSS<0) get paid because they dilute an even worse persistence forecast in M_all.
+    jul_u10 = settle_from_scorecards(
+        jul_cards,
+        baseline_key="climatology",
+        pool_amount=550.0,
+        params=params,
+        stakes=100.0,
+        variables=["u10"],
+    )
+    u10_by_id = {p.miner_id: p for p in jul_u10.payouts}
+    assert u10_by_id["noaa-gefs"].crpss is not None and u10_by_id["noaa-gefs"].crpss < 0.0
+    assert u10_by_id["noaa-gefs"].reward > 0.0
+    assert u10_by_id["climatology"].reward > 0.0
+    assert u10_by_id["persistence"].slash > 0.0
+
+
+def test_miners_from_scorecards_refuses_mismatched_periods() -> None:
+    jan_clim = load_scorecard(EXPERIMENTS_DIR / "climatology_2024-01.json")
+    jul_gefs = load_scorecard(EXPERIMENTS_DIR / "gefs_2024-07.json")
+    with pytest.raises(ValueError, match="does not share truth, thresholds, period"):
+        miners_from_scorecards({"climatology": jan_clim, "noaa-gefs": jul_gefs}, baseline_key="climatology")

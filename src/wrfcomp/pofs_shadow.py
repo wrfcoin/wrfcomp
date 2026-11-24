@@ -8,9 +8,13 @@ All calculations are deterministic pure functions over NumPy arrays.
 from __future__ import annotations
 
 import math
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+
+from wrfcomp.harness.schemas import Scorecard
 
 
 @dataclass(frozen=True)
@@ -243,8 +247,46 @@ def composite_pointwise_loss(
     return (1.0 - params.twcrps_weight) * c + params.twcrps_weight * t
 
 
+def _validate_tail_threshold(
+    threshold: np.ndarray | float | int,
+    n_obs: int | None = None,
+) -> np.ndarray:
+    """Validate that tail_threshold is finite, real, float64-representable, and shape-compatible."""
+    if isinstance(threshold, bool):
+        raise ValueError("tail_threshold must be numeric, not bool")
+    if isinstance(threshold, complex):
+        raise ValueError("tail_threshold must be real, not complex")
+    try:
+        raw = np.asarray(threshold)
+        if raw.dtype.kind == "b":
+            raise ValueError("tail_threshold must be numeric, not bool")
+        if raw.dtype.kind == "c":
+            raise ValueError("tail_threshold must be real, not complex")
+        with np.errstate(over="ignore"):
+            thr = np.asarray(raw, dtype=np.float64)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"tail_threshold must be finite and representable in float64: {exc}"
+        ) from exc
+    if thr.ndim > 1:
+        raise ValueError(f"tail_threshold must be a scalar or 1-D array, got shape {thr.shape}")
+    if thr.ndim == 1:
+        if thr.size == 0:
+            raise ValueError("tail_threshold must be non-empty")
+        if n_obs is not None and thr.shape != (n_obs,):
+            raise ValueError(
+                f"tail_threshold length {thr.shape[0]} does not match obs length {n_obs}"
+            )
+    if not np.isfinite(thr).all():
+        raise ValueError(
+            "tail_threshold must be finite (NaN, +/-infinity, and float64-overflowing values are refused)"
+        )
+    return thr
+
+
 def _clip_tail(values: np.ndarray, threshold: np.ndarray | float) -> np.ndarray:
-    thr = np.asarray(threshold, dtype=np.float64)
+    n_obs = values.shape[0] if values.ndim >= 1 else None
+    thr = _validate_tail_threshold(threshold, n_obs=n_obs)
     if thr.ndim == 1 and values.ndim == 2:
         thr = thr[:, np.newaxis]
     return np.maximum(values, thr)
@@ -261,8 +303,9 @@ def composite_forecast_loss(
     if tail_threshold is None:
         return float(np.mean(crps))
     y = np.asarray(obs, dtype=np.float64)
+    thr = _validate_tail_threshold(tail_threshold, n_obs=y.size)
     x = _as_2d_forecast(forecast, y.size)
-    twcrps = fair_ensemble_crps(_clip_tail(x, tail_threshold), _clip_tail(y, tail_threshold))
+    twcrps = fair_ensemble_crps(_clip_tail(x, thr), _clip_tail(y, thr))
     return float(np.mean(composite_pointwise_loss(crps, twcrps, params)))
 
 
@@ -278,8 +321,9 @@ def meta_ensemble_loss(
     if tail_threshold is None:
         return float(np.mean(crps))
     y = np.asarray(obs, dtype=np.float64)
-    clipped_fc = [_clip_tail(_as_2d_forecast(fc, y.size), tail_threshold) for fc in forecasts]
-    clipped_obs = _clip_tail(y, tail_threshold)
+    thr = _validate_tail_threshold(tail_threshold, n_obs=y.size)
+    clipped_fc = [_clip_tail(_as_2d_forecast(fc, y.size), thr) for fc in forecasts]
+    clipped_obs = _clip_tail(y, thr)
     twcrps = weighted_mixture_crps(clipped_fc, stakes, clipped_obs)
     return float(np.mean(composite_pointwise_loss(crps, twcrps, params)))
 
@@ -307,6 +351,9 @@ def settle_compute_pool(
     """
     if not math.isfinite(pool_amount) or pool_amount < 0.0:
         raise ValueError(f"pool_amount must be finite and >= 0, got {pool_amount}")
+    if tail_threshold is not None:
+        obs_len = np.asarray(obs).size if obs is not None else None
+        _validate_tail_threshold(tail_threshold, n_obs=obs_len)
 
     seen_ids: set[str] = set()
     for m in miners:
@@ -601,4 +648,174 @@ def settle_epoch(
         compute=compute,
         data=data,
         validator_pool=float(p_val),
+    )
+
+
+# --------------------------------------------------------------------------- Scorecard Loader
+
+
+def load_scorecard(path: Path | str) -> Scorecard:
+    """Read and validate a ``wrfcomp-eval`` JSON scorecard via ``Scorecard``."""
+    return Scorecard.model_validate_json(Path(path).read_text(encoding="utf-8"))
+
+
+def scorecard_variable_loss(
+    scorecard: Scorecard,
+    variable: str,
+    leads: Sequence[int] | None = None,
+) -> float:
+    """Return the pair-weighted composite loss for ``variable`` over ``leads`` (or ``"all"``)."""
+    if variable not in scorecard.metrics:
+        raise ValueError(f"scorecard {scorecard.model_id!r} has no metrics for variable {variable!r}")
+    per_lead = scorecard.metrics[variable]
+    if leads is None:
+        entry = per_lead["all"]
+        if entry.loss is None or not math.isfinite(entry.loss):
+            raise ValueError(f"scorecard {scorecard.model_id!r} has undefined 'all' loss for {variable!r}")
+        return float(entry.loss)
+
+    total_weighted = 0.0
+    total_pairs = 0
+    for lead in leads:
+        key = str(int(lead))
+        if key not in per_lead:
+            raise ValueError(f"scorecard {scorecard.model_id!r} lacks lead {lead}h for {variable!r}")
+        entry = per_lead[key]
+        if entry.n_pairs == 0:
+            continue
+        if entry.loss is None or not math.isfinite(entry.loss):
+            raise ValueError(f"scorecard {scorecard.model_id!r} has undefined loss at {variable!r} {lead}h")
+        total_weighted += float(entry.loss) * entry.n_pairs
+        total_pairs += entry.n_pairs
+    if total_pairs == 0:
+        raise ValueError(f"scorecard {scorecard.model_id!r} has zero scored pairs for {variable!r}")
+    return total_weighted / total_pairs
+
+
+def miners_from_scorecards(
+    scorecards: Mapping[str, Scorecard] | Sequence[tuple[str, Scorecard]],
+    *,
+    baseline_key: str,
+    stakes: Mapping[str, float] | float = 100.0,
+    variables: Sequence[str] | None = None,
+    leads: Sequence[int] | None = None,
+    fault_ids: Collection[str] = (),
+) -> tuple[list[MinerEntry], float, tuple[str, ...], tuple[int, ...]]:
+    """Build compute-pool ``MinerEntry`` inputs from validated ``wrfcomp-eval`` scorecards.
+
+    Aligns all non-faulty scorecards onto the same truth/thresholds hashes, evaluation period,
+    common variables, and common scored leads. For a single variable, returns physical-unit
+    losses with ``baseline_loss = L_base(v)``; for multiple variables, returns dimensionless
+    baseline-normalized loss ratios ``L_i(v) / L_base(v)`` with ``baseline_loss = 1.0`` so
+    variables with different units (Pa vs K vs m/s) receive equal weight.
+    """
+    items = list(scorecards.items()) if isinstance(scorecards, Mapping) else list(scorecards)
+    if not items:
+        raise ValueError("scorecards must be non-empty")
+    card_map = dict(items)
+    if len(card_map) != len(items):
+        raise ValueError("duplicate miner keys in scorecards")
+    if baseline_key not in card_map:
+        raise ValueError(f"baseline_key {baseline_key!r} not found in scorecards")
+
+    fault_set = set(fault_ids)
+    if baseline_key in fault_set:
+        raise ValueError(f"baseline_key {baseline_key!r} cannot be marked as a protocol fault")
+
+    active_keys = [k for k in sorted(card_map) if k not in fault_set]
+    ref = card_map[baseline_key]
+    for key in active_keys:
+        sc = card_map[key]
+        if (
+            sc.truth_sha256 != ref.truth_sha256
+            or sc.thresholds_sha256 != ref.thresholds_sha256
+            or sc.period_start != ref.period_start
+            or sc.period_end != ref.period_end
+            or sc.init_hours_scored != ref.init_hours_scored
+        ):
+            raise ValueError(
+                f"scorecard {key!r} does not share truth, thresholds, period, and init hours "
+                f"with baseline {baseline_key!r}"
+            )
+
+    shared_vars = set.intersection(*(set(card_map[k].metrics) for k in active_keys))
+    if variables is None:
+        chosen_vars = tuple(sorted(shared_vars))
+    else:
+        chosen_vars = tuple(variables)
+        missing_vars = [v for v in chosen_vars if v not in shared_vars]
+        if missing_vars:
+            raise ValueError(f"requested variable(s) not present in all scorecards: {missing_vars}")
+    if not chosen_vars:
+        raise ValueError("scorecards share no common scored variables")
+
+    shared_leads = set.intersection(*(set(card_map[k].leads_scored) for k in active_keys))
+    if leads is None:
+        chosen_leads = tuple(sorted(shared_leads))
+    else:
+        chosen_leads = tuple(sorted(int(h) for h in leads))
+        missing_leads = [h for h in chosen_leads if h not in shared_leads]
+        if missing_leads:
+            raise ValueError(f"requested lead(s) not present in all scorecards: {missing_leads}")
+    if not chosen_leads:
+        raise ValueError("scorecards share no common scored leads")
+
+    base_losses = {v: scorecard_variable_loss(ref, v, chosen_leads) for v in chosen_vars}
+    for v, loss in base_losses.items():
+        if loss <= 0.0:
+            raise ValueError(f"baseline loss for {v!r} must be > 0, got {loss}")
+
+    def _stake_for(key: str) -> float:
+        if isinstance(stakes, Mapping):
+            if key not in stakes:
+                raise ValueError(f"missing stake for miner {key!r}")
+            return float(stakes[key])
+        return float(stakes)
+
+    miners: list[MinerEntry] = []
+    for key in sorted(card_map):
+        stake = _stake_for(key)
+        if key in fault_set:
+            miners.append(MinerEntry(miner_id=key, stake=stake, protocol_fault=True))
+            continue
+        sc = card_map[key]
+        if len(chosen_vars) == 1:
+            v = chosen_vars[0]
+            loss_arr = np.array([scorecard_variable_loss(sc, v, chosen_leads)], dtype=np.float64)
+        else:
+            loss_arr = np.array(
+                [scorecard_variable_loss(sc, v, chosen_leads) / base_losses[v] for v in chosen_vars],
+                dtype=np.float64,
+            )
+        miners.append(MinerEntry(miner_id=key, stake=stake, pointwise_loss=loss_arr))
+
+    baseline_loss = base_losses[chosen_vars[0]] if len(chosen_vars) == 1 else 1.0
+    return miners, float(baseline_loss), chosen_vars, chosen_leads
+
+
+def settle_from_scorecards(
+    scorecards: Mapping[str, Scorecard] | Sequence[tuple[str, Scorecard]],
+    *,
+    baseline_key: str,
+    pool_amount: float,
+    params: ShadowLedgerParams,
+    stakes: Mapping[str, float] | float = 100.0,
+    variables: Sequence[str] | None = None,
+    leads: Sequence[int] | None = None,
+    fault_ids: Collection[str] = (),
+) -> ComputePoolSettlement:
+    """Validate ``wrfcomp-eval`` scorecards and settle the compute pool in pointwise-loss mode."""
+    miners, baseline_loss, _, _ = miners_from_scorecards(
+        scorecards,
+        baseline_key=baseline_key,
+        stakes=stakes,
+        variables=variables,
+        leads=leads,
+        fault_ids=fault_ids,
+    )
+    return settle_compute_pool(
+        miners,
+        pool_amount=pool_amount,
+        params=params,
+        baseline_loss=baseline_loss,
     )
