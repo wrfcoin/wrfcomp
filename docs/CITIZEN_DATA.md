@@ -101,4 +101,66 @@ rows are as recorded in the first pass of this lane and were not fetched a secon
 
 ## 3. 2024-07-08 to 2024-07-21 Sample Summary (Counts & Aggregates Only)
 
-*(Pending completion of full 14-day sample fetch.)*
+Fetched on 2026-11-23 with `scripts/fetch_citizen_sample.py` from the MADIS public surface service:
+168 two-hour windows per region, 4 concurrent requests, no account, token or terms step.
+All 336 windows returned; none failed. The run took 44 minutes.
+
+| | Amarillo TX (150 km) | Seattle WA (150 km) |
+| :--- | ---: | ---: |
+| Citizen stations | 20 | 324 |
+| Reports (station and time) | 41,869 | 621,291 |
+| Values (one per variable) | 301,453 | 4,660,098 |
+| Distinct 0.1 degree cells | 14 | 176 |
+| Transferred | 12.6 MiB | 148.0 MiB |
+| Stored | 1.2 MiB | 20.7 MiB |
+| First and last report (UTC) | 07-08 00:00, 07-21 23:58 | 07-08 00:00, 07-21 23:59 |
+
+Totals: 160.6 MiB transferred and 21.9 MiB stored, both against the 500 MiB cap.
+
+**Reporting interval.** Median 10 minutes in both regions (quartiles 5 and 10 minutes at Amarillo, 5 and
+11 at Seattle; gaps over two hours are left out of this figure). Reports fall on all 60 minutes of the
+hour; about 5 % (Amarillo) and 8 % (Seattle) are on minute 0. The median station reports in 99.7 % of the
+336 hours. 18 of 20 Amarillo stations and 283 of 324 Seattle stations report in at least 90 % of hours;
+9 Seattle stations average under one report per hour.
+
+**Variables present** (values, and stations that report the variable):
+
+| Variable | Unit | Amarillo values | Amarillo stations | Seattle values | Seattle stations |
+| :--- | :--- | ---: | ---: | ---: | ---: |
+| `t2m` | K | 40,402 | 19 | 609,835 | 320 |
+| `td2m` | K | 40,402 | 19 | 608,838 | 317 |
+| `wind_speed` | m/s | 40,402 | 19 | 613,902 | 321 |
+| `u10`, `v10` | m/s | 38,928 each | | 575,524 each | |
+| `wind_gust` | m/s | 38,884 | 18 | 602,152 | 312 |
+| `station_pressure` | Pa | 23,178 | 14 | 474,032 | 300 |
+| `precip` (last hour) | mm | 40,329 | 19 | 600,291 | 309 |
+| `msl` | Pa | 0 | 0 | 0 | 0 |
+
+**No sea-level pressure.** Not one report in either region carries `SLP`. Citizen stations in this feed
+give station pressure only, so the QC trial cannot use `msl` from them; it has `station_pressure`.
+
+**Value ranges, raw and before any quality control** (minimum, 1st percentile, median, 99th percentile,
+maximum). They confirm the units and show the kind of bad values the QC trial has to catch:
+
+| Variable | Amarillo | Seattle |
+| :--- | :--- | :--- |
+| `t2m` [K] | 285.4, 287.6, 298.7, 312.0, 317.0 | 205.4, 284.3, 293.2, 308.2, 346.5 |
+| `td2m` [K] | 271.0, 276.1, 287.4, 296.2, 299.8 | 201.4, 277.3, 287.0, 294.2, 346.5 |
+| `wind_speed` [m/s] | 0, 0, 1.8, 7.6, 15.2 | 0, 0, 0.4, 4.5, 146.2 |
+| `wind_gust` [m/s] | 0, 0, 3.6, 11.6, 21.5 | 0, 0, 1.3, 7.2, 46.9 |
+| `station_pressure` [Pa] | 86379, 86818, 89336, 91329, 91502 | 85260, 92163, 100617, 102039, 102498 |
+| `precip` [mm] | 0, 0, 0, 2.8, 61.0 | 0, 0, 0, 0, 84.8 |
+
+The Seattle extremes (205 K, 346 K, 146 m/s) are sensor or coding faults in the raw feed. They are kept
+on purpose: the sample was requested without the MADIS quality filter.
+
+**What is on disk** under `<data dir>/citizen/`: `amarillo_tx_20240708_20240721.nc`,
+`seattle_wa_20240708_20240721.nc`, `summary_20240708_20240721.json` (aggregates only) and the secret
+`.station_key`. Checked on the stored files: every station token has the keyed form, every latitude and
+longitude is on the 0.1 degree grid, every elevation is on the 10 m grid, no time is in 2025, and the
+summary holds neither a token nor a coordinate.
+
+**History of this sample.** A first fetch of the same windows, made before the privacy changes in
+section 2, wrote files with unkeyed tokens and exact elevations (and 573 MB for Seattle, uncompressed).
+Those files were deleted and the sample was fetched again with the present code. Both fetches returned
+the same counts.
