@@ -1,0 +1,482 @@
+"""Tests for scripts/build_scoring_bundle.py and scripts/fetch_scoring_data.py.
+
+Uses only synthetic seeded datasets and local fake archives (never touches the network).
+"""
+
+from __future__ import annotations
+
+import gzip
+import hashlib
+import importlib.util
+import io
+import json
+import sys
+import tarfile
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import pytest
+import xarray as xr
+
+from wrfcomp.harness.hashing import content_sha256
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "configs" / "splits.yaml"
+
+
+def _load_script(name: str):
+    path = ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+builder = _load_script("build_scoring_bundle")
+fetcher = _load_script("fetch_scoring_data")
+
+
+def _make_truth(seed: int = 1) -> xr.Dataset:
+    rng = np.random.default_rng(seed)
+    times = pd.date_range("2024-01-01T00:00:00", periods=4, freq="1h").to_numpy(dtype="datetime64[ns]")
+    stations = np.array(["72405013743", "72295023174"], dtype="U11")
+    return xr.Dataset(
+        {
+            "t2m": (("valid_time", "station_id"), rng.normal(280.0, 2.0, (4, 2)).astype(np.float32)),
+        },
+        coords={
+            "valid_time": times,
+            "station_id": stations,
+            "latitude": ("station_id", np.array([38.85, 33.94], dtype=np.float32)),
+            "longitude": ("station_id", np.array([-77.04, -118.41], dtype=np.float32)),
+            "elevation_m": ("station_id", np.array([4.0, 38.0], dtype=np.float32)),
+        },
+    )
+
+
+def _make_thresholds(seed: int = 2) -> xr.Dataset:
+    rng = np.random.default_rng(seed)
+    stations = np.array(["72405013743", "72295023174"], dtype="U11")
+    return xr.Dataset(
+        {
+            "t2m": (("station_id", "month"), rng.uniform(290.0, 305.0, (2, 12)).astype(np.float32)),
+        },
+        coords={"station_id": stations, "month": np.arange(1, 13, dtype=np.int32)},
+    )
+
+
+def _make_forecast(model_id: str, start: str, seed: int) -> xr.Dataset:
+    rng = np.random.default_rng(seed)
+    inits = pd.date_range(start, periods=2, freq="12h").to_numpy(dtype="datetime64[ns]")
+    leads = np.array([3, 6], dtype="timedelta64[h]").astype("timedelta64[ns]")
+    stations = np.array(["72405013743", "72295023174"], dtype="U11")
+    members = np.array([0, 1], dtype=np.int32)
+    return xr.Dataset(
+        {
+            "t2m": (
+                ("init_time", "lead_time", "station_id", "ens_member"),
+                rng.normal(280.0, 1.5, (2, 2, 2, 2)).astype(np.float32),
+            )
+        },
+        coords={
+            "init_time": inits,
+            "lead_time": leads,
+            "station_id": stations,
+            "ens_member": members,
+        },
+        attrs={"model_id": model_id, "model_version": "test-1"},
+    )
+
+
+@pytest.fixture()
+def synthetic_env(tmp_path: Path) -> dict[str, Any]:
+    data_dir = tmp_path / "data"
+    (data_dir / "truth").mkdir(parents=True)
+    (data_dir / "thresholds").mkdir(parents=True)
+    (data_dir / "gate1" / "2024-01_h00-12").mkdir(parents=True)
+    (data_dir / "gate1" / "2024-Q1_h00-12").mkdir(parents=True)
+    # Decoy private/unpinned files that must NEVER be bundled.
+    (data_dir / "citizen").mkdir(parents=True)
+    (data_dir / "citizen" / ".station_key").write_text("secret", encoding="utf-8")
+    (data_dir / "citizen" / "seattle.nc").write_bytes(b"private-citizen-data")
+
+    truth_ds = _make_truth(seed=10)
+    truth_path = data_dir / "truth" / "isd_conus_2024.nc"
+    truth_ds.to_netcdf(truth_path, engine="h5netcdf")
+    truth_sha = content_sha256(xr.open_dataset(truth_path))
+
+    thresh_ds = _make_thresholds(seed=11)
+    thresh_path = data_dir / "thresholds" / "tail_p95.nc"
+    thresh_ds.to_netcdf(thresh_path, engine="h5netcdf")
+    thresh_sha = content_sha256(xr.open_dataset(thresh_path))
+
+    stores = {
+        ("2024-01", "climatology"): ("gate1/2024-01_h00-12/climatology.zarr", 20),
+        ("2024-01", "noaa-gefs"): ("gate1/2024-01_h00-12/gefs.zarr", 21),
+        ("2024-Q1", "climatology"): ("gate1/2024-Q1_h00-12/climatology.zarr", 22),
+        ("2024-Q1", "noaa-gefs"): ("gate1/2024-Q1_h00-12/gefs.zarr", 23),
+    }
+    store_hashes: dict[tuple[str, str], str] = {}
+    for (period, model), (rel, seed) in stores.items():
+        ds = _make_forecast(model, "2024-01-01T00:00:00", seed)
+        target = data_dir / rel
+        ds.to_zarr(target, mode="w", consolidated=True, zarr_format=2)
+        with xr.open_zarr(target, chunks=None, consolidated=True) as opened:
+            store_hashes[(period, model)] = content_sha256(opened)
+
+    # Unpinned persistence store next to pinned stores must NOT be packed.
+    pers = _make_forecast("persistence", "2024-01-01T00:00:00", 99)
+    pers.to_zarr(
+        data_dir / "gate1" / "2024-01_h00-12" / "persistence.zarr",
+        mode="w",
+        consolidated=True,
+        zarr_format=2,
+    )
+
+    inventory = {
+        "harness_version": {"scores": "2.7.0", "wrfcomp": "0.1.0"},
+        "inventory_version": 1,
+        "protocol_version": "0.1.0",
+        "periods": {},
+    }
+    for period in ("2024-01", "2024-Q1"):
+        inventory["periods"][period] = {
+            "truth": "truth/isd_conus_2024.nc",
+            "thresholds": "thresholds/tail_p95.nc",
+            "other_reference_forecasts": {"0" * 64: f"experiments/persistence_{period}.json"},
+            "references": {
+                baseline: {
+                    "forecast_sha256": store_hashes[(period, baseline)],
+                    "model_id": baseline,
+                    "period_start": "2024-01-01T00:00:00",
+                    "period_end": "2024-01-31T12:00:00",
+                    "scorecard": f"experiments/{baseline}_{period}.json",
+                    "store": stores[(period, baseline)][0],
+                    "thresholds_sha256": thresh_sha,
+                    "truth_sha256": truth_sha,
+                }
+                for baseline in ("climatology", "noaa-gefs")
+            },
+        }
+    ref_path = tmp_path / "REFERENCES.json"
+    ref_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "data_dir": data_dir,
+        "out_dir": tmp_path / "bundle",
+        "ref_path": ref_path,
+        "truth_sha": truth_sha,
+        "thresh_sha": thresh_sha,
+        "store_hashes": store_hashes,
+    }
+
+
+def test_build_and_fetch_roundtrip_reproducible_and_excludes_private_files(synthetic_env, tmp_path):
+    out_dir = synthetic_env["out_dir"]
+    summary1 = builder.build_bundle(
+        year=2024,
+        data_dir=synthetic_env["data_dir"],
+        out_dir=out_dir,
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        min_free_gb=0.0,
+    )
+    summary2 = builder.build_bundle(
+        year=2024,
+        data_dir=synthetic_env["data_dir"],
+        out_dir=out_dir,
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        min_free_gb=0.0,
+    )
+    assert summary1["archive_sha256"] == summary2["archive_sha256"]
+    assert summary1["entries"] == 6
+    assert summary1["periods"] == ["2024-01", "2024-Q1"]
+
+    archive_path = Path(summary1["archive_path"])
+    assert archive_path.is_file()
+    assert Path(summary1["sha256_sidecar"]).read_text(encoding="utf-8").startswith(summary1["archive_sha256"])
+
+    with tarfile.open(archive_path, "r:gz") as tf:
+        names = tf.getnames()
+        assert "MANIFEST.json" in names
+        assert "README.md" in names
+        assert not any("citizen" in n or ".station_key" in n or "persistence" in n for n in names)
+        readme = tf.extractfile("README.md").read().decode("utf-8")
+        assert "NOAA" in readme and "CC0-1.0" in readme
+
+    dest = tmp_path / "unpacked"
+    fetched = fetcher.fetch_scoring_data(
+        year=2024,
+        data_dir=dest,
+        archive=archive_path,
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        expected_sha256=summary1["archive_sha256"],
+    )
+    assert fetched["entries_verified"] == 6
+    assert len(fetched["installed"]) == 6
+    assert not (dest / "citizen").exists()
+
+    # Re-running without --overwrite is idempotent when files match pins.
+    again = fetcher.fetch_scoring_data(
+        year=2024,
+        data_dir=dest,
+        archive=archive_path,
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+    )
+    assert again["installed"] == []
+
+    # Existing modified file is refused without --overwrite, replaced with --overwrite.
+    _make_truth(seed=999).to_netcdf(dest / "truth" / "isd_conus_2024.nc", engine="h5netcdf")
+    with pytest.raises(fetcher.FetchError, match="different content"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=dest,
+            archive=archive_path,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+        )
+    replaced = fetcher.fetch_scoring_data(
+        year=2024,
+        data_dir=dest,
+        archive=archive_path,
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        overwrite=True,
+    )
+    assert "truth/isd_conus_2024.nc" in replaced["installed"]
+    with xr.open_dataset(dest / "truth" / "isd_conus_2024.nc") as ds:
+        assert content_sha256(ds) == synthetic_env["truth_sha"]
+
+
+def test_build_refuses_hash_mismatch_sealed_year_and_low_disk(synthetic_env):
+    # Sealed year refused
+    with pytest.raises(builder.BundleError, match="sealed split"):
+        builder.build_bundle(
+            year=2025,
+            data_dir=synthetic_env["data_dir"],
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    # Unpinned year refused
+    with pytest.raises(builder.BundleError, match="No periods pinned"):
+        builder.build_bundle(
+            year=2023,
+            data_dir=synthetic_env["data_dir"],
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    # Free-space guard enforced
+    with pytest.raises(builder.BundleError, match="Insufficient free disk space"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=synthetic_env["data_dir"],
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=1e9,
+        )
+    # Content hash mismatch refused BEFORE packing
+    truth_nc = synthetic_env["data_dir"] / "truth" / "isd_conus_2024.nc"
+    _make_truth(seed=777).to_netcdf(truth_nc, engine="h5netcdf")
+    with pytest.raises(builder.BundleError, match="Content hash mismatch"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=synthetic_env["data_dir"],
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    assert not (synthetic_env["out_dir"] / "wrfcomp-scoring-2024.tar.gz").exists()
+
+
+def test_fetch_refuses_tampered_file_spoofed_manifest_and_unsafe_tar(synthetic_env, tmp_path):
+    summary = builder.build_bundle(
+        year=2024,
+        data_dir=synthetic_env["data_dir"],
+        out_dir=synthetic_env["out_dir"],
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        min_free_gb=0.0,
+    )
+    good_archive = Path(summary["archive_path"])
+
+    # 1. Expected archive SHA mismatch
+    with pytest.raises(fetcher.FetchError, match="Archive SHA-256 mismatch"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "d1",
+            archive=good_archive,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_sha256="0" * 64,
+        )
+
+    # 2. Tamper one file inside archive without updating MANIFEST.json
+    tampered_file = tmp_path / "tampered_file.tar.gz"
+    with tarfile.open(good_archive, "r:gz") as src, tarfile.open(tampered_file, "w:gz") as dst:
+        for member in src.getmembers():
+            data = src.extractfile(member).read()
+            if member.name == "truth/isd_conus_2024.nc":
+                data = data[:-4] + b"XXXX"
+            info = tarfile.TarInfo(member.name)
+            info.size = len(data)
+            dst.addfile(info, io.BytesIO(data))
+    d2 = tmp_path / "d2"
+    with pytest.raises(fetcher.FetchError, match="Byte SHA-256 mismatch"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=d2,
+            archive=tampered_file,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+        )
+    assert not (d2 / "truth").exists()
+
+    # 3. Spoof both truth file AND MANIFEST.json -> caught by REFERENCES.json pin
+    alt_truth = tmp_path / "alt_truth.nc"
+    _make_truth(seed=555).to_netcdf(alt_truth, engine="h5netcdf")
+    alt_bytes = alt_truth.read_bytes()
+    alt_content_sha = content_sha256(xr.open_dataset(alt_truth))
+    spoofed = tmp_path / "spoofed_manifest.tar.gz"
+    with tarfile.open(good_archive, "r:gz") as src, tarfile.open(spoofed, "w:gz") as dst:
+        for member in src.getmembers():
+            data = src.extractfile(member).read()
+            if member.name == "truth/isd_conus_2024.nc":
+                data = alt_bytes
+            elif member.name == "MANIFEST.json":
+                m = json.loads(data.decode("utf-8"))
+                for entry in m["entries"]:
+                    if entry["path"] == "truth/isd_conus_2024.nc":
+                        entry["content_sha256"] = alt_content_sha
+                        entry["size_bytes"] = len(alt_bytes)
+                        entry["files"][0]["size_bytes"] = len(alt_bytes)
+                        entry["files"][0]["sha256"] = hashlib.sha256(alt_bytes).hexdigest()
+                data = json.dumps(m).encode("utf-8")
+            info = tarfile.TarInfo(member.name)
+            info.size = len(data)
+            dst.addfile(info, io.BytesIO(data))
+    d3 = tmp_path / "d3"
+    with pytest.raises(fetcher.FetchError, match="disagrees with REFERENCES.json"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=d3,
+            archive=spoofed,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+        )
+    assert not (d3 / "truth").exists()
+
+    # 4. Path traversal member refused
+    traversal = tmp_path / "traversal.tar.gz"
+    with gzip.open(traversal, "wb") as gz, tarfile.open(fileobj=gz, mode="w") as tf:
+        info = tarfile.TarInfo("../escape.txt")
+        info.size = 3
+        tf.addfile(info, io.BytesIO(b"bad"))
+    with pytest.raises(fetcher.FetchError, match="unsafe relative path"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "d4",
+            archive=traversal,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+        )
+
+    # 5. Extra unmanifested file in archive refused
+    extra = tmp_path / "extra.tar.gz"
+    with tarfile.open(good_archive, "r:gz") as src, tarfile.open(extra, "w:gz") as dst:
+        for member in src.getmembers():
+            data = src.extractfile(member).read()
+            info = tarfile.TarInfo(member.name)
+            info.size = len(data)
+            dst.addfile(info, io.BytesIO(data))
+        sneaky = tarfile.TarInfo("truth/sneaky.txt")
+        sneaky.size = 5
+        dst.addfile(sneaky, io.BytesIO(b"extra"))
+    with pytest.raises(fetcher.FetchError, match="unmanifested extra files"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "d5",
+            archive=extra,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+        )
+
+
+def test_fetch_resolves_zenodo_record_url_with_mock_transport(synthetic_env, tmp_path, monkeypatch):
+    summary = builder.build_bundle(
+        year=2024,
+        data_dir=synthetic_env["data_dir"],
+        out_dir=synthetic_env["out_dir"],
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        min_free_gb=0.0,
+    )
+    archive_bytes = Path(summary["archive_path"]).read_bytes()
+    archive_md5 = hashlib.md5(archive_bytes).hexdigest()
+
+    record_api_url = "https://zenodo.org/api/records/12345678"
+    file_url = "https://zenodo.org/api/records/12345678/files/wrfcomp-scoring-2024.tar.gz/content"
+    record_payload = json.dumps(
+        {
+            "files": [
+                {
+                    "key": "wrfcomp-scoring-2024.tar.gz",
+                    "checksum": f"md5:{archive_md5}",
+                    "links": {"self": file_url},
+                },
+                {
+                    "key": "wrfcomp-scoring-2024.tar.gz.sha256",
+                    "links": {"self": file_url + ".sha256"},
+                },
+            ]
+        }
+    ).encode("utf-8")
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    def fake_urlopen(req, timeout=60.0):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if url == record_api_url:
+            return _FakeResp(record_payload)
+        if url == file_url:
+            return _FakeResp(archive_bytes)
+        raise AssertionError(f"Unexpected URL requested: {url}")
+
+    monkeypatch.setattr(fetcher.urllib.request, "urlopen", fake_urlopen)
+
+    dest = tmp_path / "from_zenodo"
+    result = fetcher.fetch_scoring_data(
+        year=2024,
+        data_dir=dest,
+        url="https://zenodo.org/records/12345678",
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+    )
+    assert result["entries_verified"] == 6
+    assert len(result["installed"]) == 6
+
+    # Non-HTTPS external URLs are refused.
+    with pytest.raises(fetcher.FetchError, match="Refusing URL scheme"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "bad_scheme",
+            url="http://zenodo.org/records/12345678",
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+        )
