@@ -3,17 +3,22 @@
 Owner decision 2026-11-23: a candidate is promoted only if it passes the harness gate against
 climatology AND against NOAA GEFS, on the same forecast, truth, thresholds and period.
 
-    uv run python scripts/check_promotion.py evaluate \\
+    uv run --locked python scripts/check_promotion.py evaluate \\
         --forecast F.zarr --data-dir D --period 2024-01 --out DIR
-    uv run python scripts/check_promotion.py verify A.json B.json --period 2024-01
+    uv run --locked python scripts/check_promotion.py verify A.json B.json --period 2024-01
 
-`evaluate` is the only mode that can print PROMOTED. It
-  1. checks that this checkout is the locked harness (`scripts/harness_lock.py check`);
-  2. finds the two reference forecasts of the period under the data directory, at the places named
-     in `experiments/REFERENCES.json`, and refuses them unless their content hash is the pinned one;
-  3. runs `wrfcomp-eval` twice itself, with the locked `configs/splits.yaml`: the candidate against
-     climatology and against NOAA GEFS;
-  4. judges the two scorecards it has just produced (rules below) and writes them to `--out`.
+`evaluate` is the only mode that can print PROMOTED. Everything it relies on comes from one tree,
+the checkout this script is in:
+  1. that tree must pass the harness lock (`scripts/harness_lock.py check`), and the harness modules
+     this process has imported must be files of that tree;
+  2. the two reference forecasts of the period are taken from the data directory, at the places
+     named in the tree's `experiments/REFERENCES.json`, and refused unless their content hash is the
+     pinned one;
+  3. `wrfcomp-eval` is run twice through `uv run --locked` on that tree, with its locked
+     `configs/splits.yaml`: the candidate against climatology and against NOAA GEFS;
+  4. the two scorecards are judged (rules below). They and `verdict.json` are written in a private
+     directory made for the run and published as `<out>/promotion_<period>_<forecast hash>` at the
+     end. File names are fixed by this program; the candidate's model id is data inside the files.
 
 `verify` applies the same rules to two scorecards that already exist. It proves nothing about where
 they came from, so it prints CONSISTENT or INCONSISTENT and never PROMOTED.
@@ -33,17 +38,24 @@ Rules, for each of the two scorecards, against the period's record in `experimen
 Both scorecards must describe the same candidate forecast, and both gates must be passed.
 
 Exit codes: 0 PROMOTED (evaluate) or CONSISTENT (verify); 1 NOT PROMOTED or INCONSISTENT;
-2 refused (bad input, unpinned or missing references, harness not locked).
-Locked: see docs/HARNESS_LOCK.md.
+2 refused (bad input, unpinned or missing references, harness not locked or not from this tree).
+Locked: see docs/HARNESS_LOCK.md, which also lists what this check does not establish.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import importlib.util
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +90,23 @@ CONTEXT_KEYS = (
 SAME_CANDIDATE_KEYS = ("model_id", "model_version", "forecast_sha256")
 EXIT_NOT_PROMOTED = 1
 EXIT_REFUSED = 2
+# Names this program gives the files of one run. Nothing from the candidate goes into a path.
+STAGED_NAMES = {"climatology": "candidate_vs_climatology.json", "noaa-gefs": "candidate_vs_noaa-gefs.json"}
+VERDICT_NAME = "verdict.json"
+PERIOD_NAME = re.compile(r"[0-9]{4}-[0-9]{2}")
+HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+# Every module the scores come from. `evaluate` requires each to be loaded from the checked tree.
+HARNESS_MODULES = (
+    "wrfcomp",
+    "wrfcomp.harness",
+    "wrfcomp.harness.align",
+    "wrfcomp.harness.config",
+    "wrfcomp.harness.evaluate",
+    "wrfcomp.harness.hashing",
+    "wrfcomp.harness.metrics",
+    "wrfcomp.harness.schemas",
+    "wrfcomp.harness.truth",
+)
 VERIFY_NOTICE = (
     "verify only compares two existing scorecards with the pinned references. It proves nothing about "
     "where the scorecards came from and is not a promotion. Use `evaluate` for a verdict."
@@ -136,7 +165,7 @@ def build_inventory(root: Path, periods: dict[str, dict]) -> dict:
     return inventory
 
 
-def load_inventory(root: Path = ROOT) -> dict:
+def load_inventory(root: Path) -> dict:
     """Read REFERENCES.json and check it against the reference scorecards it pins."""
     inventory = _read_json(root / INVENTORY, "reference inventory")
     if inventory.get("inventory_version") != INVENTORY_VERSION or not isinstance(
@@ -191,7 +220,7 @@ def reference_forecast_hashes(inventory: dict) -> dict[str, str]:
 # --------------------------------------------------------------------------- judging
 
 
-def judge(cards: list[dict], period: str, inventory: dict, root: Path = ROOT) -> list[str]:
+def judge(cards: list[dict], period: str, inventory: dict, root: Path) -> list[str]:
     """Reasons the two scorecards do NOT amount to a pass against both references. Empty = pass."""
     from wrfcomp.harness.config import load_config
     from wrfcomp.harness.metrics import evaluate_gates
@@ -300,15 +329,42 @@ def judge(cards: list[dict], period: str, inventory: dict, root: Path = ROOT) ->
 # --------------------------------------------------------------------------- evaluate
 
 
-def _harness_lock_problems() -> list[str]:
-    """Problems reported by scripts/harness_lock.py for THIS checkout (the code that will score)."""
-    spec = importlib.util.spec_from_file_location("harness_lock", ROOT / "scripts" / "harness_lock.py")
+@dataclass(frozen=True)
+class Outcome:
+    """Result of `evaluate`: why the candidate is not promoted (empty = promoted) and where the
+    finished artifacts were published."""
+
+    reasons: list[str]
+    directory: Path
+
+
+def _harness_lock_problems(root: Path) -> list[str]:
+    """Problems reported by `root`'s scripts/harness_lock.py for the tree at `root`."""
+    spec = importlib.util.spec_from_file_location("harness_lock", root / "scripts" / "harness_lock.py")
+    if spec is None or spec.loader is None or not (root / "scripts" / "harness_lock.py").is_file():
+        return [f"{root} has no scripts/harness_lock.py"]
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     try:
-        return module.check()
+        return module.check(root)
     except module.LockError as exc:
         return [str(exc)]
+
+
+def _modules_outside_root(root: Path) -> list[str]:
+    """Harness modules that this process did NOT load from `root`'s source tree.
+
+    The tree check looks at files under `root`; the numbers come from whatever Python imports. Both
+    must be the same files, so every harness module has to resolve inside `root/src/wrfcomp`.
+    """
+    package = (root / "src" / "wrfcomp").resolve()
+    outside = []
+    for name in HARNESS_MODULES:
+        module = importlib.import_module(name)
+        origin = Path(getattr(module, "__file__", None) or "/nonexistent").resolve()
+        if not origin.is_relative_to(package):
+            outside.append(f"{name} is loaded from {origin}")
+    return outside
 
 
 def _open_forecast(path: Path, what: str):
@@ -325,30 +381,63 @@ def _open_forecast(path: Path, what: str):
         raise Refused(f"{what}: cannot open {path}: {exc}") from exc
 
 
-def _run_eval(args: list[str]) -> int:
-    import click
-
-    from wrfcomp.harness.evaluate import app
-
-    try:
-        code = app(args=args, standalone_mode=False)
-    except click.exceptions.Exit as exc:
-        return int(exc.exit_code)
-    except click.ClickException as exc:
-        print(f"wrfcomp-eval: {exc.format_message()}", file=sys.stderr)
-        return int(exc.exit_code)
-    return int(code or 0)
+def _eval_command(root: Path, args: list[str]) -> list[str]:
+    """`wrfcomp-eval` as installed from `root`, with the dependency versions of `root`'s uv.lock."""
+    uv = shutil.which("uv")
+    if uv is None:
+        raise Refused("uv is not installed; evaluations run through `uv run --locked`")
+    return [uv, "run", "--locked", "--project", str(root), "wrfcomp-eval", *args]
 
 
-def evaluate(forecast: Path, data_dir: Path, period: str, out_dir: Path, root: Path = ROOT) -> list[str]:
-    """Score the candidate against both pinned references and judge. Returns the reasons it fails."""
+def _run_eval(root: Path, args: list[str]) -> int:
+    environment = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}  # uv picks root's own
+    return subprocess.run(_eval_command(root, args), cwd=root, env=environment, check=False).returncode
+
+
+def _publish(staging: Path, out_dir: Path, name: str) -> Path:
+    """Move the finished run directory into place. An identical earlier result is kept as it is."""
+    final = out_dir / name
+    if final.exists():
+        ours = {p.name: p.read_bytes() for p in sorted(staging.iterdir())}
+        theirs = {p.name: p.read_bytes() for p in sorted(final.iterdir())} if final.is_dir() else None
+        if ours == theirs:
+            shutil.rmtree(staging)
+            return final
+        final = out_dir / f"{name}-{staging.name.rsplit('-', 1)[-1]}"  # same candidate, different result
+    staging.chmod(0o755)
+    os.rename(staging, final)
+    return final
+
+
+def evaluate(forecast: Path, data_dir: Path, period: str, out_dir: Path, root: Path) -> Outcome:
+    """Score the candidate against both pinned references and judge.
+
+    Everything the verdict rests on comes from the one tree at `root`: the lock manifest and the
+    tree it describes, the harness modules this process imports, the reference inventory, the
+    config, and the `wrfcomp-eval` that `uv run --locked --project root` starts. If any of them is
+    somewhere else, the call is refused.
+
+    The two scorecards and `verdict.json` are written into a private directory made for this run,
+    under names this program chooses, and published as `<out_dir>/promotion_<period>_<hash>` when
+    the run is complete. The candidate's model id is recorded inside the files; it is never part of
+    a path.
+    """
     from wrfcomp.harness.hashing import content_sha256
 
-    problems = _harness_lock_problems()
+    root = root.resolve()
+    problems = _harness_lock_problems(root)
     if problems:
-        raise Refused("this checkout is not the locked harness: " + "; ".join(problems[:5]))
+        raise Refused(f"{root} is not the locked harness: " + "; ".join(problems[:5]))
+    outside = _modules_outside_root(root)
+    if outside:
+        raise Refused(
+            f"the harness in use is not the one under {root}: " + "; ".join(outside[:3]) + ". "
+            "Run this script with `uv run --locked` from that checkout."
+        )
     inventory = load_inventory(root)
     entry = period_record(inventory, period)
+    if not PERIOD_NAME.fullmatch(period):
+        raise Refused(f"period {period!r} is not a name this program writes files for")
     data_dir = data_dir.resolve()
     truth, thresholds = data_dir / entry["truth"], data_dir / entry["thresholds"]
     for path, what in ((truth, "truth"), (thresholds, "thresholds")):
@@ -374,24 +463,55 @@ def evaluate(forecast: Path, data_dir: Path, period: str, out_dir: Path, root: P
             )
         stores[name] = store
 
+    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    cards: list[dict] = []
-    failures: list[str] = []
-    for name in REQUIRED_BASELINES:
-        target = out_dir / f"{model_id}_vs_{name}_{period}.json"
-        target.unlink(missing_ok=True)
-        args = ["--forecast", str(forecast), "--truth", str(truth), "--thresholds", str(thresholds)]
-        args += ["--baseline", str(stores[name]), "--baseline-id", name, "--out", str(target)]
-        args += ["--model-id", model_id, "--model-version", model_version]
-        args += ["--config", str(root / "configs" / "splits.yaml")]
-        code = _run_eval(args)
-        if code != 0 or not target.is_file():
-            failures.append(f"wrfcomp-eval refused the candidate against {name} (exit code {code})")
-            continue
-        cards.append(_read_json(target, "scorecard"))
-    if failures:
-        return failures
-    return judge(cards, period, inventory, root)
+    staging = Path(tempfile.mkdtemp(prefix=".promotion-run-", dir=out_dir))  # private: mode 0700
+    try:
+        cards: list[dict] = []
+        reasons: list[str] = []
+        for name in REQUIRED_BASELINES:
+            target = staging / STAGED_NAMES[name]
+            args = [
+                "--forecast",
+                str(forecast.resolve()),
+                "--truth",
+                str(truth),
+                "--thresholds",
+                str(thresholds),
+            ]
+            args += ["--baseline", str(stores[name]), "--baseline-id", name, "--out", str(target)]
+            args += ["--model-id", model_id, "--model-version", model_version]
+            args += ["--config", str(root / "configs" / "splits.yaml")]
+            code = _run_eval(root, args)
+            if code != 0 or not target.is_file():
+                target.unlink(missing_ok=True)
+                reasons.append(f"wrfcomp-eval refused the candidate against {name} (exit code {code})")
+                continue
+            cards.append(_read_json(target, "scorecard"))
+        if not reasons:
+            reasons = judge(cards, period, inventory, root)
+
+        digests = {str(card.get("forecast_sha256")) for card in cards}
+        digest = digests.pop() if len(digests) == 1 else ""
+        verdict = {
+            "period": period,
+            "verdict": "NOT PROMOTED" if reasons else "PROMOTED",
+            "reasons": reasons,
+            "baselines": list(REQUIRED_BASELINES),
+            "candidate": {
+                "model_id": model_id,
+                "model_version": model_version,
+                "forecast_sha256": digest or None,
+            },
+            "scorecards": sorted(p.name for p in staging.iterdir()),
+        }
+        text = json.dumps(verdict, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        (staging / VERDICT_NAME).write_text(text, encoding="ascii")
+        token = digest[:16] if HEX_DIGEST.fullmatch(digest) else "unscored-" + staging.name.rsplit("-", 1)[-1]
+        return Outcome(reasons=reasons, directory=_publish(staging, out_dir, f"promotion_{period}_{token}"))
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- command line
@@ -417,7 +537,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.mode == "evaluate":
-            reasons = evaluate(args.forecast, args.data_dir, args.period, args.out, root=ROOT)
+            outcome = evaluate(args.forecast, args.data_dir, args.period, args.out, root=ROOT)
+            reasons = outcome.reasons
+            print(f"Scorecards and verdict: {outcome.directory}")
             verdict = ("PROMOTED", "NOT PROMOTED")
         else:
             print(VERIFY_NOTICE)

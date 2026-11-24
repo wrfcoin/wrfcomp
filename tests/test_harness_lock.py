@@ -124,6 +124,7 @@ def repo(tmp_path: Path) -> Path:
     """A small repository with the real locked scope, a manifest, and a clean tree."""
     root = tmp_path / "repo"
     files = {
+        **{path: f"{path}\n" for path in tool.LOCKED_FILES},
         "src/wrfcomp/__init__.py": '__version__ = "9.9.9"\n',
         "src/wrfcomp/harness/__init__.py": "",
         "src/wrfcomp/harness/metrics.py": "a = 1\n",
@@ -131,7 +132,6 @@ def repo(tmp_path: Path) -> Path:
         "configs/splits.yaml": "x: 1\n",
         "uv.lock": UV_LOCK,
         ".gitignore": "__pycache__/\n*.tmp\n",
-        **{path: f"{path}\n" for path in tool.LOCKED_FILES},
     }
     for path, text in files.items():
         (root / path).parent.mkdir(parents=True, exist_ok=True)
@@ -368,43 +368,51 @@ def test_unreadable_lock_is_an_error_not_a_pass(
 # =============================================================================== the approval gate
 
 OWNER = gate.APPROVERS[0]
-HEAD = "a" * 40
+HEAD, OLD_HEAD, BASE = "a" * 40, "c" * 40, "b" * 40
+T1, T2 = "2026-11-24T10:00:00Z", "2026-11-24T11:00:00Z"
 
 
-def pull(*labels: str, changed_files: int = 1, head: str = HEAD) -> dict:
-    return {"head": {"sha": head}, "changed_files": changed_files, "labels": [{"name": n} for n in labels]}
+def pull(*, changed_files: int = 1, head: str = HEAD, base: str = BASE) -> dict:
+    return {"head": {"sha": head}, "base": {"sha": base}, "changed_files": changed_files, "labels": []}
 
 
-def committed(when: str, sha: str = HEAD) -> dict:
-    return {"event": "committed", "sha": sha, "committer": {"date": when}, "author": {"date": when}}
+def comment(
+    body: str, *, login: str = OWNER, kind: str = "User", edited: bool = False, number: int = 1
+) -> dict:
+    return {
+        "id": number,
+        "html_url": f"https://github.test/pr/1#issuecomment-{number}",
+        "body": body,
+        "user": {"login": login, "type": kind},
+        "created_at": T1,
+        "updated_at": T2 if edited else T1,
+    }
 
 
-def labeled(when: str, actor: str = OWNER, name: str = gate.LABEL) -> dict:
-    return {"event": "labeled", "label": {"name": name}, "actor": {"login": actor}, "created_at": when}
+def approval(head: str = HEAD, **kwargs) -> dict:
+    return comment(f"{gate.APPROVAL_WORD} {head}", **kwargs)
 
 
-def decide(
-    files: list[dict], timeline: list[dict], *labels: str, action: str = "labeled", **kwargs
-) -> tuple[bool, str]:
-    kwargs.setdefault("pull", pull(*labels, changed_files=len(files)))
+def decide(files: list[dict], comments: list[dict], **kwargs) -> tuple[bool, str]:
+    kwargs.setdefault("pull_before", pull(changed_files=len(files)))
+    kwargs.setdefault("pull_after", kwargs["pull_before"])
     kwargs.setdefault("event_head_sha", HEAD)
-    approved, lines = gate.decide(files=files, timeline=timeline, action=action, **kwargs)
-    return approved, "\n".join(lines)
+    passes, lines = gate.decide(files=files, comments=comments, **kwargs)
+    return passes, "\n".join(lines)
 
 
 LOCKED_CHANGE = [{"filename": "src/wrfcomp/harness/metrics.py", "status": "modified"}]
-T1, T2, T3 = "2026-11-24T10:00:00Z", "2026-11-24T11:00:00Z", "2026-11-24T12:00:00Z"
+HARMLESS = [
+    {"filename": "src/wrfcomp/models/new.py"},
+    {"filename": "docs/BASELINES.md"},
+    {"filename": "uv.lock"},
+]
 
 
 def test_gate_passes_a_pull_request_that_touches_nothing_locked() -> None:
-    files = [
-        {"filename": "src/wrfcomp/models/new.py"},
-        {"filename": "docs/BASELINES.md"},
-        {"filename": "uv.lock"},
-    ]
-    for action in ("opened", "synchronize", "labeled"):
-        approved, text = decide(files, [committed(T1)], action=action)
-        assert approved and "No locked path" in text
+    passes, text = decide(HARMLESS, [])
+    assert passes and "No locked path" in text
+    assert f"Evaluated head {HEAD} on base {BASE}." in text  # the verdict names the commit it is about
 
 
 @pytest.mark.parametrize(
@@ -412,6 +420,7 @@ def test_gate_passes_a_pull_request_that_touches_nothing_locked() -> None:
     [
         "src/wrfcomp/harness/metrics.py",
         "src/wrfcomp/harness/new_module.py",
+        "src/wrfcomp/__init__.py",
         "configs/splits.yaml",
         "configs/new.yaml",
         ".github/workflows/harness-lock.yml",
@@ -429,11 +438,12 @@ def test_gate_passes_a_pull_request_that_touches_nothing_locked() -> None:
         "experiments/gefs_2024-07.json",
     ],
 )
-def test_gate_needs_the_label_for_every_locked_path(path: str) -> None:
-    approved, text = decide([{"filename": path}], [committed(T1)], action="opened")
-    assert not approved and "NOT APPROVED" in text and "is not on the pull request" in text
-    approved, _ = decide([{"filename": path}], [committed(T1), labeled(T2)], gate.LABEL)
-    assert approved
+def test_gate_needs_an_approval_of_the_head_for_every_locked_path(path: str) -> None:
+    passes, text = decide([{"filename": path}], [])
+    assert not passes and f"NOT APPROVED: no approval comment for head {HEAD}" in text
+    assert f"    {gate.APPROVAL_WORD} {HEAD}" in text  # it says exactly what the owner has to write
+    passes, text = decide([{"filename": path}], [approval()])
+    assert passes and f"APPROVED: {OWNER} approved head {HEAD}" in text
 
 
 def test_gate_sees_renames_out_of_and_into_the_locked_set() -> None:
@@ -446,137 +456,205 @@ def test_gate_sees_renames_out_of_and_into_the_locked_set() -> None:
     ]
     into = [{"filename": "configs/extra.yaml", "previous_filename": "notes/extra.yaml", "status": "renamed"}]
     for files in (out, into):
-        approved, text = decide(files, [committed(T1)], action="opened")
-        assert not approved and "Locked paths touched" in text
+        passes, text = decide(files, [])
+        assert not passes and "Locked paths touched" in text
     assert gate.changed_paths(out) == ["src/wrfcomp/harness/metrics.py", "src/wrfcomp/metrics.py"]
     assert not gate.is_locked("src/wrfcomp/harness.py") and not gate.is_locked("experiments/README.md")
     assert not gate.is_locked("configs.yaml") and not gate.is_locked("docs/HARNESS_LOCK.md.bak")
+    assert not gate.is_locked("src/wrfcomp/baselines/__init__.py")
 
 
-def test_gate_approves_only_a_fresh_owner_label() -> None:
-    approved, text = decide(LOCKED_CHANGE, [committed(T1), labeled(T2)], gate.LABEL)
-    assert approved and f"applied by {OWNER}" in text and HEAD in text
-
-    # applied by anyone else, including the Actions bot of a workflow inside the pull request
-    for actor in ("github-actions[bot]", "someone-else", None):
-        event = labeled(T2, actor=actor) if actor else {**labeled(T2), "actor": None}
-        approved, text = decide(LOCKED_CHANGE, [committed(T1), event], gate.LABEL)
-        assert not approved and "not an approver" in text
-    # the owner's label, followed by a re-label from a bot: the latest event decides
-    approved, _ = decide(
-        LOCKED_CHANGE, [committed(T1), labeled(T2), labeled(T3, actor="github-actions[bot]")], gate.LABEL
-    )
-    assert not approved
-    # another label does not count, and the right label must actually be on the pull request
-    approved, _ = decide(LOCKED_CHANGE, [committed(T1), labeled(T2, name="bug")], "bug")
-    assert not approved
-    approved, text = decide(LOCKED_CHANGE, [committed(T1), labeled(T2)])
-    assert not approved and "is not on the pull request" in text
-    approved, text = decide(LOCKED_CHANGE, [committed(T1)], gate.LABEL)
-    assert not approved and "no labeled event" in text
+def test_approval_is_bound_to_the_exact_head_commit() -> None:
+    # An approval of an earlier head says nothing about this one: that is all a new push needs.
+    passes, text = decide(LOCKED_CHANGE, [approval(OLD_HEAD)])
+    assert not passes and "first line is not exactly the approval of this head" in text
+    # several approvals over the life of a pull request: only the one for the current head counts
+    assert decide(LOCKED_CHANGE, [approval(OLD_HEAD, number=1), approval(number=2)])[0]
+    assert not decide(LOCKED_CHANGE, [approval(OLD_HEAD, number=1), approval("d" * 40, number=2)])[0]
+    # the base commit's sha is not the head's
+    assert not decide(LOCKED_CHANGE, [approval(BASE)])[0]
 
 
-def test_gate_binds_the_approval_to_the_head() -> None:
-    # a commit after the label
-    approved, text = decide(LOCKED_CHANGE, [committed(T1), labeled(T2), committed(T3)], gate.LABEL)
-    assert not approved and "not newer than the latest head change" in text
-    # at the very same second: not newer
-    approved, _ = decide(LOCKED_CHANGE, [committed(T2), labeled(T2)], gate.LABEL)
-    assert not approved
-    # a force push, a base change or a reopen after the label
-    for kind in gate.HEAD_CHANGE_EVENTS:
-        approved, text = decide(
-            LOCKED_CHANGE, [committed(T1), labeled(T2), {"event": kind, "created_at": T3}], gate.LABEL
+@pytest.mark.parametrize(
+    "body",
+    [
+        f"{gate.APPROVAL_WORD} {HEAD[:39]}",  # 39 characters
+        f"{gate.APPROVAL_WORD} {HEAD[:7]}",  # a short sha
+        f"{gate.APPROVAL_WORD} {HEAD}0",  # 41 characters
+        f"{gate.APPROVAL_WORD} {HEAD.upper()}",
+        f"{gate.APPROVAL_WORD}  {HEAD}",  # two spaces
+        f"{gate.APPROVAL_WORD} {HEAD} ",  # trailing space
+        f" {gate.APPROVAL_WORD} {HEAD}",  # leading space
+        f"{gate.APPROVAL_WORD} {HEAD} looks good",
+        f"{gate.APPROVAL_WORD}: {HEAD}",
+        f"{gate.APPROVAL_WORD.lower()} {HEAD}",
+        f"> {gate.APPROVAL_WORD} {HEAD}",  # a quotation of someone else's comment
+        f"`{gate.APPROVAL_WORD} {HEAD}`",
+        f"I will not write\n{gate.APPROVAL_WORD} {HEAD}",  # not the first line
+        f"\n{gate.APPROVAL_WORD} {HEAD}",
+        gate.APPROVAL_WORD,
+        HEAD,
+        "",
+    ],
+)
+def test_only_the_exact_first_line_approves(body: str) -> None:
+    passes, text = decide(LOCKED_CHANGE, [comment(body)])
+    assert not passes and "NOT APPROVED" in text
+
+
+def test_exact_first_line_may_be_followed_by_anything() -> None:
+    for body in (
+        f"{gate.APPROVAL_WORD} {HEAD}\nReviewed with Codex's findings, go ahead.",
+        f"{gate.APPROVAL_WORD} {HEAD}\r\nWindows line ending",
+        f"{gate.APPROVAL_WORD} {HEAD}\n",
+    ):
+        assert decide(LOCKED_CHANGE, [comment(body)])[0], body
+
+
+def test_only_an_unedited_comment_by_the_owner_account_approves() -> None:
+    for login, kind in (
+        ("github-actions[bot]", "Bot"),
+        ("someone-else", "User"),
+        (OWNER, "Bot"),
+        (None, "User"),
+    ):
+        passes, text = decide(LOCKED_CHANGE, [approval(login=login, kind=kind)])
+        assert not passes and "is not an approver" in text, (login, kind)
+    passes, text = decide(LOCKED_CHANGE, [approval(edited=True)])
+    assert not passes and "was edited after it was posted" in text
+    # someone else's attempt does not spoil the owner's approval, in either order
+    stranger = approval(login="someone-else", number=2)
+    assert decide(LOCKED_CHANGE, [stranger, approval(number=3)])[0]
+    assert decide(LOCKED_CHANGE, [approval(number=3), stranger])[0]
+    # malformed comment records are skipped, not trusted
+    broken = [
+        {"body": None},
+        {"body": f"{gate.APPROVAL_WORD} {HEAD}"},
+        {"body": f"{gate.APPROVAL_WORD} {HEAD}", "user": {}},
+    ]
+    assert not decide(LOCKED_CHANGE, broken)[0]
+    # a label plays no part: with or without one, the answer is the same
+    labelled = {**pull(), "labels": [{"name": "owner-approved-harness-change"}]}
+    assert not decide(LOCKED_CHANGE, [], pull_before=labelled, pull_after=labelled)[0]
+    assert decide(LOCKED_CHANGE, [approval()], pull_before=labelled, pull_after=labelled)[0]
+
+
+def test_gate_fails_if_the_pull_request_moved_while_it_was_read() -> None:
+    moved_head = pull(head="d" * 40)
+    moved_base = pull(base="e" * 40)
+    for files, comments in (
+        (HARMLESS, []),
+        (LOCKED_CHANGE, [approval()]),
+        (LOCKED_CHANGE, [approval("d" * 40)]),
+    ):
+        before = pull(changed_files=len(files))
+        for after in (moved_head, moved_base):
+            after = {**after, "changed_files": len(files)}
+            passes, text = decide(files, comments, pull_before=before, pull_after=after)
+            assert not passes and "moved while it was being read" in text
+        # a run started for an older head never answers for the current one, locked paths or not
+        passes, text = decide(files, comments, event_head_sha=OLD_HEAD)
+        assert not passes and f"started for head {OLD_HEAD}" in text
+    # unreadable commits are not a pass either
+    for bad in ({}, {"head": {"sha": "not-a-sha"}, "base": {"sha": BASE}}, {"head": {"sha": HEAD}}):
+        passes, text = decide(
+            HARMLESS, [], pull_before=pull(changed_files=3), pull_after={**bad, "changed_files": 3}
         )
-        assert not approved and "not newer" in text, kind
-    # a fresh label after the push approves again
-    approved, _ = decide(LOCKED_CHANGE, [committed(T1), labeled(T2), committed(T2), labeled(T3)], gate.LABEL)
-    assert approved
-    # commit times with an offset are compared as instants
-    approved, _ = decide(LOCKED_CHANGE, [committed("2026-11-24T13:30:00+02:00"), labeled(T3)], gate.LABEL)
-    assert approved
-    approved, _ = decide(LOCKED_CHANGE, [committed("2026-11-24T14:30:00+02:00"), labeled(T3)], gate.LABEL)
-    assert not approved
-    # the author date counts too
-    backdated = {**committed(T1), "author": {"date": T3}}
-    approved, _ = decide(LOCKED_CHANGE, [backdated, labeled(T2)], gate.LABEL)
-    assert not approved
-
-
-def test_gate_fails_a_run_started_by_a_push_and_a_head_that_moved() -> None:
-    timeline = [committed(T1), labeled(T2)]
-    approved, text = decide(LOCKED_CHANGE, timeline, gate.LABEL, action="synchronize")
-    assert not approved and "every push needs a fresh owner label" in text
-    approved, text = decide(LOCKED_CHANGE, timeline, gate.LABEL, event_head_sha="b" * 40)
-    assert not approved and "head moved during this run" in text
-    for result in ("failure", "cancelled", ""):
-        approved, text = decide(LOCKED_CHANGE, timeline, gate.LABEL, withdraw_result=result)
-        assert not approved and "withdraws approval" in text
-    for result in ("success", "skipped"):
-        assert decide(LOCKED_CHANGE, timeline, gate.LABEL, withdraw_result=result)[0]
+        assert not passes and "NOT APPROVED" in text
 
 
 def test_gate_fails_closed_on_incomplete_or_unreadable_facts(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     harmless = [{"filename": "docs/BASELINES.md"}]
     # GitHub says 5 files changed but listed 1: the locked change may be in the missing part
-    approved, text = decide(harmless, [committed(T1)], pull=pull(changed_files=5), action="opened")
-    assert not approved and "may be cut off" in text
-    approved, _ = decide(
-        harmless, [committed(T1)], pull={"head": {"sha": HEAD}, "labels": []}, action="opened"
-    )
-    assert not approved
+    cut = pull(changed_files=5)
+    passes, text = decide(harmless, [], pull_before=cut, pull_after=cut)
+    assert not passes and "may be cut off" in text
+    assert decide(harmless, [approval()], pull_before=cut, pull_after=cut)[
+        0
+    ]  # the owner may still approve it
+    unknown = {"head": {"sha": HEAD}, "base": {"sha": BASE}}
+    assert not decide(harmless, [], pull_before=unknown, pull_after=unknown)[0]
     many = [{"filename": f"docs/{i}.md"} for i in range(gate.MAX_LISTED_FILES)]
-    assert not decide(many, [committed(T1)], action="opened")[0]
-    # unreadable times
-    approved, text = decide(LOCKED_CHANGE, [{"event": "committed", "sha": HEAD}, labeled(T2)], gate.LABEL)
-    assert not approved and "no readable date" in text
-    approved, _ = decide(LOCKED_CHANGE, [committed(T1), {**labeled(T2), "created_at": "soon"}], gate.LABEL)
-    assert not approved
-    approved, text = decide(LOCKED_CHANGE, [labeled(T2)], gate.LABEL)
-    assert not approved and "no commit" in text
+    assert not decide(many, [])[0]
     # the command itself: no environment, or an API that cannot be reached
-    for name in ("GH_TOKEN", "PR_NUMBER", "EVENT_ACTION", "EVENT_HEAD_SHA"):
+    for name in ("GH_TOKEN", "PR_NUMBER", "EVENT_HEAD_SHA"):
         monkeypatch.delenv(name, raising=False)
     assert gate.main() == 1
     assert "NOT APPROVED" in capsys.readouterr().out
-    env = {"GH_TOKEN": "x", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "1", "EVENT_ACTION": "labeled"}
-    for name, value in {**env, "EVENT_HEAD_SHA": HEAD, "GITHUB_API_URL": "http://127.0.0.1:1"}.items():
+    env = {"GH_TOKEN": "x", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "1", "EVENT_HEAD_SHA": HEAD}
+    for name, value in {**env, "GITHUB_API_URL": "http://127.0.0.1:1"}.items():
         monkeypatch.setenv(name, value)
     assert gate.main() == 1
     assert "could not read the pull request" in capsys.readouterr().out
 
 
-def test_gate_main_reads_the_api_and_follows_pagination(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    pages = {
-        "/repos/o/r/pulls/7": (pull(gate.LABEL, changed_files=2), None),
-        "/repos/o/r/pulls/7/files?per_page=100": ([{"filename": "docs/a.md"}], "/files-page-2"),
-        "/files-page-2": (LOCKED_CHANGE, None),
-        "/repos/o/r/issues/7/timeline?per_page=100": ([committed(T1)], "/timeline-page-2"),
-        "/timeline-page-2": ([labeled(T2)], None),
-    }
-    seen: list[str] = []
+class FakeApi:
+    """Stands in for the GitHub API. The pull request can change between the first and second read."""
 
-    def fake_get(url: str, token: str):
+    def __init__(self, *, files: list[list[dict]], comments: list[list[dict]], pulls: list[dict]) -> None:
+        self.pulls, self.seen = list(pulls), []
+        self.pages = {
+            "/repos/o/r/pulls/7/files?per_page=100": files,
+            "/repos/o/r/issues/7/comments?per_page=100": comments,
+        }
+
+    def get(self, url: str, token: str):
         assert token == "secret-token"
         key = url.removeprefix("https://api.test")
-        seen.append(key)
-        body, nxt = pages[key]
-        return body, (f"https://api.test{nxt}" if nxt else None)
+        self.seen.append(key)
+        if key == "/repos/o/r/pulls/7":
+            return self.pulls.pop(0), None
+        base, _, page = key.partition("#page")
+        pages = self.pages[base]
+        index = int(page or 0)
+        nxt = f"https://api.test{base}#page{index + 1}" if index + 1 < len(pages) else None
+        return pages[index], nxt
 
-    monkeypatch.setattr(gate, "_get", fake_get)
-    env = {
-        "GH_TOKEN": "secret-token",
-        "GITHUB_REPOSITORY": "o/r",
-        "PR_NUMBER": "7",
-        "EVENT_ACTION": "labeled",
-    }
-    for name, value in {**env, "EVENT_HEAD_SHA": HEAD, "GITHUB_API_URL": "https://api.test"}.items():
+
+@pytest.fixture
+def api_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = {"GH_TOKEN": "secret-token", "GITHUB_REPOSITORY": "o/r", "PR_NUMBER": "7", "EVENT_HEAD_SHA": HEAD}
+    for name, value in {**env, "GITHUB_API_URL": "https://api.test"}.items():
         monkeypatch.setenv(name, value)
+
+
+def test_gate_main_pages_through_files_and_comments_and_reads_the_pull_twice(
+    monkeypatch: pytest.MonkeyPatch, api_env: None, capsys
+) -> None:
+    # the locked file is on the second page of files, the approval on the second page of comments
+    api = FakeApi(
+        files=[[{"filename": "docs/a.md"}], LOCKED_CHANGE],
+        comments=[[comment("nice work")], [approval(number=2)]],
+        pulls=[pull(changed_files=2), pull(changed_files=2)],
+    )
+    monkeypatch.setattr(gate, "_get", api.get)
     assert gate.main() == 0
     out = capsys.readouterr().out
-    assert "APPROVED" in out and "secret-token" not in out
-    assert "/files-page-2" in seen and "/timeline-page-2" in seen  # the locked file was on page 2
-    monkeypatch.setenv("EVENT_ACTION", "synchronize")
+    assert f"APPROVED: {OWNER} approved head {HEAD}" in out and "secret-token" not in out
+    assert api.seen[0] == api.seen[-1] == "/repos/o/r/pulls/7"  # read before and after paging
+    assert sum("#page1" in key for key in api.seen) == 2
+    assert api.pulls == []
+
+    # the same pull request without the approval comment
+    api = FakeApi(files=[LOCKED_CHANGE], comments=[[comment("nice work")]], pulls=[pull(), pull()])
+    monkeypatch.setattr(gate, "_get", api.get)
+    assert gate.main() == 1
+    assert f"{gate.APPROVAL_WORD} {HEAD}" in capsys.readouterr().out
+
+
+def test_gate_main_fails_when_a_push_lands_between_the_two_reads(
+    monkeypatch: pytest.MonkeyPatch, api_env: None, capsys
+) -> None:
+    # First read: a harmless head. While the files are paged, a push adds a locked change.
+    # The file list already shows nothing locked, so only the second read can catch it.
+    for second in (pull(head="d" * 40, changed_files=3), pull(base="e" * 40, changed_files=3)):
+        api = FakeApi(files=[HARMLESS], comments=[[]], pulls=[pull(changed_files=3), second])
+        monkeypatch.setattr(gate, "_get", api.get)
+        assert gate.main() == 1
+        assert "moved while it was being read" in capsys.readouterr().out
+    # and an approval of the old head does not carry over to a head pushed during the run
+    api = FakeApi(files=[LOCKED_CHANGE], comments=[[approval()]], pulls=[pull(), pull(head="d" * 40)])
+    monkeypatch.setattr(gate, "_get", api.get)
     assert gate.main() == 1
 
 
@@ -588,6 +666,7 @@ def test_gate_scope_covers_the_manifest_scope_and_the_lock_machinery() -> None:
         assert f"{directory}/" in gate.LOCKED_PREFIXES
     for path in tool.LOCKED_FILES:
         assert path in gate.LOCKED_FILES
+    assert "src/wrfcomp/__init__.py" in tool.LOCKED_FILES  # the package initializer is hashed too
     for path in (
         "HARNESS_LOCK.json",
         "scripts/harness_lock.py",
@@ -611,46 +690,33 @@ def _workflow(name: str) -> tuple[dict, str]:
     return yaml.safe_load(text), text
 
 
-def test_approval_workflow_runs_from_the_base_branch_and_never_checks_out() -> None:
+def test_approval_workflow_runs_from_the_base_branch_reads_only_and_never_checks_out() -> None:
     workflow, text = _workflow("harness-lock.yml")
     triggers = workflow[True]  # YAML reads the key `on` as a boolean
     assert set(triggers) == {"pull_request_target"}
-    assert {"opened", "reopened", "synchronize", "labeled", "unlabeled"} <= set(
-        triggers["pull_request_target"]["types"]
-    )
+    assert {"opened", "reopened", "synchronize"} <= set(triggers["pull_request_target"]["types"])
     assert workflow["permissions"] == {}
-    assert (
-        workflow["concurrency"]["cancel-in-progress"] is False
-    )  # a queued run must still withdraw the label
+    assert "concurrency" not in workflow  # no shared queue in which one run can displace another
+    assert list(workflow["jobs"]) == ["harness-lock"]
 
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert "write" not in code  # no write permission anywhere in the workflow
     assert "actions/checkout" not in code and "uses:" not in code
     assert "git " not in code and "head.ref" not in code and "head.repo" not in code
     assert "pull_request.title" not in code and "pull_request.body" not in code
-    # expressions appear only in `if:`, `env:` values, the concurrency group and job wiring, never in a script
-    for job in workflow["jobs"].values():
-        for step in job["steps"]:
-            assert "${{" not in step["run"], step["name"]
+    assert "-X DELETE" not in code and "-X POST" not in code and "labels/" not in code
+    # expressions appear only in `env:` values, never inside a script
+    job = workflow["jobs"]["harness-lock"]
+    assert all("${{" not in step["run"] for step in job["steps"])
+    assert "concurrency" not in job and "needs" not in job and "if" not in job
 
-    gate_job = workflow["jobs"]["harness-lock"]
-    assert gate_job["name"] == "harness-lock"
-    assert gate_job["permissions"] == {"contents": "read", "pull-requests": "read", "issues": "read"}
-    assert gate_job["needs"] == "withdraw-approval" and "!cancelled()" in gate_job["if"]
-    fetch, run = gate_job["steps"]
+    assert job["name"] == "harness-lock"
+    assert job["permissions"] == {"contents": "read", "pull-requests": "read", "issues": "read"}
+    fetch, run = job["steps"]
     assert "contents/.github/harness_lock_gate.py?ref=${WORKFLOW_SHA}" in fetch["run"]
-    assert (
-        fetch["env"]["WORKFLOW_SHA"] == "${{ github.sha }}"
-    )  # the base commit the workflow itself came from
+    assert fetch["env"]["WORKFLOW_SHA"] == "${{ github.sha }}"  # the base commit the workflow came from
     assert run["env"]["EVENT_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
-    assert run["env"]["WITHDRAW_RESULT"] == "${{ needs.withdraw-approval.result }}"
-
-    withdraw = workflow["jobs"]["withdraw-approval"]
-    assert withdraw["if"] == "github.event.action == 'synchronize'"
-    assert withdraw["permissions"] == {"pull-requests": "write"}  # the only write permission in the file
-    assert (
-        f"/labels/{gate.LABEL}" in withdraw["steps"][0]["run"] and "-X DELETE" in withdraw["steps"][0]["run"]
-    )
-    assert text.count("write") == 1
+    assert set(run["env"]) == {"GH_TOKEN", "PR_NUMBER", "EVENT_HEAD_SHA"}
 
 
 def test_ci_workflow_keeps_only_the_hash_check_lint_and_tests() -> None:
@@ -661,4 +727,4 @@ def test_ci_workflow_keeps_only_the_hash_check_lint_and_tests() -> None:
     runs = [step.get("run", "") for step in workflow["jobs"]["test"]["steps"]]
     assert "python3 scripts/harness_lock.py check" in runs
     assert "uv run ruff check" in runs and "uv run pytest -q" in runs
-    assert gate.LABEL not in text and "pull_request_target" not in text
+    assert gate.APPROVAL_WORD not in text and "pull_request_target" not in text

@@ -107,28 +107,44 @@ def build_world(root: Path) -> Path:
     return root
 
 
+def in_process_eval(root: Path, args: list[str]) -> int:
+    """Stands in for `uv run --locked wrfcomp-eval`: the same command, run in this process."""
+    return CliRunner().invoke(eval_app, args).exit_code
+
+
+def trust(patch: pytest.MonkeyPatch) -> None:
+    """Pretend the synthetic world is a locked checkout whose harness is the one imported here.
+
+    The real checks are tested on their own below; the synthetic world is not a Git repository and
+    holds no source tree, so they would (rightly) refuse it.
+    """
+    patch.setattr(tool, "_harness_lock_problems", lambda root: [])
+    patch.setattr(tool, "_modules_outside_root", lambda root: [])
+    patch.setattr(tool, "_run_eval", in_process_eval)
+
+
 @pytest.fixture(scope="module")
 def base_world(tmp_path_factory: pytest.TempPathFactory) -> dict:
     """Built once, never modified. `cards` are the two scorecards of the good candidate."""
     root = build_world(tmp_path_factory.mktemp("promotion") / "repo")
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(tool, "_harness_lock_problems", lambda: [])
+        trust(patch)
         out = root.parent / "good-cards"
-        reasons = tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, out, root=root)
-    cards = [json.loads(p.read_text()) for p in sorted(out.glob("*.json"))]
+        outcome = tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, out, root)
+    cards = [json.loads((outcome.directory / name).read_text()) for name in tool.STAGED_NAMES.values()]
     return {
         "root": root,
-        "reasons": reasons,
+        "reasons": outcome.reasons,
         "cards": cards,
         "out": out,
+        "directory": outcome.directory,
         "inventory": tool.load_inventory(root),
     }
 
 
 @pytest.fixture
 def locked(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pretend this checkout passes the harness lock (the lock itself is tested in test_harness_lock)."""
-    monkeypatch.setattr(tool, "_harness_lock_problems", lambda: [])
+    trust(monkeypatch)
 
 
 def judge(base_world: dict, cards: list[dict]) -> list[str]:
@@ -146,8 +162,19 @@ def good_cards(base_world: dict) -> tuple[dict, dict]:
 
 def test_evaluate_runs_both_evaluations_and_promotes_a_better_candidate(base_world: dict) -> None:
     assert base_world["reasons"] == []
-    names = sorted(p.name for p in base_world["out"].iterdir())
-    assert names == [f"synth_vs_climatology_{PERIOD}.json", f"synth_vs_noaa-gefs_{PERIOD}.json"]
+    # one published directory, named by the program from the period and the forecast's content hash
+    directory = base_world["directory"]
+    digest = base_world["cards"][0]["forecast_sha256"]
+    assert [p.name for p in base_world["out"].iterdir()] == [directory.name]
+    assert directory.name == f"promotion_{PERIOD}_{digest[:16]}"
+    assert sorted(p.name for p in directory.iterdir()) == [
+        "candidate_vs_climatology.json",
+        "candidate_vs_noaa-gefs.json",
+        "verdict.json",
+    ]
+    verdict = json.loads((directory / "verdict.json").read_text())
+    assert verdict["verdict"] == "PROMOTED" and verdict["reasons"] == [] and verdict["period"] == PERIOD
+    assert verdict["candidate"] == {"model_id": "synth", "model_version": "1", "forecast_sha256": digest}
     against_climatology, against_gefs = good_cards(base_world)
     for card in (against_climatology, against_gefs):
         Scorecard.model_validate(card)
@@ -175,7 +202,7 @@ def test_command_line_verdicts(base_world: dict, locked: None, monkeypatch, caps
     assert "NOT PROMOTED" in out and "gate not passed against" in out
 
     # verify: the same good scorecards are only ever CONSISTENT
-    paths = [str(p) for p in sorted(base_world["out"].glob("*.json"))]
+    paths = [str(base_world["directory"] / name) for name in tool.STAGED_NAMES.values()]
     assert tool.main(["verify", *paths, "--period", PERIOD]) == 0
     out = capsys.readouterr().out
     assert "CONSISTENT" in out and "proves nothing about where the scorecards came from" in out
@@ -353,7 +380,7 @@ def test_stand_in_baseline_is_refused(base_world: dict) -> None:
 
 
 def test_no_reference_directory_can_be_passed_in(base_world: dict, capsys) -> None:
-    paths = [str(p) for p in sorted(base_world["out"].glob("*.json"))]
+    paths = [str(base_world["directory"] / name) for name in tool.STAGED_NAMES.values()]
     stand_in = str(base_world["root"] / "experiments")
     for argv in (
         ["verify", *paths, stand_in, "--period", PERIOD],  # the old third argument
@@ -402,11 +429,11 @@ def test_stand_in_reference_store_is_refused(base_world: dict, locked: None, tmp
     shutil.rmtree(store)
     write_zarr(weakened, store)
     with pytest.raises(tool.Refused, match="reference climatology .* is not the pinned forecast"):
-        tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, tmp_path / "out", root=root)
+        tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, tmp_path / "out", root)
     assert not (tmp_path / "out").exists()
     shutil.rmtree(store)
     with pytest.raises(tool.Refused, match="reference climatology: no such forecast store"):
-        tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, tmp_path / "out", root=root)
+        tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, tmp_path / "out", root)
 
 
 def test_tampered_inventory_or_reference_scorecard_is_refused(base_world: dict, tmp_path: Path) -> None:
@@ -457,7 +484,7 @@ def test_candidate_that_is_a_copy_of_a_reference_is_refused(
 ) -> None:
     root = base_world["root"]
     # the GEFS reference submitted as it is
-    reasons = tool.evaluate(root / "data/refs/gefs.zarr", root / "data", PERIOD, tmp_path / "a", root=root)
+    reasons = tool.evaluate(root / "data/refs/gefs.zarr", root / "data", PERIOD, tmp_path / "a", root).reasons
     assert any("is a reference baseline, not a candidate" in r for r in reasons)
     assert any("byte-for-byte a reference forecast (noaa-gefs" in r for r in reasons)
 
@@ -465,7 +492,7 @@ def test_candidate_that_is_a_copy_of_a_reference_is_refused(
     renamed = open_zarr(root / "data/refs/climatology.zarr").load()
     renamed.attrs.update(model_id="brand-new-model", model_version="9")
     write_zarr(renamed, tmp_path / "renamed.zarr")
-    reasons = tool.evaluate(tmp_path / "renamed.zarr", root / "data", PERIOD, tmp_path / "b", root=root)
+    reasons = tool.evaluate(tmp_path / "renamed.zarr", root / "data", PERIOD, tmp_path / "b", root).reasons
     assert any("byte-for-byte a reference forecast (climatology" in r for r in reasons)
     assert not any("is a reference baseline, not a candidate" in r for r in reasons)
 
@@ -482,37 +509,186 @@ def test_candidate_that_is_a_copy_of_a_reference_is_refused(
 
 
 def test_weaker_candidate_is_not_promoted_and_refused_inputs_stop_early(
-    base_world: dict, locked: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    base_world: dict, locked: None, tmp_path: Path
 ) -> None:
     root = base_world["root"]
-    reasons = tool.evaluate(
-        root / "data/candidates/weak.zarr", root / "data", PERIOD, tmp_path / "weak", root=root
+    outcome = tool.evaluate(
+        root / "data/candidates/weak.zarr", root / "data", PERIOD, tmp_path / "weak", root
     )
-    assert "gate not passed against climatology" in reasons and "gate not passed against noaa-gefs" in reasons
-    assert len(list((tmp_path / "weak").glob("*.json"))) == 2  # both evaluations ran and were kept
+    assert "gate not passed against climatology" in outcome.reasons
+    assert "gate not passed against noaa-gefs" in outcome.reasons
+    verdict = json.loads((outcome.directory / "verdict.json").read_text())
+    assert verdict["verdict"] == "NOT PROMOTED" and verdict["reasons"] == outcome.reasons
+    assert len(list(outcome.directory.glob("candidate_vs_*.json"))) == 2  # both evaluations ran and were kept
 
     good = root / "data/candidates/good.zarr"
     with pytest.raises(tool.Refused, match="has no pinned references"):
-        tool.evaluate(good, root / "data", "2024-04", tmp_path / "x", root=root)
+        tool.evaluate(good, root / "data", "2024-04", tmp_path / "x", root)
     with pytest.raises(tool.Refused, match="candidate: no such forecast store"):
-        tool.evaluate(root / "data/candidates/none.zarr", root / "data", PERIOD, tmp_path / "x", root=root)
+        tool.evaluate(root / "data/candidates/none.zarr", root / "data", PERIOD, tmp_path / "x", root)
     with pytest.raises(tool.Refused, match="truth not found under the data directory"):
-        tool.evaluate(good, tmp_path, PERIOD, tmp_path / "x", root=root)
+        tool.evaluate(good, tmp_path, PERIOD, tmp_path / "x", root)
+    assert not (tmp_path / "x").exists()  # a refusal leaves nothing behind
     # a candidate wrfcomp-eval itself refuses (a NaN at a scored point) is not promoted
     broken = open_zarr(good).load()
     broken["t2m"].values[3, 1, 2, 0] = np.nan
     write_zarr(broken, tmp_path / "broken.zarr")
-    reasons = tool.evaluate(tmp_path / "broken.zarr", root / "data", PERIOD, tmp_path / "y", root=root)
-    assert reasons == [
+    outcome = tool.evaluate(tmp_path / "broken.zarr", root / "data", PERIOD, tmp_path / "y", root)
+    assert outcome.reasons == [
         "wrfcomp-eval refused the candidate against climatology (exit code 3)",
         "wrfcomp-eval refused the candidate against noaa-gefs (exit code 3)",
     ]
+    assert outcome.directory.name.startswith(f"promotion_{PERIOD}_unscored-")
+    assert [p.name for p in outcome.directory.iterdir()] == ["verdict.json"]
 
-    # a checkout that is not the locked harness may not issue a verdict at all
-    monkeypatch.setattr(tool, "_harness_lock_problems", lambda: ["changed: src/wrfcomp/harness/metrics.py"])
+
+# --------------------------------------------------------------------------- one tree, private output
+
+
+def test_candidate_metadata_never_becomes_a_path(base_world: dict, locked: None, tmp_path: Path) -> None:
+    # Model ids written to climb out of the output directory or to collide with the program's own
+    # file names. They are recorded as data; none changes where anything is written.
+    root = base_world["root"]
+    out = tmp_path / "published"
+    hostile_ids = ("../../escaped", "/tmp/wrfcomp-escaped", "candidate_vs_climatology.json", "a/b\\c")
+    for index, model_id in enumerate(hostile_ids):
+        hostile = open_zarr(root / "data/candidates/good.zarr").load()
+        hostile.attrs["model_id"] = model_id
+        hostile["t2m"].values[0, 0, 0, 0] += np.float32(0.001 * (index + 1))  # a distinct forecast each time
+        write_zarr(hostile, tmp_path / f"hostile{index}.zarr")
+        outcome = tool.evaluate(tmp_path / f"hostile{index}.zarr", root / "data", PERIOD, out, root)
+        assert outcome.reasons == [], model_id
+        assert outcome.directory.parent == out.resolve()
+        assert sorted(p.name for p in outcome.directory.iterdir()) == [
+            "candidate_vs_climatology.json",
+            "candidate_vs_noaa-gefs.json",
+            "verdict.json",
+        ]
+        verdict = json.loads((outcome.directory / "verdict.json").read_text())
+        assert verdict["candidate"]["model_id"] == model_id  # kept, as data
+        card = json.loads((outcome.directory / "candidate_vs_climatology.json").read_text())
+        assert card["model_id"] == model_id
+    assert not (tmp_path / "escaped.json").exists() and not Path("/tmp/wrfcomp-escaped").exists()
+    everything = (p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*.json"))
+    written = sorted(path for path in everything if ".zarr/" not in path)  # not the stores' own metadata
+    assert len(written) == 12
+    assert all(path.startswith("published/promotion_") for path in written), written
+    assert len({p.name for p in out.iterdir()}) == 4 and not list(out.glob(".promotion-run-*"))
+
+
+def test_runs_are_staged_privately_and_published_whole(
+    base_world: dict, locked: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root, out = base_world["root"], tmp_path / "published"
+    good = root / "data/candidates/good.zarr"
+    seen: list[tuple[Path, int, list[str]]] = []
+
+    def watching_eval(eval_root: Path, args: list[str]) -> int:
+        target = Path(args[args.index("--out") + 1])
+        seen.append((target, target.parent.stat().st_mode & 0o777, sorted(p.name for p in out.iterdir())))
+        return in_process_eval(eval_root, args)
+
+    monkeypatch.setattr(tool, "_run_eval", watching_eval)
+    first = tool.evaluate(good, root / "data", PERIOD, out, root)
+    assert [target.name for target, _, _ in seen] == list(tool.STAGED_NAMES.values())
+    for target, mode, published in seen:
+        assert target.parent.name.startswith(".promotion-run-") and target.parent.parent == out.resolve()
+        assert mode == 0o700  # private while the run is in progress
+        assert published == [target.parent.name]  # nothing is published before the run is complete
+    assert [p.name for p in out.iterdir()] == [first.directory.name]  # staging is gone, one result
+
+    # the same candidate again: each run has its own staging directory, the identical result is kept
+    before = {p.name: p.read_bytes() for p in first.directory.iterdir()}
+    again = tool.evaluate(good, root / "data", PERIOD, out, root)
+    assert again.directory == first.directory
+    assert {p.name: p.read_bytes() for p in again.directory.iterdir()} == before
+    assert len({target.parent for target, _, _ in seen}) == 2
+    assert [p.name for p in out.iterdir()] == [first.directory.name]
+
+    # an evaluator that crashes half way leaves no staging directory and publishes nothing new
+    def crashing_eval(eval_root: Path, args: list[str]) -> int:
+        raise RuntimeError("evaluator crashed")
+
+    monkeypatch.setattr(tool, "_run_eval", crashing_eval)
+    with pytest.raises(RuntimeError, match="evaluator crashed"):
+        tool.evaluate(good, root / "data", PERIOD, out, root)
+    assert [p.name for p in out.iterdir()] == [first.directory.name]
+
+
+def test_every_input_must_come_from_the_one_checked_tree(
+    base_world: dict, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = base_world["root"]
+    good = root / "data/candidates/good.zarr"
+    monkeypatch.setattr(tool, "_run_eval", in_process_eval)
+
+    # 1. The synthetic world is not a locked checkout: with the real lock check it is refused.
+    with pytest.raises(tool.Refused, match="is not the locked harness"):
+        tool.evaluate(good, root / "data", PERIOD, tmp_path / "a", root)
+    monkeypatch.setattr(tool, "_harness_lock_problems", lambda r: ["changed: src/wrfcomp/harness/metrics.py"])
     with pytest.raises(tool.Refused, match="not the locked harness: changed: src/wrfcomp/harness/metrics.py"):
-        tool.evaluate(good, root / "data", PERIOD, tmp_path / "z", root=root)
-    assert not (tmp_path / "z").exists()
+        tool.evaluate(good, root / "data", PERIOD, tmp_path / "a", root)
+
+    # 2. A tree that passes its own lock, but is not where this process's harness was imported from:
+    #    the inventory and config would come from one place and the scoring code from another.
+    monkeypatch.setattr(tool, "_harness_lock_problems", lambda r: [])
+    with pytest.raises(tool.Refused, match="the harness in use is not the one under") as refusal:
+        tool.evaluate(good, root / "data", PERIOD, tmp_path / "a", root)
+    assert "wrfcomp is loaded from" in str(refusal.value)
+    assert not (tmp_path / "a").exists()
+
+
+def test_origin_and_lock_checks_look_at_the_given_root(base_world: dict, tmp_path: Path) -> None:
+    # this checkout's harness modules are files of this checkout
+    assert tool._modules_outside_root(ROOT) == []
+    outside = tool._modules_outside_root(base_world["root"])
+    assert len(outside) == len(tool.HARNESS_MODULES)
+    assert any(line.startswith("wrfcomp.harness.metrics is loaded from") for line in outside)
+    expected = {"wrfcomp", "wrfcomp.harness.metrics", "wrfcomp.harness.evaluate", "wrfcomp.harness.schemas"}
+    assert expected <= set(tool.HARNESS_MODULES)
+    # the lock check runs that root's own script on that root
+    assert tool._harness_lock_problems(ROOT) == []
+    assert tool._harness_lock_problems(tmp_path) == [f"{tmp_path} has no scripts/harness_lock.py"]
+
+
+def test_evaluations_run_through_uv_locked_on_the_checked_tree(tmp_path: Path) -> None:
+    command = tool._eval_command(ROOT, ["--help"])
+    assert Path(command[0]).name == "uv"
+    assert command[1:] == ["run", "--locked", "--project", str(ROOT), "wrfcomp-eval", "--help"]
+    # a real run of that command: a synthetic forecast scored by the locked environment of this tree
+    world = build_world(tmp_path / "repo")
+
+    def args_for(out: Path) -> list[str]:
+        args = ["--forecast", str(world / "data/candidates/good.zarr")]
+        args += [
+            "--truth",
+            str(world / "data/truth/truth.nc"),
+            "--thresholds",
+            str(world / "data/thresholds/tail.nc"),
+        ]
+        args += [
+            "--baseline",
+            str(world / "data/refs/gefs.zarr"),
+            "--baseline-id",
+            "noaa-gefs",
+            "--out",
+            str(out),
+        ]
+        args += [
+            "--model-id",
+            "synth",
+            "--model-version",
+            "1",
+            "--config",
+            str(world / "configs/splits.yaml"),
+        ]
+        return args
+
+    assert tool._run_eval(ROOT, args_for(tmp_path / "locked.json")) == 0
+    assert in_process_eval(ROOT, args_for(tmp_path / "in-process.json")) == 0
+    # the in-process stand-in used by the other tests writes the same bytes as the real command
+    assert (tmp_path / "locked.json").read_bytes() == (tmp_path / "in-process.json").read_bytes()
+    assert tool._run_eval(ROOT, ["--forecast", "nope.zarr"]) != 0
 
 
 # --------------------------------------------------------------------------- the real repository

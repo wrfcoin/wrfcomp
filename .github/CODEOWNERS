@@ -3,6 +3,7 @@
 # `harness-lock` and `test` checks.
 /src/wrfcomp/harness/                   @tonykoop
 /configs/                               @tonykoop
+/src/wrfcomp/__init__.py                @tonykoop
 /.github/                               @tonykoop
 /HARNESS_LOCK.json                      @tonykoop
 /scripts/harness_lock.py                @tonykoop

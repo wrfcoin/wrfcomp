@@ -13,10 +13,11 @@ from an easier test instead of a better forecast. Scores from different harness 
 
 ## What is locked
 
-| Locked | Hashed in `HARNESS_LOCK.json` | Needs the owner label to change |
+| Locked | Hashed in `HARNESS_LOCK.json` | Needs the owner's approval to change |
 | --- | --- | --- |
 | `src/wrfcomp/harness/` (scoring rules, truth loader, alignment, content hash, `wrfcomp-eval`) | yes | yes |
 | `configs/` (split boundaries, station list, gate thresholds) | yes | yes |
+| `src/wrfcomp/__init__.py` (the package initializer and its version) | yes | yes |
 | `docs/VERIFICATION_PROTOCOL.md`, `scripts/check_promotion.py` | yes | yes |
 | `experiments/REFERENCES.json` and the six Gate 1 scorecards (climatology, GEFS, persistence; 2024-01, 2024-07) | yes | yes |
 | Versions of `scores`, `numpy`, `xarray`, `scipy`, `pandas` in `uv.lock` | yes (as versions) | yes, through the manifest |
@@ -48,33 +49,47 @@ or the workflow can therefore make it say anything. That is why the second check
 Triggered by `pull_request_target`, so GitHub runs the workflow file of the **base** branch, not the pull
 request's. It checks out nothing. It fetches its gate script (`.github/harness_lock_gate.py`) from the same
 base commit through the API and reads the pull request through the API. Code from the pull request is never
-executed by this workflow, so a pull request cannot change its own gate.
+executed by this workflow, so a pull request cannot change its own gate. The workflow has no write permission
+and no shared concurrency group.
 
 The gate lists every changed path (paginated, including the previous name of a rename). If none is locked, it
-passes. If any is locked, it passes only when all of these hold:
+passes. If any is locked, it passes only if the owner's account (`tonykoop`) has posted a comment on the pull
+request whose **whole first line is exactly**
 
-1. the pull request carries the label `owner-approved-harness-change`;
-2. the latest `labeled` event for that label was made by the owner's account (`tonykoop`), not by a bot or
-   another account. A workflow inside the pull request that labels its own pull request does not count;
-3. that event is newer than the pull request's latest head change in the timeline (latest commit date, force
-   push, base change or reopen);
-4. the run was not started by a new push. A push withdraws approval: a second job removes the label, and the
-   gate fails that run outright. Every new commit needs a fresh label.
+```text
+APPROVE-HARNESS-CHANGE <full 40-character sha of the pull request's current head commit>
+```
 
-It fails closed: an API error, a file list GitHub cut off, or a head that moved during the run count as not
-approved.
+- The approval names the commit. After a new push the head is a different commit, so the old comment no longer
+  matches and a new one is needed. No dates and no label are involved.
+- The comment must come from the owner's account, be a normal user comment (not a bot's), and never have been
+  edited. Anything after the first line is free text.
+- The gate reads the pull request before and after it pages through the files and the comments. If the head or
+  the base moved in between, or the head is not the one the run was started for, it fails, whatever the file
+  list says. It prints the head and base it evaluated.
+- It fails closed: an API error or a file list GitHub cut off count as not approved.
+
+A comment does not start a new run of this check. After commenting, the owner re-runs the `harness-lock` job,
+or adds or removes any label on the pull request, which starts a run. The label
+`owner-approved-harness-change` may still be used as a marker for people; the gate does not look at it.
 
 ### 3. `scripts/check_promotion.py evaluate`: the candidate beat both references
 
 ```sh
-uv run python scripts/check_promotion.py evaluate \
+uv run --locked python scripts/check_promotion.py evaluate \
   --forecast <candidate.zarr> --data-dir "$WRFCOMP_DATA_DIR" --period 2024-01 --out <dir>
 ```
 
-It refuses to run unless check 1 passes for the checkout it runs in. It takes the two reference forecasts of
-the period from the places named in `experiments/REFERENCES.json` under the data directory, and refuses a
-store whose content hash is not the pinned one. It then runs `wrfcomp-eval` twice itself, with the locked
-config, and judges the two scorecards it has just produced:
+Everything the verdict rests on comes from one tree, the checkout the script is in:
+
+- that tree must pass check 1, and the harness modules the running Python has imported must be files of that
+  tree (a harness installed from somewhere else is refused);
+- the reference inventory and the config are read from that tree, and `wrfcomp-eval` is started with
+  `uv run --locked` on that tree, so the dependency versions are the ones in its `uv.lock`;
+- the two reference forecasts of the period are taken from the places named in `experiments/REFERENCES.json`
+  under the data directory, and a store whose content hash is not the pinned one is refused.
+
+It then runs `wrfcomp-eval` twice itself and judges the two scorecards it has just produced:
 
 - each validates as a harness scorecard, has all five primary variables, and its gates and `passed_gate` are
   what the harness computes from its own metrics;
@@ -88,18 +103,22 @@ config, and judges the two scorecards it has just produced:
 It prints `PROMOTED` only then, and only in this mode. Promotion is per period: run it for each pinned period
 (`2024-01` and `2024-07`). No reference directory, reference file or config can be passed in.
 
+The two scorecards and a `verdict.json` are written in a private directory created for the run and published
+at the end as `<out>/promotion_<period>_<first 16 hex digits of the forecast hash>/`. The file names are
+fixed by the program. The candidate's model id is recorded inside the files and is never part of a path.
+
 `check_promotion.py verify A.json B.json --period P` applies the same rules to two scorecards that already
 exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
 
 ## What is NOT enforced
 
 - **GitHub cannot tell the owner from an agent.** All agents in this project act through the owner's GitHub
-  account. To GitHub, a label applied by an agent and a label applied by the owner are the same event from
+  account. To GitHub, a comment posted by an agent and a comment posted by the owner are the same event from
   the same account. The `harness-lock` check proves that the owner's *account* approved the exact commit; it
   cannot prove that the owner did. The working rule is therefore a rule for agents, not a control: **only
-  the owner applies the label `owner-approved-harness-change`; agents never apply it, never ask a tool to
-  apply it, and never merge a pull request that carries it without the owner's explicit yes.** Separate
-  accounts for agents would turn this rule into a control.
+  the owner writes an `APPROVE-HARNESS-CHANGE` comment; agents never write one, never ask a tool to write
+  one, not even as a test, and never merge a pull request that has one without the owner's explicit yes.**
+  Separate accounts for agents would turn this rule into a control.
 - **Nothing is enforced until the repository rules exist.** As of this change, `main` is not protected.
   Both `harness-lock` and `test` must be **required status checks** on `main`, with pull requests required,
   no direct pushes and no bypass. The manager sets that rule after this change merges and verifies it through
@@ -107,9 +126,18 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
   before merging for the `test` result to describe what lands.
 - **The pull request that introduces or changes the gate is not judged by the new gate.** `harness-lock` runs
   the base branch's version. The first installation, and any later change to the gate, is reviewed by people.
-- **Commit dates are set by whoever makes the commit.** Condition 3 above can be defeated with a backdated
-  commit; condition 4 (the label is removed on every push) does not depend on dates and is the stronger of
-  the two.
+- **A comment does not re-run the check.** Until someone re-runs it, the check shows the result from before
+  the approval. That delays a merge; it cannot let one through.
+- **No isolated, artifact-pinned runtime.** `evaluate` checks that the harness modules it imports are files
+  of the locked tree and runs the evaluations with `uv run --locked`, which pins dependency *versions*. It
+  does not verify the installed packages byte for byte, and it does not run in a clean container built from
+  an approved release. A modified `numpy` with the right version number would not be noticed.
+- **Inputs are hashed before they are read for scoring.** `wrfcomp-eval` hashes the forecast, baseline,
+  truth and thresholds and then reads them again to score, and the two evaluations of a promotion open the
+  inputs separately. The hashes in a scorecard therefore prove what was scored only if the inputs did not
+  change during the run. Closing this needs a change to the locked harness and is not done here. A promotion
+  that matters is re-run by a second party from read-only inputs; the scorecards are deterministic, so the
+  bytes must match.
 - **`verify` proves nothing about origin.** A hand-made pair of scorecards with consistent numbers passes it.
   Only `evaluate` computes the numbers.
 - **`evaluate` on a private machine is as trustworthy as that machine.** It checks the harness code, config,
@@ -130,8 +158,8 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
    `python3 scripts/harness_lock.py update <new version>` and commit the new manifest. `update` reads the
    committed tree, so the change must be committed first.
 3. A reviewer from a different model provider reviews it.
-4. The owner applies the label to the final commit. Any later push removes it. Merge. Tag
-   `harness-v<new version>`.
+4. The owner comments `APPROVE-HARNESS-CHANGE <head sha>` on the final commit and re-runs the
+   `harness-lock` check. Any later push needs a new comment. Merge. Tag `harness-v<new version>`.
 5. Re-score every baseline under the new version, commit the new scorecards and a new
    `experiments/REFERENCES.json`. Old scorecards stay, marked with their version; they are not comparable
    with new ones.

@@ -5,37 +5,42 @@ branch, and the workflow fetches THIS file from that same base commit through th
 the pull request is checked out or executed: the change under review cannot alter its own gate.
 
 Rule
-    A pull request that changes, adds, removes or renames a locked path passes only if
-      1. it carries the label `owner-approved-harness-change`;
-      2. the latest `labeled` event for that label was made by an approver listed below;
-      3. that event is newer than the pull request's latest head change; and
-      4. the run was not started by a new push (a push withdraws approval: a second job removes the
-         label, and this gate fails that run outright).
+    A pull request that changes, adds, removes or renames a locked path passes only if an approver
+    listed below has posted a comment on the pull request whose whole first line is exactly
+
+        APPROVE-HARNESS-CHANGE <full 40-character sha of the pull request's current head commit>
+
+    and that comment has never been edited. The approval names the commit, so it needs no dates and
+    no label: after a new push the head is another commit and the old comment no longer matches.
     A pull request that touches no locked path passes.
 
-It fails closed: an API error, a file list GitHub truncated, or a head that moved during the run all
-count as "not approved".
+    The pull request is read twice, before and after the file list and the comments are paged
+    through. If its head or base moved in between, or the head is not the one the run was started
+    for, the run fails, whatever the file list says.
+
+It fails closed: an API error or a file list GitHub cut off count as "not approved".
 
 What this cannot do: tell the owner from an agent acting through the owner's GitHub account. See
-docs/HARNESS_LOCK.md. Standard library only.
+docs/HARNESS_LOCK.md. Standard library only. This workflow needs no write permission.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
 
-LABEL = "owner-approved-harness-change"
-APPROVERS = ("tonykoop",)  # GitHub logins whose label counts. Bots and other accounts do not.
+APPROVAL_WORD = "APPROVE-HARNESS-CHANGE"
+APPROVERS = ("tonykoop",)  # GitHub logins whose approval comment counts. Bots and other accounts do not.
 
 # The locked set: the hashed scope of scripts/harness_lock.py plus the lock machinery itself.
 LOCKED_PREFIXES = ("src/wrfcomp/harness/", "configs/", ".github/")
 LOCKED_FILES = (
     "HARNESS_LOCK.json",
+    "src/wrfcomp/__init__.py",
     "scripts/harness_lock.py",
     "tests/test_harness_lock.py",
     "scripts/check_promotion.py",
@@ -50,9 +55,8 @@ LOCKED_FILES = (
     "experiments/persistence_2024-01.json",
     "experiments/persistence_2024-07.json",
 )
-# Timeline events that mean "the code under review may have changed".
-HEAD_CHANGE_EVENTS = ("head_ref_force_pushed", "head_ref_restored", "base_ref_changed", "reopened")
 MAX_LISTED_FILES = 3000  # the pull request files API stops there
+SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def is_locked(path: str) -> bool:
@@ -70,70 +74,74 @@ def changed_paths(files: list[dict]) -> list[str]:
     return sorted(paths)
 
 
-def _time(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+def _sha(pull: dict, side: str) -> str | None:
+    value = (pull.get(side) or {}).get("sha")
+    return value if isinstance(value, str) and SHA.fullmatch(value) else None
 
 
-def latest_head_change(timeline: list[dict]) -> datetime | None:
-    """The newest time at which the head (or the base) of the pull request changed.
-
-    Commit times come from the commit itself, so the pusher sets them; force pushes and base
-    changes carry GitHub's own time. A commit without a readable time is a reason to fail closed.
-    """
-    latest: datetime | None = None
-    for event in timeline:
-        kind = event.get("event")
-        times: list[datetime | None] = []
-        if kind == "committed":
-            times = [_time((event.get(who) or {}).get("date")) for who in ("committer", "author")]
-            if None in times:
-                raise ValueError(f"commit {event.get('sha')} in the timeline has no readable date")
-        elif kind in HEAD_CHANGE_EVENTS:
-            times = [_time(event.get("created_at"))]
-            if None in times:
-                raise ValueError(f"timeline event {kind} has no readable time")
-        for value in times:
-            if value is not None and (latest is None or value > latest):
-                latest = value
-    return latest
+def approval_line(head_sha: str) -> str:
+    return f"{APPROVAL_WORD} {head_sha}"
 
 
-def latest_label_event(timeline: list[dict]) -> dict | None:
-    """The newest `labeled` event for the approval label, with its parsed time under "_time"."""
-    found: dict | None = None
-    for event in timeline:
-        if event.get("event") != "labeled" or (event.get("label") or {}).get("name") != LABEL:
+def approving_comment(comments: list[dict], head_sha: str) -> tuple[dict | None, list[str]]:
+    """The comment that approves `head_sha`, if any, and notes on comments that came close."""
+    wanted = approval_line(head_sha)
+    notes: list[str] = []
+    for comment in comments:
+        body = comment.get("body")
+        if not isinstance(body, str):
             continue
-        when = _time(event.get("created_at"))
-        if when is None:
-            raise ValueError("a labeled event in the timeline has no readable time")
-        if found is None or when >= found["_time"]:
-            found = {**event, "_time": when}
-    return found
+        first_line = body.split("\n", 1)[0].removesuffix("\r")
+        if not first_line.startswith(APPROVAL_WORD):
+            continue
+        user = comment.get("user") or {}
+        login, where = user.get("login"), comment.get("html_url") or f"comment {comment.get('id')}"
+        if first_line != wanted:
+            notes.append(f"{where}: first line is not exactly the approval of this head")
+        elif login not in APPROVERS or user.get("type") != "User":
+            notes.append(f"{where}: written by {login!r}, who is not an approver")
+        elif not comment.get("created_at") or comment.get("created_at") != comment.get("updated_at"):
+            notes.append(f"{where}: the comment was edited after it was posted")
+        else:
+            return comment, notes
+    return None, notes
 
 
 def decide(
     *,
-    pull: dict,
+    pull_before: dict,
+    pull_after: dict,
     files: list[dict],
-    timeline: list[dict],
-    action: str,
+    comments: list[dict],
     event_head_sha: str,
-    withdraw_result: str = "skipped",
 ) -> tuple[bool, list[str]]:
-    """Return (approved, lines to print). Pure: all GitHub data is passed in."""
+    """Return (passes, lines to print). Pure: all GitHub data is passed in.
+
+    `pull_before` is the pull request as read before the file list and the comments were fetched,
+    `pull_after` as read after. The decision is about one commit: the head both of them name.
+    """
     lines: list[str] = []
-    head_sha = (pull.get("head") or {}).get("sha")
-    declared = pull.get("changed_files")
+    head, base = _sha(pull_after, "head"), _sha(pull_after, "base")
+
+    def refuse(reason: str) -> tuple[bool, list[str]]:
+        lines.append(f"NOT APPROVED: {reason}")
+        return False, lines
+
+    # One snapshot: the same head and base before and after paging, and the head this run is for.
+    if head is None or base is None:
+        return refuse("the pull request has no readable head or base commit")
+    if _sha(pull_before, "head") != head or _sha(pull_before, "base") != base:
+        return refuse(
+            f"the pull request moved while it was being read (head {_sha(pull_before, 'head')} -> {head}, "
+            f"base {_sha(pull_before, 'base')} -> {base}); run the check again"
+        )
+    if event_head_sha != head:
+        return refuse(f"this run was started for head {event_head_sha}, the pull request is now at {head}")
+    lines.append(f"Evaluated head {head} on base {base}.")
+
+    declared = pull_after.get("changed_files")
     paths = changed_paths(files)
     locked = [p for p in paths if is_locked(p)]
-
     if not isinstance(declared, int) or declared != len(files) or declared >= MAX_LISTED_FILES:
         lines.append(
             f"GitHub reports {declared!r} changed files but listed {len(files)}; the list may be cut off. "
@@ -146,44 +154,19 @@ def decide(
 
     lines.append("Locked paths touched:")
     lines += [f"  {json.dumps(path)}" for path in locked]
-
-    def refuse(reason: str) -> tuple[bool, list[str]]:
-        lines.append(f"NOT APPROVED: {reason}")
+    comment, notes = approving_comment(comments, head)
+    lines += [f"  note: {note}" for note in notes]
+    if comment is None:
         lines.append(
-            f"A change to the locked harness needs the label {LABEL}, applied by the project owner "
-            "after the last push. See docs/HARNESS_LOCK.md."
+            "A change to the locked harness needs a comment on this pull request by the project owner "
+            "whose whole first line is exactly:"
         )
-        return False, lines
-
-    if withdraw_result not in ("success", "skipped"):
-        return refuse(f"the job that withdraws approval on a new push ended as {withdraw_result!r}")
-    if action == "synchronize":
-        return refuse("this run was started by a new push; every push needs a fresh owner label")
-    if not head_sha or head_sha != event_head_sha:
-        return refuse(f"the head moved during this run (event {event_head_sha}, now {head_sha})")
-    names = [(label or {}).get("name") for label in pull.get("labels") or []]
-    if LABEL not in names:
-        return refuse(f"the label {LABEL} is not on the pull request")
-    try:
-        label_event = latest_label_event(timeline)
-        head_change = latest_head_change(timeline)
-    except ValueError as exc:
-        return refuse(str(exc))
-    if label_event is None:
-        return refuse("the label is present but the timeline has no labeled event for it")
-    actor = (label_event.get("actor") or {}).get("login")
-    if actor not in APPROVERS:
-        return refuse(f"the label was applied by {actor!r}, who is not an approver ({', '.join(APPROVERS)})")
-    if head_change is None:
-        return refuse("the timeline shows no commit, so the approval cannot be tied to a head")
-    if label_event["_time"] <= head_change:
-        return refuse(
-            f"the label ({label_event['_time'].isoformat()}) is not newer than the latest head change "
-            f"({head_change.isoformat()})"
-        )
+        lines.append(f"    {approval_line(head)}")
+        lines.append("Then run this check again. A new push needs a new comment. See docs/HARNESS_LOCK.md.")
+        return refuse(f"no approval comment for head {head}")
     lines.append(
-        f"APPROVED: {LABEL} applied by {actor} at {label_event['_time'].isoformat()}, after the latest "
-        f"head change at {head_change.isoformat()}, for head {head_sha}."
+        f"APPROVED: {comment['user']['login']} approved head {head} in "
+        f"{comment.get('html_url') or 'comment ' + str(comment.get('id'))}."
     )
     return True, lines
 
@@ -225,28 +208,31 @@ def get_all(url: str, token: str) -> list[dict]:
     return out
 
 
+def _pull(base_url: str, number: int, token: str) -> dict:
+    pull, _ = _get(f"{base_url}/pulls/{number}", token)
+    if not isinstance(pull, dict):
+        raise ValueError("unexpected response for the pull request")
+    return pull
+
+
 def main() -> int:
     try:
         token = os.environ["GH_TOKEN"]
         repository = os.environ["GITHUB_REPOSITORY"]
         number = int(os.environ["PR_NUMBER"])
-        action = os.environ["EVENT_ACTION"]
         event_head_sha = os.environ["EVENT_HEAD_SHA"]
-        withdraw_result = os.environ.get("WITHDRAW_RESULT", "skipped")
         api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-        base = f"{api}/repos/{repository}"
-        pull, _ = _get(f"{base}/pulls/{number}", token)
-        if not isinstance(pull, dict):
-            raise ValueError("unexpected response for the pull request")
-        files = get_all(f"{base}/pulls/{number}/files?per_page=100", token)
-        timeline = get_all(f"{base}/issues/{number}/timeline?per_page=100", token)
-        approved, lines = decide(
-            pull=pull,
+        base_url = f"{api}/repos/{repository}"
+        pull_before = _pull(base_url, number, token)
+        files = get_all(f"{base_url}/pulls/{number}/files?per_page=100", token)
+        comments = get_all(f"{base_url}/issues/{number}/comments?per_page=100", token)
+        pull_after = _pull(base_url, number, token)  # read again: the snapshot must not have moved
+        passes, lines = decide(
+            pull_before=pull_before,
+            pull_after=pull_after,
             files=files,
-            timeline=timeline,
-            action=action,
+            comments=comments,
             event_head_sha=event_head_sha,
-            withdraw_result=withdraw_result,
         )
     except (KeyError, ValueError, OSError, urllib.error.URLError) as exc:
         # Fail closed: without the facts there is no approval.
@@ -254,7 +240,7 @@ def main() -> int:
         return 1
     for line in lines:
         print(line)
-    return 0 if approved else 1
+    return 0 if passes else 1
 
 
 if __name__ == "__main__":

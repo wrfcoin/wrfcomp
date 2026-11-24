@@ -37,6 +37,7 @@ REGULAR_FILE = "100644"
 # The hashed scope. Changing it is itself a locked change: `check` compares it with the manifest.
 LOCKED_DIRS = ("src/wrfcomp/harness", "configs")
 LOCKED_FILES = (
+    "src/wrfcomp/__init__.py",
     "docs/VERIFICATION_PROTOCOL.md",
     "scripts/check_promotion.py",
     "experiments/REFERENCES.json",

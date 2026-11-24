@@ -41,7 +41,11 @@
       "mode": "100644"
     },
     "scripts/check_promotion.py": {
-      "blob": "1640d590245b9313205dfdb28ed6a3eb626d53bd",
+      "blob": "0b80bb3effda34080f9c7e5e956d90f00a85b19f",
+      "mode": "100644"
+    },
+    "src/wrfcomp/__init__.py": {
+      "blob": "fc7284cbabde117804ee575e463db73d7fc452a7",
       "mode": "100644"
     },
     "src/wrfcomp/harness/__init__.py": {
@@ -85,6 +89,7 @@
       "configs"
     ],
     "files": [
+      "src/wrfcomp/__init__.py",
       "docs/VERIFICATION_PROTOCOL.md",
       "scripts/check_promotion.py",
       "experiments/REFERENCES.json",
