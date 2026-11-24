@@ -1,0 +1,273 @@
+{
+  "entries": {
+    "configs/splits.yaml": {
+      "blob": "2849076026621b8782900396a9c85e5a8dcfe4b4",
+      "mode": "100644"
+    },
+    "configs/stations_conus.csv": {
+      "blob": "8013fb285169f937ec4f207f6055021b10d6f4aa",
+      "mode": "100644"
+    },
+    "docs/VERIFICATION_PROTOCOL.md": {
+      "blob": "fb4228ad3663141918a8cfd19e14f74737a4da33",
+      "mode": "100644"
+    },
+    "experiments/REFERENCES.json": {
+      "blob": "b8c1770d9a7e33fd108fb3b52090770d11f27fff",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-01.json": {
+      "blob": "a2317c5e2b9e22bdb36837906b02ff1841ec6c8d",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-02.json": {
+      "blob": "32a05e664d0092b94b6c6c5329cd32e00a744275",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-03.json": {
+      "blob": "251152b26d782a7f3bbd18f2022ba1d0c161a240",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-04.json": {
+      "blob": "418642e9382efd29a85f4ed85925bc20dfd1965f",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-05.json": {
+      "blob": "20ec0ed3d97a4e56389ba599aba6b2cadd30522a",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-06.json": {
+      "blob": "2f726d62ff361bcbbe5b831cb87730f256333220",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-07.json": {
+      "blob": "a0c150fbd72769e7707c60c4c9105cdb734b3fcd",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-08.json": {
+      "blob": "d708ebb294760df0879918676139b453798ce9ce",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-09.json": {
+      "blob": "a10b7a0aa4888fc2b50f20ff92ad6d20741736e3",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-10.json": {
+      "blob": "dc2088bdbe4c623835ee61f7a335d0e52fd0ac40",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-11.json": {
+      "blob": "cc346dde50b07f85b2cccd360515cdccdd404e8a",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-12.json": {
+      "blob": "bf58dbca5c4e347b75a9a805de2b831f18c82196",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-01.json": {
+      "blob": "c0010e0826824b8f1c4f4bfbb7913d5b840c2d35",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-02.json": {
+      "blob": "2d5cf278138ed1bd0c6e30bc3cf9b61c0b96dd55",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-03.json": {
+      "blob": "49fa26907791a589c62ca8f6bde57309b8edc2db",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-04.json": {
+      "blob": "d477bf7570ec75311693e72a6fc5df78ee477f40",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-05.json": {
+      "blob": "d9b7d31d2bd2b75b83cfdda7e1785b52b4567ce7",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-06.json": {
+      "blob": "fcab93f03ab5eb2a36d7ce23ef207b35bdaeb27f",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-07.json": {
+      "blob": "9c4ca13de18473e9a5c31106985329e01c997328",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-08.json": {
+      "blob": "ef0619129ed913f3a5badfc7f08c28d78f21f9f1",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-09.json": {
+      "blob": "51d2fd81b3d488719041cceb066cdef896ec9371",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-10.json": {
+      "blob": "f4d1ec48761a9d6727cbef99b50c3bcc4ef05880",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-11.json": {
+      "blob": "0bb83cd32e382518c4312632f19fe1531e8933d8",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-12.json": {
+      "blob": "06cee83eb99ee085f3956c396416d92c71fa800b",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-01.json": {
+      "blob": "827ebd2de897aa96caa71b84975dc03cc5813813",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-02.json": {
+      "blob": "81880293d11ca83249268bf05dcc8af2a01624df",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-03.json": {
+      "blob": "8e71433dd4d7a3ba809d81ed02a483f9b2d8e504",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-04.json": {
+      "blob": "1f06042a4732377e51f834aee5101a1ca7dd6efc",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-05.json": {
+      "blob": "a0df3494e6b444a6e9cf1698bc8fb524aab88f03",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-06.json": {
+      "blob": "eddb3f896211eaccc574aef62fd31a21a7a3a855",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-07.json": {
+      "blob": "f17e00e65d8433a712a84bf1ecde51f7b97219cd",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-08.json": {
+      "blob": "6b935368dcf2412d6c2bd28882177f1a4520d841",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-09.json": {
+      "blob": "41523c5a2184aec7c0b65ca87a66a0c840740e05",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-10.json": {
+      "blob": "17674fc514fc045e11dda47c16fc4152a6bcf0a3",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-11.json": {
+      "blob": "233d31213dc7bf8571eb00e6160c6cefc2177c5e",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-12.json": {
+      "blob": "335903ce22dfc847412fce2f00922c8b6d7852e2",
+      "mode": "100644"
+    },
+    "scripts/check_promotion.py": {
+      "blob": "4b0ea64a233d1fcf312fa1efb9fa18862126aa9e",
+      "mode": "100644"
+    },
+    "src/wrfcomp/__init__.py": {
+      "blob": "fc7284cbabde117804ee575e463db73d7fc452a7",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/__init__.py": {
+      "blob": "96ab8290cfe8750f8f054ef4357d1862f50ab6a9",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/align.py": {
+      "blob": "6084d96e6ca04af399ed902d1a73a64bb8564bf0",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/config.py": {
+      "blob": "e97956226d2eccbb0626dd0570d9d5e4d2a9678d",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/evaluate.py": {
+      "blob": "b8a8133fa8cf711c9fbe5ab737b92a728e533cdd",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/hashing.py": {
+      "blob": "7a8a66804c2c1fc04d0adff9ac884753985d81f1",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/metrics.py": {
+      "blob": "9b05053dd65f8cb2452a4c03f49fa8884f1e5ce3",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/schemas.py": {
+      "blob": "d2eda298db100b0be60eb540cdc2c059b00d95a6",
+      "mode": "100644"
+    },
+    "src/wrfcomp/harness/truth.py": {
+      "blob": "6d07076f40d68b7ca2416015a792f70a307a93be",
+      "mode": "100644"
+    }
+  },
+  "harness_version": "0.1.0",
+  "manifest_version": 2,
+  "scope": {
+    "dirs": [
+      "src/wrfcomp/harness",
+      "configs"
+    ],
+    "files": [
+      "src/wrfcomp/__init__.py",
+      "docs/VERIFICATION_PROTOCOL.md",
+      "scripts/check_promotion.py",
+      "experiments/REFERENCES.json",
+      "experiments/climatology_2024-01.json",
+      "experiments/gefs_2024-01.json",
+      "experiments/persistence_2024-01.json",
+      "experiments/climatology_2024-02.json",
+      "experiments/gefs_2024-02.json",
+      "experiments/persistence_2024-02.json",
+      "experiments/climatology_2024-03.json",
+      "experiments/gefs_2024-03.json",
+      "experiments/persistence_2024-03.json",
+      "experiments/climatology_2024-04.json",
+      "experiments/gefs_2024-04.json",
+      "experiments/persistence_2024-04.json",
+      "experiments/climatology_2024-05.json",
+      "experiments/gefs_2024-05.json",
+      "experiments/persistence_2024-05.json",
+      "experiments/climatology_2024-06.json",
+      "experiments/gefs_2024-06.json",
+      "experiments/persistence_2024-06.json",
+      "experiments/climatology_2024-07.json",
+      "experiments/gefs_2024-07.json",
+      "experiments/persistence_2024-07.json",
+      "experiments/climatology_2024-08.json",
+      "experiments/gefs_2024-08.json",
+      "experiments/persistence_2024-08.json",
+      "experiments/climatology_2024-09.json",
+      "experiments/gefs_2024-09.json",
+      "experiments/persistence_2024-09.json",
+      "experiments/climatology_2024-10.json",
+      "experiments/gefs_2024-10.json",
+      "experiments/persistence_2024-10.json",
+      "experiments/climatology_2024-11.json",
+      "experiments/gefs_2024-11.json",
+      "experiments/persistence_2024-11.json",
+      "experiments/climatology_2024-12.json",
+      "experiments/gefs_2024-12.json",
+      "experiments/persistence_2024-12.json"
+    ]
+  },
+  "scoring_dependencies": {
+    "numpy": [
+      "2.4.6",
+      "2.5.5"
+    ],
+    "pandas": [
+      "3.1.1"
+    ],
+    "scipy": [
+      "1.17.1",
+      "1.18.1"
+    ],
+    "scores": [
+      "2.7.0"
+    ],
+    "xarray": [
+      "2026.9.0"
+    ]
+  }
+}
