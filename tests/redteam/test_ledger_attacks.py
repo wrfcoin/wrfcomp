@@ -291,7 +291,7 @@ def test_selective_non_reveal_penalized_on_mild_loss_epoch() -> None:
     rev_gambler = _by_id(revealed)["gambler"]
     fault_gambler = _by_id(withheld)["gambler"]
     assert 0.0 < rev_gambler.slash < fault_gambler.slash
-    assert fault_gambler.slash == pytest.approx(5.0, abs=1e-12)
+    assert fault_gambler.slash == pytest.approx(DEFAULT_PARAMS.max_slash_cap * fault_gambler.stake, abs=1e-12)
 
 
 @pytest.mark.xfail(
