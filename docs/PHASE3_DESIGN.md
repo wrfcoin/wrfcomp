@@ -32,7 +32,8 @@ How it is carried out, fixed here: the issue times are 00Z and 12Z. A citizen re
 by the first issue time at or after its measurement is not used at all: not for that issue, not for a later
 one, and not in any QC state, its own station's or a neighbour's. A report with no arrival time is treated
 the same way. Every other report is used exactly as registered. This removes a report only when it is
-measured in the last minutes before an issue time and arrives after it (roughly 1 % of all reports), and it
+measured in the last minutes before an issue time and arrives after it (1.8 % of the reports of
+2024-01-01), and it
 guarantees with one QC pass that nothing behind a weight or a value at T arrived after T.
 
 **Official readings keep the v3 rule** (measurement time at or before T), in A, B and C alike, so the
