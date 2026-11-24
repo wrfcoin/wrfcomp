@@ -99,3 +99,13 @@ class QCConfig:
     guard_decay: float = 0.9
     official_prior: float = 1
     new_prior: float = 0.5
+    calm_wind_ms: float = 0.5
+    wind_flat_minutes: int = 75
+    official_buddy_weight: int = 2
+    verified_days: int = 7
+    verified_reports_per_day: int = 6
+    verified_reports: int = 84
+    verified_bias_sigma: float = 1.0
+    verified_prior: float = 1.0
+    wind_bin_ms: float = 0.5
+    official_bias_radius_km: float = 150.0

@@ -88,3 +88,64 @@ The 0.5 citizen prior makes the 0.8 error comparison unreachable even for a perf
 Fourteen summer days in two regions cannot establish general false-positive rates, long-term reliability, fraud, sensor siting or absolute citizen accuracy. Local weather, elevation mismatch, instrument precision and GEFS timing can all contribute to an innovation. The trial has no collocated independent truth for the citizen sites.
 
 Reproduce from the repository with `uv run python scripts/run_qc_trial.py --region Amarillo` and `uv run python scripts/run_qc_trial.py --region Seattle`. The commands emit aggregate JSON.
+
+## V2 replay on the same July sample
+
+The replay covered the same 20 Amarillo and 324 Seattle stations, 663,160 station-time reports and 4,961,551 variable observations. It used the same official observations, GEFS runs, uncertainty assumptions and time-matching rules as v1, adding two days of official thermal history for the background correction. All rates below measure changes in QC decisions. The trial has no independent labels for faulty sensors.
+
+### Spatial coverage
+
+| Region | Reports | V1 decisions | V2 reports with a decision | V2 temperature coverage | V2 reports with outliers / decided |
+|---|---|---|---|---|---|
+| Amarillo | 41,869 | 0 | 17,903 (42.76%) | 17,826 (44.12%) | 5,423 (30.29%) |
+| Seattle | 621,291 | 0 | 582,768 (93.80%) | 569,480 (93.38%) | 71,645 (12.29%) |
+
+A report has a spatial decision when any variable has three distinct eligible neighbours within 25 km, including at least one official or a citizen in another rounded cell. Different variables in one report can have different coverage. Each neighbour contributes its latest measurement at or before the target, at most 15 minutes old. A failed recent citizen report supersedes any older good report. Citizen buddies pass static and temporal screening and the official-reference copycat screen. Self-matches are excluded. Official observations have twice the weight of citizens in the median and MAD. The storm override also needs an agreeing independent buddy. Tests cover a same-cell cluster, a disagreeing outsider, a genuine cross-cell group, an official buddy and changes in report order.
+
+Station pressure is compared only with citizen station pressure adjusted to the target elevation. Gust and precipitation also use citizen spatial data. The trial uses MAD scale-floor inputs of 200 Pa for pressure, 1 mm for precipitation and 2 K or 2 m/s for the other variables. Pressure, gust and precipitation still have no GEFS trial weights.
+
+### Wind flatlines
+
+Each percentage uses the full number of observations for that variable and region. Calm means absolute wind at or below 0.5 m/s. For other repeats, v2 requires a continuous 75-minute plateau and checks for a nearby official value consistent with the reporting bin. The original nonzero frozen-anemometer regression still passes.
+
+| Region | Variable | Observations | V1 flatline | V2 flatline |
+|---|---|---|---|---|
+| Amarillo | wind_speed | 40,402 | 7,116 (17.61%) | 110 (0.27%) |
+| Amarillo | wind_gust | 38,884 | 3,340 (8.59%) | 695 (1.79%) |
+| Amarillo | u10 | 38,928 | 7,883 (20.25%) | 0 (0.00%) |
+| Amarillo | v10 | 38,928 | 6,168 (15.84%) | 2 (0.01%) |
+| Seattle | wind_speed | 613,902 | 219,083 (35.69%) | 2,839 (0.46%) |
+| Seattle | wind_gust | 602,152 | 126,190 (20.96%) | 2,170 (0.36%) |
+| Seattle | u10 | 575,524 | 183,331 (31.85%) | 0 (0.00%) |
+| Seattle | v10 | 575,524 | 179,591 (31.20%) | 6 (0.00%) |
+
+### Corrected daytime temperature bias
+
+The screen still requires at least 12 accepted daytime and 12 nighttime reports and a day-minus-night EMA above 1 K at least once. V2 subtracts the nearest official site's expanding mean observation-minus-GEFS innovation for the same UTC measurement hour, using only earlier official measurement times within the 150 km radius. A report at the exact target timestamp cannot supply its own correction.
+
+| Region | Stations | V1 screen | V2 screen | Temperature reports with past official correction |
+|---|---|---|---|---|
+| Amarillo | 20 | 18 | 18 | 40,402 (100.00%) |
+| Seattle | 324 | 225 | 228 | 609,548 (99.95%) |
+
+The corrected screen remained common in Amarillo and became slightly more common in Seattle. The replay gives no evidence that subtracting regional model bias alone identifies unshielded instruments. A single official site, UTC-hour sampling, local exposure and elevation can all affect the residual. Other QC decisions also changed between versions.
+
+### Verified temperature tier and paired errors
+
+Seven completed UTC days of independent temperature checks can raise the temperature prior from 0.5 to 1. Each day needs six distinct official measurements, at least 84 across the week, stable daily signed bias, and no disqualifying correlation or copycat evidence. The complete rule is in `docs/ASSIMILATION_SPEC.md`. Eligibility is determined from past history and can be revoked. End-of-trial counts use the last temperature report on July 21, with a final check for station-wide copycat evidence.
+
+For stations qualified at the end, RMSE uses only report times when the credential was active and both official comparators had a measurement available. Both RMSE columns use exactly the same timestamps and count. They compare raw temperatures in K. V1 had no earned tier.
+
+| Region | Ever qualified | Qualified at end / all stations | Matched reports | Citizen–official RMSE | Official–official RMSE | V2 max final weight |
+|---|---|---|---|---|---|---|
+| Amarillo | 2 | 2/20 | 391 | 1.08 K | 2.79 K | 0.686 |
+| Seattle | 68 | 55/324 | 12,243 | 1.92 K | 4.07 K | 0.729 |
+
+No individual final weight exceeded 0.8 in either region. A prior of 1 makes that weight possible, but the other factors in the weight still apply. The eligibility screen selects for agreement with the nearest official station. The official-to-official pair can have a different separation or terrain. Lower error in the selected citizen cohort therefore cannot establish higher instrument accuracy.
+
+### Remaining limits and options
+
+- A different rounded cell is a minimum independence check. It cannot establish independent ownership or exposure. Position rounding still allows roughly 8 km of distance uncertainty at the 25 km cutoff. The official-only three-buddy coverage remains zero in both regions.
+- The calm exemption removes the original zero-wind false-alarm mechanism, but also removes flatline evidence for instruments genuinely stuck at zero. A future labeled trial could test requiring nearby sustained non-calm wind to flag that case. V1 found 6,437 zero-speed flatlines in Amarillo and 207,095 in Seattle.
+- At roughly ten-minute cadence the 0.9 low-correlation decay compounds quickly. The overall median final weight moved from 0.214 to 0.226 in Amarillo and 0.235 to 0.054 in Seattle. Compare elapsed-time decay with report-count decay on independent periods before adjusting it.
+- The same 14 summer days motivated and evaluated these changes. The absence of copycat hits or indoor-like hits in the independent temperature-range screen does not establish sensitivity. Verify the solar threshold, reporting-bin assumption and tier transitions on other seasons, regions and independently inspected sites before using them for rewards.

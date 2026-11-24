@@ -15,14 +15,16 @@ from wrfcomp.assimilation.citizen_obs import load_citizen_batch
 from wrfcomp.assimilation.qc import (
     Flag,
     background_gate,
+    cells,
     distances_km,
+    official_hour_bias,
     solar_elevation,
-    spatial_gate,
+    spatial_series,
     static_gate,
     temporal_gate,
 )
 from wrfcomp.assimilation.tokens import QCConfig
-from wrfcomp.assimilation.trust import StationState, update_state
+from wrfcomp.assimilation.trust import StationState, advance_state, veto_recent_copy
 
 START = np.datetime64("2024-07-08", "ns")
 STOP = np.datetime64("2024-07-22", "ns")
@@ -124,7 +126,7 @@ def station_points(batch):
     variables = pd.Categorical(batch.variable)
     frame = pd.DataFrame(dict(station=codes, time=batch.obs_time, variable=variables, value=batch.values))
     geo = pd.DataFrame(dict(station=codes, lat=batch.lat, lon=batch.lon, height=batch.elevation_m))
-    geo = geo.drop_duplicates().sort_values("station")
+    geo = geo.drop_duplicates().set_index("station").sort_index()
     if len(geo) != len(ids):
         raise ValueError("station position changed within trial")
     return frame, geo
@@ -146,7 +148,106 @@ def indoor_screen(when, values, measured, reference):
     return bool(eligible.any()), bool((eligible & (ranges.citizen <= 1)).any())
 
 
-def aggregate_station(wide, position, official, forecasts, series, totals, modes, samples, station):
+def trailing_correlation(times, values, comparison):
+    """Vectorized equivalent of trust.correlation on the trailing paired observations."""
+    index = pd.DatetimeIndex(times)
+    x = pd.Series(np.where(np.isfinite(comparison), values, np.nan), index=index)
+    y = pd.Series(comparison, index=index)
+    window = f"{CFG.window_days}D"
+    xx = x.rolling(window, min_periods=CFG.min_pairs)
+    yy = y.rolling(window, min_periods=CFG.min_pairs)
+    corr = xx.corr(y).where(yy.max() > yy.min())
+    corr = corr.mask((xx.max() == xx.min()) & (yy.max() > yy.min()), 0.0)
+    rms = ((x - y) ** 2).rolling(window, min_periods=CFG.min_pairs).mean().pow(0.5)
+    return corr.to_numpy(), rms.to_numpy()
+
+
+def citizen_sources(wides, geo, official, forecasts, series):
+    """Prepare each neighbour's own time-ordered series. Failed reports supersede stale good ones."""
+    out = {}
+    fault_times = defaultdict(list)
+    issued, valid, means = forecasts
+    for station, wide in wides.items():
+        lat, lon, height = geo.loc[station, ["lat", "lon", "height"]]
+        distances = distances_km(lat, lon, official.latitude.values, official.longitude.values)
+        nearest = int(np.argmin(distances))
+        times = wide.index.values.astype("datetime64[ns]")
+        choice = forecast_indices(issued, valid, times)
+        sun = np.array([solar_elevation(t, lat, lon) > CFG.day_degrees for t in times])
+        peers = wide.to_dict("records")
+        for var in wide:
+            rows = np.flatnonzero(np.isfinite(wide[var].values))
+            when = times[rows]
+            values = wide[var].values[rows].astype(float)
+            z = np.full(len(rows), np.nan)
+            reference = z.copy()
+            copycat = np.zeros(len(rows), bool)
+            if var in SUPPORTED:
+                reference, _ = align(series[var][nearest], when)
+                r, rms = trailing_correlation(when, values, reference)
+                copycat = (r > CFG.copy_correlation) & (rms <= SIGMA * CFG.copy_residual_sigma)
+                if copycat.any():
+                    fault_times[station].extend(when[copycat].astype(np.int64).tolist())
+                bg = np.where(choice[rows] >= 0, means[var][choice[rows], nearest], np.nan)
+                if var in ("t2m", "td2m"):
+                    measured, _, official_z = series[var][nearest]
+                    correction = official_hour_bias(measured, official_z * SIGMA, when)
+                    if distances[nearest] > CFG.official_bias_radius_km:
+                        correction[:] = np.nan
+                    bg += (
+                        correction
+                        + CFG.lapse_k_per_km * (official.elevation_m.values[nearest] - height) / 1000
+                    )
+                z = (values - bg) / SIGMA
+            biases = [0.0, 0.0]
+            eligible = ~copycat
+            state = StationState()
+            for k, row in enumerate(rows):
+                ns = int(when[k].astype(np.int64))
+                v = float(values[k])
+                flag = static_gate(var, v, height, peers[row], CFG)
+                flag |= temporal_gate(
+                    var,
+                    v,
+                    ns,
+                    state,
+                    CFG,
+                    reference=reference[k] if distances[nearest] <= CFG.radius_km else np.nan,
+                )
+                if flag:
+                    eligible[k] = False
+                if np.isfinite(z[k]):
+                    regime = int(sun[row])
+                    z[k] -= biases[regime] / SIGMA
+                    if eligible[k] and abs(z[k]) <= CFG.gross_cut:
+                        biases[regime] += CFG.ema_alpha * z[k] * SIGMA
+                record_recent(state, ns, v)
+            out[station, var] = (when, np.where(eligible, values, np.nan), np.where(eligible, z, np.nan))
+    return out, {site: np.unique(stamps) for site, stamps in fault_times.items()}
+
+
+def record_recent(state, ns, value):
+    if not state.recent or state.recent[-1] != value or (ns - state.last_ns) / 60e9 > CFG.step_minutes:
+        state.constant_since_ns = ns
+    state.recent = (state.recent + [value])[-CFG.flat_reports :]
+    state.last_ns = ns
+
+
+def aggregate_station(
+    wide,
+    position,
+    official,
+    forecasts,
+    series,
+    totals,
+    modes,
+    samples,
+    station,
+    *,
+    geo=None,
+    sources=None,
+    copy_times=(),
+):
     times = wide.index.values.astype("datetime64[ns]")
     lat, lon, height = position
     dist = distances_km(lat, lon, official.latitude.values, official.longitude.values)
@@ -164,9 +265,21 @@ def aggregate_station(wide, position, official, forecasts, series, totals, modes
     fi = forecast_indices(issued, valid, times)
     sun = np.array([solar_elevation(t, lat, lon) > CFG.day_degrees for t in times])
     peers = wide.to_dict("records")
+    copy_times = np.asarray(copy_times, dtype=np.int64)
+    last_copy = np.searchsorted(copy_times, times.astype(np.int64), side="right") - 1
     report_flags = np.zeros(len(times), dtype=int)
     reports = totals["reports"]
     reports["total"] += len(times)
+    citizen_near = []
+    external = np.ones(len(buddies), dtype=bool)
+    if geo is not None:
+        distances = distances_km(lat, lon, geo.lat.values, geo.lon.values)
+        citizen_near = geo.index[(distances <= CFG.radius_km) & (geo.index != station)].tolist()
+        external = np.r_[
+            external, cells(geo.loc[citizen_near].lat, geo.loc[citizen_near].lon) != cells(lat, lon)
+        ]
+    is_official = np.arange(len(external)) < len(buddies)
+    any_spatial = np.zeros(len(times), bool)
     for var in wide:
         rows = np.flatnonzero(np.isfinite(wide[var].values))
         values = wide[var].values[rows]
@@ -174,9 +287,24 @@ def aggregate_station(wide, position, official, forecasts, series, totals, modes
         counts = totals[var]
         counts["total"] += len(rows)
         state = StationState()
+        end_errors = Counter()
         day_count = night_count = 0
         flags = np.zeros(len(rows), dtype=int)
         weights = []
+        thermal = var in ("t2m", "td2m")
+        adjusted = np.full((len(when), len(external)), np.nan)
+        votes = adjusted.copy()
+        reference = np.full(len(when), np.nan)
+        for col, source in enumerate(citizen_near, start=len(buddies)):
+            stream = sources.get((source, var))
+            if stream is None:
+                continue
+            adjusted[:, col], votes[:, col] = align(stream, when)
+            dh = geo.loc[source, "height"] - height
+            if thermal:
+                adjusted[:, col] += CFG.lapse_k_per_km * dh / 1000
+            if var == "station_pressure":
+                adjusted[:, col] *= np.exp(dh / CFG.scale_height_m)
         if var in SUPPORTED:
             if var == "t2m" and dist[nearest] <= CFG.radius_km:
                 eligible, indoor = indoor_screen(when, values, *series[var][nearest][:2])
@@ -194,9 +322,6 @@ def aggregate_station(wide, position, official, forecasts, series, totals, modes
             both = np.isfinite(reference)
             counts["reference_pairs"] += int(both.sum())
             counts["reference_sq"] += float(np.sum((values[both] - reference[both]) ** 2))
-            adjusted = np.full((len(when), len(buddies)), np.nan)
-            votes = adjusted.copy()
-            thermal = var in ("t2m", "td2m")
             for col, buddy in enumerate(buddies):
                 adjusted[:, col], votes[:, col] = align(series[var][buddy], when)
                 if thermal:
@@ -206,32 +331,59 @@ def aggregate_station(wide, position, official, forecasts, series, totals, modes
             background = np.where(fi[rows] >= 0, means[var][fi[rows], nearest], np.nan)
             if thermal:
                 background += CFG.lapse_k_per_km * (official.elevation_m.values[nearest] - height) / 1000
+                measured, _, official_z = series[var][nearest]
+                correction = official_hour_bias(measured, official_z * SIGMA, when)
+                if dist[nearest] > CFG.official_bias_radius_km:
+                    correction[:] = np.nan
+                counts["corrected"] += int(np.isfinite(correction).sum())
+                background += correction
+            measured = series[var][nearest][0]
+            rix = latest_indices(measured, when)
+            ref_times = np.full(len(when), -1, dtype=np.int64)
+            ref_times[rix >= 0] = measured[rix[rix >= 0]].astype(np.int64)
+            ref_r, ref_rmse = trailing_correlation(when, values, reference)
+        spatial_sigma = {"precip": 1.0, "station_pressure": 200.0}.get(var, SIGMA)
+        spatial_flags, medians = spatial_series(values, adjusted, is_official, external, spatial_sigma, CFG)
+        decided = spatial_flags != int(Flag.FEW_BUDDIES)
+        counts["spatial_applied"] += int(decided.sum())
+        any_spatial[rows] |= decided
+        buddy_r, _ = trailing_correlation(when, values, medians)
         for j, row in enumerate(rows):
             value = float(values[j])
             ns = int(times[row].astype(np.int64))
             flag = static_gate(var, value, height, peers[row], CFG)
-            flag |= temporal_gate(var, value, ns, state, CFG)
+            flag |= temporal_gate(
+                var,
+                value,
+                ns,
+                state,
+                CFG,
+                reference=reference[j] if dist[nearest] <= CFG.radius_km else np.nan,
+            )
+            flag |= Flag(int(spatial_flags[j]))
             if var in SUPPORTED:
-                neighbours = adjusted[j]
-                spatial, median = spatial_gate(value, neighbours[np.isfinite(neighbours)], SIGMA, CFG)
-                flag |= spatial
-                if spatial != Flag.FEW_BUDDIES:
-                    counts["spatial_applied"] += 1
+                median = medians[j]
                 innovation = value - background[j]
                 day = bool(sun[row])
                 bias = state.bias_day if day else state.bias_night
                 if np.isfinite(innovation):
-                    bg_flag, huber = background_gate((innovation - (bias or 0)) / SIGMA, votes[j], CFG)
+                    bg_flag, huber = background_gate(
+                        (innovation - (bias or 0)) / SIGMA, votes[j], CFG, independent=external
+                    )
                     flag |= bg_flag
                     counts["background_applied"] += 1
                 else:
                     huber = 0
                 hard = bool(flag & (Flag.STATIC | Flag.TEMPORAL))
-                state = update_state(
+                state = advance_state(
                     state,
                     time_ns=ns,
                     value=value,
-                    buddy=median,
+                    buddy_r=buddy_r[j],
+                    ref_r=ref_r[j] if np.isfinite(ref_r[j]) else None,
+                    ref_rmse=ref_rmse[j],
+                    verify_temperature=var == "t2m" and dist[nearest] <= CFG.radius_km,
+                    reference_time_ns=int(ref_times[j]) if ref_times[j] >= 0 else None,
                     reference=reference[j],
                     innovation=innovation,
                     day=day,
@@ -242,6 +394,17 @@ def aggregate_station(wide, position, official, forecasts, series, totals, modes
                     hard_fail=hard,
                     cfg=CFG,
                 )
+                if last_copy[row] >= 0:
+                    state = veto_recent_copy(state, ns, int(copy_times[last_copy[row]]), CFG)
+                if state.earned:
+                    modes["ever_earned"].add(station)
+                    if var == "t2m" and np.isfinite(reference[j]) and np.isfinite(comparison[j]):
+                        end_errors["end_pairs"] += 1
+                        end_errors["end_sq"] += (value - reference[j]) ** 2
+                        end_errors["end_official_sq"] += (reference[j] - comparison[j]) ** 2
+                        counts["earned_pairs"] += 1
+                        counts["earned_sq"] += (value - reference[j]) ** 2
+                        counts["earned_official_sq"] += (reference[j] - comparison[j]) ** 2
                 if state.copycat:
                     flag |= Flag.COPYCAT
                     modes["copycat"].add(station)
@@ -261,19 +424,24 @@ def aggregate_station(wide, position, official, forecasts, series, totals, modes
                         modes["low_temperature_correlation"].add(station)
             else:
                 # No comparable official/GEFS field. Maintain the true temporal history only.
-                state.recent = (state.recent + [value])[-CFG.flat_reports :]
-                state.last_ns = ns
+                record_recent(state, ns, value)
             if flag & Flag.FLATLINE:
                 modes["flatline"].add(station)
                 if var == "wind_speed":
                     modes["wind_speed_flatline"].add(station)
                     counts["calm_flatline"] += int(value == 0)
             flags[j] = int(flag)
+        if len(copy_times):
+            state = veto_recent_copy(state, int(STOP.astype(np.int64)), int(copy_times[-1]), CFG)
+        if var == "t2m" and state.earned and when[-1] >= STOP - 24 * HOUR:
+            modes["end_earned"].add(station)
+            counts.update(end_errors)
         report_flags[rows] |= flags
         for bit in Flag:
             counts[bit.name] += int(np.count_nonzero(flags & bit))
         if weights:
             samples[var].append(np.array(weights))
+    reports["spatial_applied"] += int(any_spatial.sum())
     for bit in Flag:
         reports[bit.name] += int(np.count_nonzero(report_flags & bit))
 
@@ -302,6 +470,8 @@ def trial_region(path, official, forecasts, series):
     modes = {
         name: set()
         for name in (
+            "ever_earned",
+            "end_earned",
             "indoor_screen",
             "indoor_evaluable",
             "daytime_bias",
@@ -312,11 +482,28 @@ def trial_region(path, official, forecasts, series):
         )
     }
     samples = defaultdict(list)
+    wides = {}
     for station, group in frame.groupby("station", sort=True):
         wide = group.pivot(index="time", columns="variable", values="value").sort_index()
         wide = wide.dropna(axis=1, how="all")
+        wides[station] = wide
+    sources, faults = citizen_sources(wides, geo, official, forecasts, series)
+    for station, wide in wides.items():
         position = geo.iloc[station][["lat", "lon", "height"]].to_numpy()
-        aggregate_station(wide, position, official, forecasts, series, totals, modes, samples, station)
+        aggregate_station(
+            wide,
+            position,
+            official,
+            forecasts,
+            series,
+            totals,
+            modes,
+            samples,
+            station,
+            geo=geo,
+            sources=sources,
+            copy_times=faults.get(station, ()),
+        )
 
     def distribution(parts):
         w = np.concatenate(parts)
@@ -346,7 +533,7 @@ def main():
     root = args.data_dir
     path = root / "citizen" / f"{REGIONS[args.region]}_20240708_20240721.nc"
     with xr.open_dataset(root / "truth/isd_conus_2024.nc") as ds:
-        official = ds.sel(valid_time=slice(START - HOUR, STOP)).load()
+        official = ds.sel(valid_time=slice(START - 48 * HOUR, STOP)).load()
     forecasts = forecast_archive(root, official.station_id.values)
     print(
         json.dumps(

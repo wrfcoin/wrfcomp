@@ -6,7 +6,7 @@ from enum import IntFlag
 import numpy as np
 
 from .tokens import ObservationBatch, QCConfig
-from .trust import StationState, update_state
+from .trust import StationState, update_state, veto_recent_copy
 
 
 class Flag(IntFlag):
@@ -36,7 +36,7 @@ def static_gate(var, value, elevation, peers, cfg):
     return Flag.STATIC if bad else Flag(0)
 
 
-def temporal_gate(var, value, time_ns, state, cfg):
+def temporal_gate(var, value, time_ns, state, cfg, *, reference=np.nan):
     if not state.recent:
         return Flag(0)
     minutes = (time_ns - state.last_ns) / 60e9
@@ -46,30 +46,87 @@ def temporal_gate(var, value, time_ns, state, cfg):
     spike = minutes <= cfg.step_minutes and abs(value - state.recent[-1]) > limit
     window = (state.recent + [value])[-cfg.flat_reports :]
     flat = len(window) == cfg.flat_reports and min(window) == max(window)
+    if flat and var in ("wind_speed", "wind_gust", "u10", "v10"):
+        start = state.constant_since_ns
+        flat = (
+            abs(value) > cfg.calm_wind_ms
+            and minutes <= cfg.step_minutes
+            and start is not None
+            and (time_ns - start) / 60e9 >= cfg.wind_flat_minutes
+            and not abs(value - reference) <= cfg.wind_bin_ms / 2
+        )
     if flat and not (var == "precip" and value == 0):
         return Flag.TEMPORAL | Flag.FLATLINE
     return Flag.TEMPORAL if spike else Flag(0)
 
 
-def spatial_gate(value, adjusted_buddies, sigma_total, cfg):
-    if len(adjusted_buddies) < cfg.minimum_buddies:
-        return Flag.FEW_BUDDIES, np.nan
-    median = float(np.median(adjusted_buddies))
-    mad = np.median(abs(adjusted_buddies - median))
-    scale = max(cfg.mad_scale * mad, cfg.scale_floor_fraction * sigma_total)
-    return (Flag.SPATIAL if abs(value - median) > cfg.spatial_z * scale else Flag(0)), median
+def spatial_gate(value, adjusted_buddies, sigma_total, cfg, *, official=None, independent=None):
+    """One entry per distinct non-self station. Independence is relative to the target cell."""
+    n = len(adjusted_buddies)
+    flags, medians = spatial_series(
+        np.array([value]),
+        np.asarray(adjusted_buddies)[None, :],
+        np.zeros(n, bool) if official is None else official,
+        np.ones(n, bool) if independent is None else independent,
+        sigma_total,
+        cfg,
+    )
+    return Flag(int(flags[0])), medians[0]
 
 
-def background_gate(z, buddy_z, cfg):
+def spatial_series(values, neighbours, official, independent, sigma, cfg):
+    """Vectorized weighted median/MAD for the trial's per-report as-of joins."""
+    present = np.isfinite(neighbours)
+    ok = (present.sum(axis=1) >= cfg.minimum_buddies) & present[:, independent].any(axis=1)
+    medians = np.full(len(values), np.nan)
+    flags = np.full(len(values), int(Flag.FEW_BUDDIES))
+    if ok.any():
+        weighted = np.repeat(neighbours[ok], np.where(official, cfg.official_buddy_weight, 1), axis=1)
+        median = np.nanmedian(weighted, axis=1)
+        mad = np.nanmedian(abs(weighted - median[:, None]), axis=1)
+        scale = np.maximum(cfg.mad_scale * mad, cfg.scale_floor_fraction * sigma)
+        medians[ok] = median
+        flags[ok] = np.where(abs(values[ok] - median) > cfg.spatial_z * scale, int(Flag.SPATIAL), 0)
+    return flags, medians
+
+
+def background_gate(z, buddy_z, cfg, *, independent=None):
     magnitude = abs(z)
     if not np.isfinite(z):
         return Flag.BACKGROUND, 0.0
     if magnitude <= cfg.huber_cut:
         return Flag(0), 1.0
-    votes = np.count_nonzero(np.isfinite(buddy_z) & (np.sign(z) * buddy_z > cfg.corroboration_z))
-    if magnitude > cfg.gross_cut and votes < cfg.corroborating_stations:
-        return Flag.BACKGROUND, 0.0
+    if magnitude > cfg.gross_cut:
+        votes = np.isfinite(buddy_z) & (np.sign(z) * buddy_z > cfg.corroboration_z)
+        if votes.sum() < cfg.corroborating_stations or (
+            independent is not None and not np.any(votes & independent)
+        ):
+            return Flag.BACKGROUND, 0.0
     return Flag.BACKGROUND, cfg.huber_cut / magnitude
+
+
+def cells(lat, lon):
+    """Integer labels for the supplied tenth-degree grid."""
+    return np.rint(np.asarray(lat) * 10).astype(int) * 4000 + np.rint(np.asarray(lon) * 10).astype(int)
+
+
+def official_hour_bias(measured, innovations, targets):
+    """Expanding same-UTC-hour mean. Availability is strictly before each target."""
+    measured = np.asarray(measured, dtype="datetime64[ns]")
+    targets = np.asarray(targets, dtype="datetime64[ns]")
+    innovations = np.asarray(innovations, dtype=float)
+    result = np.full(len(targets), np.nan)
+    mh = measured.astype("datetime64[h]").astype(np.int64) % 24
+    th = targets.astype("datetime64[h]").astype(np.int64) % 24
+    for hour in np.unique(th):
+        valid = (mh == hour) & np.isfinite(innovations)
+        ts, samples = measured[valid], innovations[valid]
+        order = np.argsort(ts, kind="stable")
+        at = np.flatnonzero(th == hour)
+        count = np.searchsorted(ts[order], targets[at], side="left")
+        keep = count > 0
+        result[at[keep]] = np.cumsum(samples[order])[count[keep] - 1] / count[keep]
+    return result
 
 
 def solar_elevation(time, lat, lon):
@@ -127,6 +184,8 @@ def quality_control(
     *,
     official=False,
     reference=np.nan,
+    official_background_bias=None,
+    reference_time_ns=None,
     states=None,
     cfg=QCConfig(),
 ):
@@ -144,7 +203,16 @@ def quality_control(
     flags = batch.qc_flags.copy()
     weights, huber = np.zeros(size), np.zeros(size)
     medians = np.full(size, np.nan)
-    innovations = batch.values - background
+    corrections = None if official_background_bias is None else column(official_background_bias)
+    raw = batch.values - background
+    innovations = raw.copy()
+    bias_available = np.ones(size, dtype=bool)
+    grid = cells(batch.lat, batch.lon)
+    reference_times = None if reference_time_ns is None else column(reference_time_ns, np.int64)
+    if reference_times is not None and np.any(
+        np.isfinite(reference) & (reference_times > batch.obs_time.astype(np.int64))
+    ):
+        raise ValueError("reference measurement cannot be later than the observation")
     z = np.full(size, np.nan)
     times, groups = np.unique(batch.obs_time, return_inverse=True)
     order = np.argsort(groups, kind="stable")
@@ -159,15 +227,39 @@ def quality_control(
             if var in readings:
                 raise ValueError("duplicate station-variable report at one timestamp")
             readings[var] = batch.values[i]
+        hour = str(int(time.astype("datetime64[h]").astype(np.int64) % 24))
+        history = {}
+        if corrections is None:
+            for (_, var), previous in states.items():
+                if (
+                    previous.official_site is not None
+                    and previous.last_ns < time_ns
+                    and hour in previous.hourly_innovations
+                ):
+                    count, total_error = previous.hourly_innovations[hour]
+                    history.setdefault(var, []).append([*previous.official_site, total_error / count])
         eligible = {}
         for i, daytime in zip(rows, day, strict=True):
             station, var = batch.station_ids[i], batch.variable[i]
             value = float(batch.values[i])
             old = states.get((station, var), StationState())
+            if not official[i] and var in ("t2m", "td2m"):
+                correction = np.nan
+                if corrections is not None:
+                    correction = corrections[i]
+                elif var in history:
+                    lats, lons, errors = np.asarray(history[var]).T
+                    km = distances_km(batch.lat[i], batch.lon[i], lats, lons)
+                    nearest = int(np.argmin(km))
+                    if km[nearest] <= cfg.official_bias_radius_km:
+                        correction = errors[nearest]
+                bias_available[i] = np.isfinite(correction)
+                if bias_available[i]:
+                    innovations[i] -= correction
             bias = old.bias_day if daytime else old.bias_night
-            z[i] = (innovations[i] - (bias or 0)) / total[i]
+            z[i] = (innovations[i] - ((bias or 0) if bias_available[i] else 0)) / total[i]
             flags[i] |= int(static_gate(var, value, batch.elevation_m[i], peers[station], cfg))
-            flags[i] |= int(temporal_gate(var, value, time_ns, old, cfg))
+            flags[i] |= int(temporal_gate(var, value, time_ns, old, cfg, reference=reference[i]))
             if not (int(flags[i]) & (Flag.STATIC | Flag.TEMPORAL | Flag.COPYCAT)) and not old.copycat:
                 eligible.setdefault(var, []).append(i)
         for i, daytime in zip(rows, day, strict=True):
@@ -178,9 +270,14 @@ def quality_control(
             adjusted = batch.values[near].astype(float)
             if var in ("t2m", "td2m"):
                 adjusted += cfg.lapse_k_per_km * (batch.elevation_m[near] - batch.elevation_m[i]) / 1000
-            flag, medians[i] = spatial_gate(batch.values[i], adjusted, total[i], cfg)
+            if var == "station_pressure":
+                adjusted *= np.exp((batch.elevation_m[near] - batch.elevation_m[i]) / cfg.scale_height_m)
+            independent = official[near] | (grid[near] != grid[i])
+            flag, medians[i] = spatial_gate(
+                batch.values[i], adjusted, total[i], cfg, official=official[near], independent=independent
+            )
             flags[i] |= int(flag)
-            flag, huber[i] = background_gate(z[i], z[near], cfg)
+            flag, huber[i] = background_gate(z[i], z[near], cfg, independent=independent)
             flags[i] |= int(flag)
             key = (station, var)
             new = update_state(
@@ -194,12 +291,30 @@ def quality_control(
                 solar_sensitive=var in ("t2m", "td2m"),
                 huber=huber[i],
                 sigma_bg=bg[i],
+                verify_temperature=var == "t2m",
+                learn_bias=bool(bias_available[i]),
+                reference_time_ns=None if reference_times is None else int(reference_times[i]),
                 official=official[i],
                 hard_fail=bool(int(flags[i]) & (Flag.STATIC | Flag.TEMPORAL | Flag.COPYCAT)),
                 cfg=cfg,
             )
+            if official[i] and var in ("t2m", "td2m") and np.isfinite(raw[i]) and not flags[i] & Flag.STATIC:
+                new.official_site = [float(batch.lat[i]), float(batch.lon[i])]
+                count, error = new.hourly_innovations.get(hour, [0, 0.0])
+                new.hourly_innovations = {**new.hourly_innovations, hour: [count + 1, error + float(raw[i])]}
             states[key] = new
             if new.copycat:
                 flags[i] |= int(Flag.COPYCAT)
             weights[i] = new.weight
+        # Resolve simultaneous channels together so row order cannot change eligibility.
+        faults = {}
+        for (site, _), state in states.items():
+            if state.last_copycat_ns is not None:
+                faults[site] = max(faults.get(site, state.last_copycat_ns), state.last_copycat_ns)
+        for site in peers.keys() & faults.keys():
+            key = (site, "t2m")
+            if key in states:
+                states[key] = veto_recent_copy(states[key], time_ns, faults[site], cfg)
+        for i in rows:
+            weights[i] = states[(batch.station_ids[i], batch.variable[i])].weight
     return QCResult(flags, weights, huber, medians, states)

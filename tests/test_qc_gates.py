@@ -76,7 +76,7 @@ def test_robust_buddies_and_mountain_lapse():
     heights[0] = 0
     values = 280 - CFG.lapse_k_per_km * heights / 1000
     values[-3:] += 20
-    r = quality_control(batch(values, elev=heights), values, 1, 1)
+    r = quality_control(batch(values, elev=heights, lon=np.resize([0, 0.1], 9)), values, 1, 1)
     assert r.buddy_median[0] == pytest.approx(280)
     assert r.qc_flags[-1] & Flag.SPATIAL
     assert not (r.qc_flags[0] & Flag.SPATIAL)
@@ -114,7 +114,14 @@ def test_indoor_sensor_and_copycat():
         outdoor = 290 + 5 * np.sin(hour * np.pi / 12) + rng.normal(0, 0.1)
         values = np.array([294, outdoor, outdoor + 0.1, outdoor - 0.2, outdoor + 0.3, outdoor])
         refs = [np.nan] * 5 + [outdoor]
-        r = quality_control(batch(values, times=time), outdoor, 2, 5, reference=refs, states=states)
+        r = quality_control(
+            batch(values, times=time, lon=[0, 0, 0.1, -0.1, 0, 0.1]),
+            outdoor,
+            2,
+            5,
+            reference=refs,
+            states=states,
+        )
         states = r.states
     assert states[("00000000000", "t2m")].correlation_guard < 0.01
     copy = states[("00000000005", "t2m")]
