@@ -3,7 +3,7 @@
 **Target path:** `docs/TOKENOMICS.md` in [`wrfcoin/wrfcomp`](https://github.com/wrfcoin)  
 **Status:** Draft v0.1 (Shadow Leaderboard Specification)
 
-> **Research draft, shadow only.** Nothing in this document is live, scheduled or decided. It does not
+> **Research draft, shadow only.** The four 2026-11-24 compute rules apply to the shadow simulation only. It does not
 > replace WRFCoin's accepted tokenomics decisions or the skill pay that already exists on the testnet chain.
 > The numbers are starting points for an off-chain paper ledger. Changing any slash or emission parameter
 > here needs the project owner's approval.
@@ -49,6 +49,13 @@ Each epoch mints `E_epoch` WRF (plus any protocol fee revenue from enterprise fo
 
 Every participating compute node `i` posts a refundable stake `K_i >= K_min` for the epoch. Scoring uses strictly proper probabilistic rules implemented via the Bureau of Meteorology's [`scores`](https://github.com/nci/scores) library so miners maximize expected payout only by reporting their true calibrated probability distribution.
 
+Admission follows the owner ruling of 2026-11-24. A timely recorder commitment and matching
+reveal, stake at or above the floor, and passing gates against the free NOAA GEFS forecast
+are required before a forecast enters the payout or marginal contribution pool. The
+spread-skill band applies to every variable. Copies of GEFS earn zero. Among clones only the
+first valid commit can earn. A committed non-reveal is slashed at the maximum honest rate.
+The shadow defaults and replay procedure are in [SHADOW_LEDGER.md](SHADOW_LEDGER.md).
+
 ### 4.1 Individual Proper Skill (`CRPSS_i`)
 
 For each evaluated variable `v` and lead time `h`, `wrfcomp-eval` computes the unbiased ("fair") ensemble CRPS and 95th-percentile threshold-weighted tail CRPS (`twCRPS_p95`), blended into a weighted proper loss:
@@ -57,7 +64,7 @@ For each evaluated variable `v` and lead time `h`, `wrfcomp-eval` computes the u
 L_i = 0.70 * CRPS_fair(i) + 0.30 * twCRPS_p95(i)
 ```
 
-Normalized against the locked open operational baseline `L_base` (e.g., open-weight ECMWF AIFS or NOAA GFS/HRRR):
+Normalize against the free NOAA GEFS forecast for the same epoch and coverage:
 
 ```text
 CRPSS_i = 1 - (L_i / L_base)
@@ -69,14 +76,14 @@ A miner that merely matches the free baseline scores `CRPSS_i = 0`. A miner wors
 
 To prevent thousands of nodes from farming rewards by relaying identical copies of free public models, WRFCoin adapts [Numerai's Meta Model Contribution (MMC)](https://docs.numer.ai/numerai-tournament/scoring/meta-model-contribution-mmc) to probabilistic weather ensembles.
 
-Let `M_all` be the stake-weighted WRFCoin Meta-Ensemble across all valid staked miners, and let `M_{-i}` be the Meta-Ensemble with miner `i` removed. Miner `i`'s marginal contribution is:
+Let `M_all` be the equal-weight mixture across distinct eligible forecasts, and let `M_{-i}` be the Meta-Ensemble with miner `i` removed. Miner `i`'s marginal contribution is:
 
 ```text
 Delta_CRPS_i = (L(M_{-i}) - L(M_all)) / L_base
 ```
 
 - **Unique signal:** If removing miner `i` makes the Meta-Ensemble worse (`L(M_{-i}) > L(M_all)`), then `Delta_CRPS_i > 0`.
-- **Clone / copycat:** If miner `i` submits a duplicate of a public model or another miner, removing it leaves `M_all` unchanged (`Delta_CRPS_i ≈ 0`).
+- **Clone / copycat:** GEFS relays and later clones are excluded before forming the mixture.
 
 ### 4.3 Composite Score, Payout & Slashing Cap
 
@@ -86,10 +93,10 @@ Miner `i`'s composite skill score blends individual skill and uniqueness using w
 S_i = (1 - w_delta) * CRPSS_i + w_delta * Delta_CRPS_i
 ```
 
-- **Positive Skill (`S_i > 0`):** Miner `i` receives a share of the Compute Pool proportional to its stake-capped positive score (using concave stake weighting `K_i^0.75` to discourage whale monopoly):
+- **Positive Skill (`S_i > 0`):** Miner `i` receives a share of the Compute Pool proportional to its stake times its positive score:
 
 ```text
-Reward_i = P_comp * (K_i^0.75 * S_i) / sum_{j: S_j > 0} (K_j^0.75 * S_j)
+Reward_i = P_comp * (K_i * S_i) / sum_{j: S_j > 0} (K_j * S_j)
 ```
 
 - **Negative Skill (`S_i < 0`):** Miner `i` earns `0` emission and burns a capped fraction of its stake (default **`max_slash_cap = 0.10`**, i.e., 10% max burn per epoch):
@@ -98,7 +105,7 @@ Reward_i = P_comp * (K_i^0.75 * S_i) / sum_{j: S_j > 0} (K_j^0.75 * S_j)
 Slash_i = min(max_slash_cap, alpha_slash * |S_i|) * K_i
 ```
 
-- **Protocol Faults (Invalid Schema / Corrupt Ciphertext / Missed Reveal):** Automatic flat slash of `0.05 * K_i` (5% of epoch stake) and exclusion from the Meta-Ensemble.
+- **Protocol Faults (Invalid Schema / Corrupt Ciphertext / Missed Reveal):** Maximum slash of `max_slash_cap * K_i` and exclusion from the Meta-Ensemble.
 
 ---
 
@@ -142,9 +149,9 @@ Validator nodes stake `K_val` and execute the deterministic, containerized `wrfc
 | Attack Vector | Mechanism Exploited | WRFCoin Mitigation |
 | :--- | :--- | :--- |
 | **Live Forecast Copycatting** | Copying top miner outputs before cutoff | `drand` timelock encryption until `T0` |
-| **Free Public Model Relaying** | Submitting raw NOAA GFS or ECMWF AIFS clones | `w_delta = 0.90` zeroes out non-unique `Delta_CRPS` |
-| **Selective Non-Reveal** | Hiding bad forecasts after weather starts | Automatic timelock decryption + 5% invalid-payload slash |
-| **Sybil Stake Splitting** | Splitting one model across 50 wallets | `Delta_CRPS` evaluates marginal uniqueness; identical clones split the same near-zero marginal gain |
+| **Free Public Model Relaying** | Submitting raw NOAA GFS or ECMWF AIFS clones | GEFS skill and calibration gates before marginal scoring |
+| **Selective Non-Reveal** | Hiding bad forecasts after weather starts | Maximum slash on a committed non-reveal or invalid payload |
+| **Sybil Stake Splitting** | Splitting one model across 50 wallets | Earliest-commit clone deduplication, minimum wallet stake and linear payout weight |
 | **Backyard Station Farming** | Deploying 10 sensors at one address | H3 Cell Capacity (`C_max / N_cell`) + `PoL_s` |
 | **Airport METAR Scraping** | Spoofing IoT readings from nearby ASOS feeds | Rolling `r > 0.998` + zero micro-residual anti-spoof guard (`C_s -> 0`) |
 | **Calibration / Extreme-Event Shirking** | Hedging toward safe averages on calm days | Strictly proper CRPS + 30% weight on extreme-tail `twCRPS_p95` |

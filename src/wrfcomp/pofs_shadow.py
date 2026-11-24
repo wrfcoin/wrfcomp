@@ -7,14 +7,22 @@ All calculations are deterministic pure functions over NumPy arrays.
 
 from __future__ import annotations
 
+import hashlib
 import math
+import struct
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
+import xarray as xr
 
+from wrfcomp.harness.config import load_config
+from wrfcomp.harness.metrics import diebold_mariano_pvalue, evaluate_gates
 from wrfcomp.harness.schemas import Scorecard
+
+DEFAULT_REPLAY_STAKE = 100.0
 
 
 @dataclass(frozen=True)
@@ -32,8 +40,9 @@ class ShadowLedgerParams:
     w_delta: float = 0.90
     twcrps_weight: float = 0.30
     max_slash_cap: float = 0.10
-    stake_exponent: float = 0.75
-    protocol_fault_slash: float = 0.05
+    stake_exponent: float = 1.0
+    k_min: float = 10.0
+    clone_relative_tolerance: float = 0.05
     h3_cell_cap: int = 1
 
     def __post_init__(self) -> None:
@@ -48,18 +57,64 @@ class ShadowLedgerParams:
             ("w_delta", self.w_delta),
             ("twcrps_weight", self.twcrps_weight),
             ("max_slash_cap", self.max_slash_cap),
-            ("protocol_fault_slash", self.protocol_fault_slash),
         ):
             if not math.isfinite(val) or not (0.0 <= val <= 1.0):
                 raise ValueError(f"{name} must be in [0, 1], got {val}")
-        if not math.isfinite(self.stake_exponent) or self.stake_exponent <= 0.0:
-            raise ValueError(f"stake_exponent must be finite and > 0, got {self.stake_exponent}")
+        if not math.isfinite(self.k_min) or self.k_min <= 0:
+            raise ValueError("k_min must be finite and positive")
+        if not math.isfinite(self.clone_relative_tolerance) or self.clone_relative_tolerance < 0:
+            raise ValueError("clone_relative_tolerance must be finite and nonnegative")
+        if not math.isfinite(self.stake_exponent) or self.stake_exponent < 1.0:
+            raise ValueError(
+                f"stake_exponent must be at least 1 for split resistance, got {self.stake_exponent}"
+            )
         if (
             isinstance(self.h3_cell_cap, bool)
             or not isinstance(self.h3_cell_cap, int)
             or self.h3_cell_cap < 1
         ):
             raise ValueError(f"h3_cell_cap must be an integer >= 1, got {self.h3_cell_cap}")
+
+
+@dataclass(frozen=True)
+class Commitment:
+    """Receipt from the epoch recorder, separate from the revealed payload."""
+
+    digest: str
+    received_at: np.datetime64
+
+
+@dataclass(frozen=True)
+class EpochEvidence:
+    """Trusted epoch facts. init_time is the first init covered by a batch."""
+
+    init_time: np.datetime64
+    gefs_digest: str
+    commitments: Mapping[str, Commitment]
+
+    def __post_init__(self):
+        object.__setattr__(self, "commitments", MappingProxyType(dict(self.commitments)))
+        if not isinstance(self.init_time, np.datetime64) or np.isnat(self.init_time):
+            raise ValueError("invalid epoch init")
+        for digest in [self.gefs_digest, *(r.digest for r in self.commitments.values())]:
+            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("invalid SHA-256 digest")
+        for receipt in self.commitments.values():
+            if not isinstance(receipt.received_at, np.datetime64) or np.isnat(receipt.received_at):
+                raise ValueError("invalid commitment time")
+
+
+def forecast_digest(forecast: np.ndarray) -> str:
+    """Raw-array commitment to the ordered forecast rows, dimensions and members."""
+    arr = np.asarray(forecast, dtype="<f8")
+    if arr.ndim == 1:
+        arr = arr[:, None]
+    if arr.ndim != 2:
+        raise ValueError("expected a 2-D ensemble")
+    h = hashlib.sha256(b"wrfcomp-shadow-forecast-v1" + struct.pack("<QQ", *arr.shape))
+    canonical = np.where(arr == 0, 0.0, arr).astype("<f8", copy=False)
+    h.update(canonical.tobytes(order="C"))
+    return h.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -86,6 +141,7 @@ class MinerPayout:
     composite_score: float | None
     reward: float
     slash: float
+    status: str
 
 
 @dataclass(frozen=True)
@@ -156,9 +212,7 @@ def _as_2d_forecast(forecast: np.ndarray, n_obs: int) -> np.ndarray:
     if arr.ndim == 1:
         arr = arr[:, np.newaxis]
     if arr.ndim != 2 or arr.shape[0] != n_obs or arr.shape[1] < 1:
-        raise ValueError(
-            f"forecast must have shape ({n_obs},) or ({n_obs}, M>=1), got {arr.shape}"
-        )
+        raise ValueError(f"forecast must have shape ({n_obs},) or ({n_obs}, M>=1), got {arr.shape}")
     if not np.isfinite(arr).all():
         raise ValueError("forecast contains non-finite values")
     return arr
@@ -265,18 +319,14 @@ def _validate_tail_threshold(
         with np.errstate(over="ignore"):
             thr = np.asarray(raw, dtype=np.float64)
     except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"tail_threshold must be finite and representable in float64: {exc}"
-        ) from exc
+        raise ValueError(f"tail_threshold must be finite and representable in float64: {exc}") from exc
     if thr.ndim > 1:
         raise ValueError(f"tail_threshold must be a scalar or 1-D array, got shape {thr.shape}")
     if thr.ndim == 1:
         if thr.size == 0:
             raise ValueError("tail_threshold must be non-empty")
         if n_obs is not None and thr.shape != (n_obs,):
-            raise ValueError(
-                f"tail_threshold length {thr.shape[0]} does not match obs length {n_obs}"
-            )
+            raise ValueError(f"tail_threshold length {thr.shape[0]} does not match obs length {n_obs}")
     if not np.isfinite(thr).all():
         raise ValueError(
             "tail_threshold must be finite (NaN, +/-infinity, and float64-overflowing values are refused)"
@@ -331,6 +381,67 @@ def meta_ensemble_loss(
 # --------------------------------------------------------------------------- Compute Pool
 
 
+def _array_gate(fc, gefs, obs, threshold, issue_times, lead_hours, cfg):
+    """Single variable, single lead, one verifying observation per issue."""
+    if threshold is None or issue_times is None or lead_hours is None:
+        return False
+    times = np.asarray(issue_times)
+    if (
+        times.shape != obs.shape
+        or times.dtype.kind != "M"
+        or np.isnat(times).any()
+        or not np.isfinite(lead_hours)
+        or lead_hours <= 0
+    ):
+        raise ValueError("invalid DM initialization grid or lead")
+
+    def losses(x):
+        def scores(values, truth):
+            fair = fair_ensemble_crps(values, truth)
+            mae = np.abs(values - truth[:, None]).mean(axis=1)
+            return fair, fair + (mae - fair) / values.shape[1]
+
+        c, ce = scores(x, obs)
+        tail, te = scores(_clip_tail(x, threshold), _clip_tail(obs, threshold))
+        return (
+            cfg.gate.loss_weights.crps_fair * c + cfg.gate.loss_weights.twcrps_p95 * tail,
+            cfg.gate.loss_weights.crps_fair * ce + cfg.gate.loss_weights.twcrps_p95 * te,
+            tail.mean(),
+        )
+
+    base, be, bt = losses(gefs)
+    cand, ce, ct = losses(fc)
+    rmse = np.sqrt(np.mean((fc.mean(axis=1) - obs) ** 2))
+    n = fc.shape[1]
+    if n < 2 or rmse == 0 or base.mean() <= 0 or be.mean() <= 0:
+        return False
+    spread = np.sqrt((n + 1) / n * fc.var(axis=1, ddof=1).mean()) / rmse
+    diff = xr.DataArray(base - cand, dims="init_time", coords={"init_time": times})
+    metrics = dict(
+        crpss_vs_baseline=1 - cand.mean() / base.mean(),
+        crpss_vs_baseline_ecdf=1 - ce.mean() / be.mean(),
+        twcrps_p95=ct,
+        baseline_twcrps_p95=bt,
+        spread_skill_ratio=spread,
+        n_members=n,
+        dm_pvalue=diebold_mariano_pvalue(diff, lead_hours),
+    )
+    return all(evaluate_gates({"all": metrics}, cfg).values())
+
+
+def _mean_wasserstein(left: np.ndarray, right: np.ndarray) -> float:
+    """Mean row-wise W1 of sorted, equally weighted empirical ensembles."""
+    m, n = left.shape[1], right.shape[1]
+    if m == n:
+        return float(np.abs(left - right).mean())
+    # On each interval between empirical quantile jumps both quantiles
+    # are constant. Integer coordinates on [0, m*n] keep the jumps exact.
+    edges = np.union1d(np.arange(m + 1) * n, np.arange(n + 1) * m)
+    lower = edges[:-1]
+    distances = np.abs(left[:, lower // n] - right[:, lower // m]).mean(axis=0)
+    return float(np.dot(np.diff(edges) / (m * n), distances))
+
+
 def settle_compute_pool(
     miners: list[MinerEntry],
     *,
@@ -340,192 +451,199 @@ def settle_compute_pool(
     baseline_forecast: np.ndarray | None = None,
     obs: np.ndarray | None = None,
     tail_threshold: np.ndarray | float | None = None,
+    evidence: EpochEvidence | None = None,
+    issue_times: np.ndarray | None = None,
+    lead_hours: float | None = None,
+    gefs_forecast: np.ndarray | None = None,
 ) -> ComputePoolSettlement:
-    """Settle the Compute Pool (Section 4 of ``docs/TOKENOMICS.md``).
+    """The raw-array adapter settles a single variable/lead forecast batch.
 
-    Accepts either:
-      - Forecast-array mode: every non-faulty miner provides ``forecast`` plus ``obs``
-        (and either ``baseline_loss`` or ``baseline_forecast``).
-      - Pointwise-loss mode: every non-faulty miner provides ``pointwise_loss`` plus
-        scalar ``baseline_loss``.
+    A scalar baseline or supplied pointwise losses alone cannot prove eligibility.
+    For multi-variable epochs use the evaluator scorecard adapter.
     """
-    if not math.isfinite(pool_amount) or pool_amount < 0.0:
-        raise ValueError(f"pool_amount must be finite and >= 0, got {pool_amount}")
+    y = None if obs is None else np.asarray(obs, dtype=float)
     if tail_threshold is not None:
-        obs_len = np.asarray(obs).size if obs is not None else None
-        _validate_tail_threshold(tail_threshold, n_obs=obs_len)
-
-    seen_ids: set[str] = set()
+        _validate_tail_threshold(tail_threshold, None if y is None else y.size)
+    gefs = None
+    if gefs_forecast is not None:
+        baseline_forecast = gefs_forecast
+    if baseline_forecast is not None:
+        if y is None:
+            raise ValueError("baseline_forecast needs observations")
+        gefs = _as_2d_forecast(baseline_forecast, y.size)
+        if evidence and forecast_digest(gefs) != evidence.gefs_digest:
+            raise ValueError("baseline does not match epoch GEFS digest")
+        actual = composite_forecast_loss(gefs, y, params, tail_threshold)
+        if baseline_loss is not None and baseline_loss != actual:
+            raise ValueError("baseline loss differs from forecast")
+        baseline_loss = actual
+    if issue_times is not None and evidence and np.min(issue_times) != evidence.init_time:
+        raise ValueError("commit cutoff differs from first initialization")
+    losses, digests, gates, arrays = {}, {}, {}, {}
+    cfg = load_config()
+    gate_cache = {}
+    loss_shape = None
     for m in miners:
-        if not m.miner_id:
-            raise ValueError("miner_id must be non-empty")
-        if m.miner_id in seen_ids:
-            raise ValueError(f"duplicate miner_id: {m.miner_id!r}")
-        seen_ids.add(m.miner_id)
-        if not math.isfinite(m.stake) or m.stake < 0.0:
-            raise ValueError(f"miner {m.miner_id!r}: stake must be finite and >= 0")
-
-    if baseline_loss is None:
-        if baseline_forecast is None or obs is None:
-            raise ValueError("provide either baseline_loss or (baseline_forecast and obs)")
-        baseline_loss = composite_forecast_loss(
-            baseline_forecast, obs, params, tail_threshold=tail_threshold
-        )
-    if not math.isfinite(baseline_loss) or baseline_loss <= 0.0:
-        raise ValueError(f"baseline_loss must be finite and > 0, got {baseline_loss}")
-
-    # Deterministic ordering by miner_id ensures bitwise-identical float reductions.
-    ordered = sorted(miners, key=lambda m: m.miner_id)
-    valid = [m for m in ordered if not m.protocol_fault]
-
-    if valid:
-        has_fc = [m.forecast is not None for m in valid]
-        has_pl = [m.pointwise_loss is not None for m in valid]
-        if any(fc and pl for fc, pl in zip(has_fc, has_pl, strict=True)):
-            raise ValueError("a miner entry must set either forecast or pointwise_loss, not both")
-        if all(has_fc):
-            mode = "forecast"
-            if obs is None:
-                raise ValueError("obs is required in forecast mode")
-        elif all(has_pl):
-            mode = "pointwise_loss"
-        else:
-            raise ValueError(
-                "all non-faulty miners must use the same input mode (forecast or pointwise_loss)"
-            )
-    else:
-        mode = "empty"
-
-    staked_valid = [m for m in valid if m.stake > 0.0]
-
-    meta_loss: float | None = None
-    indiv_losses: dict[str, float] = {}
-    delta_crps_map: dict[str, float] = {}
-
-    if mode == "forecast":
-        assert obs is not None
-        y = np.asarray(obs, dtype=np.float64)
-        fc_by_id = {m.miner_id: _as_2d_forecast(m.forecast, y.size) for m in valid}  # type: ignore[arg-type]
-        for m in valid:
-            indiv_losses[m.miner_id] = composite_forecast_loss(
-                fc_by_id[m.miner_id], y, params, tail_threshold=tail_threshold
-            )
-
-        if staked_valid:
-            all_fc = [fc_by_id[m.miner_id] for m in staked_valid]
-            all_stakes = np.array([m.stake for m in staked_valid], dtype=np.float64)
-            meta_loss = meta_ensemble_loss(
-                all_fc, all_stakes, y, params, tail_threshold=tail_threshold
-            )
-            for idx, m in enumerate(staked_valid):
-                if len(staked_valid) == 1:
-                    # Single-miner fallback: without the sole miner, only the baseline remains.
-                    loo_loss = baseline_loss
-                else:
-                    other_fc = [fc for j, fc in enumerate(all_fc) if j != idx]
-                    other_stakes = np.delete(all_stakes, idx)
-                    loo_loss = meta_ensemble_loss(
-                        other_fc, other_stakes, y, params, tail_threshold=tail_threshold
-                    )
-                delta_crps_map[m.miner_id] = (loo_loss - meta_loss) / baseline_loss
-
-        for m in valid:
-            if m.miner_id not in delta_crps_map:
-                delta_crps_map[m.miner_id] = 0.0
-
-    elif mode == "pointwise_loss":
-        pl_by_id: dict[str, np.ndarray] = {}
-        expected_shape: tuple[int, ...] | None = None
-        for m in valid:
-            arr = np.asarray(m.pointwise_loss, dtype=np.float64)
-            if arr.size == 0 or not np.isfinite(arr).all():
-                raise ValueError(f"miner {m.miner_id!r}: pointwise_loss must be non-empty and finite")
-            if expected_shape is None:
-                expected_shape = arr.shape
-            elif arr.shape != expected_shape:
-                raise ValueError("all miners' pointwise_loss arrays must have identical shape")
-            pl_by_id[m.miner_id] = arr
-            indiv_losses[m.miner_id] = float(np.mean(arr))
-
-        if staked_valid:
-            stakes = np.array([m.stake for m in staked_valid], dtype=np.float64)
-            losses = np.array([indiv_losses[m.miner_id] for m in staked_valid], dtype=np.float64)
-            total_stake = float(np.sum(stakes))
-            meta_loss = float(np.sum(stakes * losses) / total_stake)
-            for idx, m in enumerate(staked_valid):
-                if len(staked_valid) == 1:
-                    loo_loss = baseline_loss
-                else:
-                    other_stakes = np.delete(stakes, idx)
-                    other_losses = np.delete(losses, idx)
-                    loo_loss = float(np.sum(other_stakes * other_losses) / float(np.sum(other_stakes)))
-                delta_crps_map[m.miner_id] = (loo_loss - meta_loss) / baseline_loss
-
-        for m in valid:
-            if m.miner_id not in delta_crps_map:
-                delta_crps_map[m.miner_id] = 0.0
-
-    # Compute scores, raw positive payout weights, and slashes.
-    scores: dict[str, float] = {}
-    crpss_map: dict[str, float] = {}
-    pos_weights: dict[str, float] = {}
-    slashes: dict[str, float] = {}
-
-    for m in ordered:
         if m.protocol_fault:
-            slashes[m.miner_id] = params.protocol_fault_slash * m.stake
-            pos_weights[m.miner_id] = 0.0
             continue
-        crpss = 1.0 - indiv_losses[m.miner_id] / baseline_loss
-        delta = delta_crps_map[m.miner_id]
-        s_i = (1.0 - params.w_delta) * crpss + params.w_delta * delta
-        crpss_map[m.miner_id] = crpss
-        scores[m.miner_id] = s_i
-        if s_i > 0.0 and m.stake > 0.0:
-            pos_weights[m.miner_id] = (m.stake**params.stake_exponent) * s_i
-            slashes[m.miner_id] = 0.0
-        elif s_i < 0.0:
-            pos_weights[m.miner_id] = 0.0
-            slash_frac = min(params.max_slash_cap, params.alpha_slash * abs(s_i))
-            slashes[m.miner_id] = slash_frac * m.stake
-        else:
-            pos_weights[m.miner_id] = 0.0
-            slashes[m.miner_id] = 0.0
+        if m.forecast is not None and m.pointwise_loss is not None:
+            raise ValueError("provide only one reveal representation")
+        if m.forecast is not None:
+            if y is None:
+                raise ValueError("forecast needs observations")
+            try:
+                fc = _as_2d_forecast(m.forecast, y.size)
+            except (TypeError, ValueError, OverflowError):
+                if evidence and m.miner_id in evidence.commitments:
+                    continue  # malformed committed reveal: maximum slash
+                raise
+            arrays[m.miner_id] = np.sort(fc, axis=1)
+            digests[m.miner_id] = forecast_digest(fc)
+            losses[m.miner_id] = composite_forecast_loss(fc, y, params, tail_threshold)
+            digest = digests[m.miner_id]
+            if digest not in gate_cache:
+                gate_cache[digest] = bool(
+                    evidence
+                    and gefs is not None
+                    and _array_gate(fc, gefs, y, tail_threshold, issue_times, lead_hours, cfg)
+                )
+            gates[m.miner_id] = gate_cache[digest]
+        elif m.pointwise_loss is not None:
+            arr = np.asarray(m.pointwise_loss, dtype=float)
+            if not arr.size or not np.isfinite(arr).all():
+                raise ValueError("invalid pointwise loss")
+            if loss_shape is not None and arr.shape != loss_shape:
+                raise ValueError("all pointwise_loss arrays must have identical shape")
+            loss_shape = arr.shape
+            losses[m.miner_id] = float(arr.mean())
 
-    total_pos_weight = float(np.sum([pos_weights[m.miner_id] for m in ordered]))
-    payouts: list[MinerPayout] = []
+    if arrays and loss_shape is not None:
+        raise ValueError("cannot mix forecast and pointwise-loss inputs")
+
+    def mixture(ids):
+        return meta_ensemble_loss([arrays[k] for k in ids], np.ones(len(ids)), y, params, tail_threshold)
+
+    clone_distance = 0.0
+    if gefs is not None:
+        field_scale = max(float(np.sqrt(gefs.var(axis=1).mean())), float(np.std(y)))
+        clone_distance = params.clone_relative_tolerance * field_scale
+    return _settle(
+        miners,
+        pool_amount,
+        params,
+        baseline_loss,
+        evidence,
+        losses,
+        digests,
+        gates,
+        arrays,
+        mixture,
+        clone_distance,
+    )
+
+
+def _settle(
+    miners, pool, params, baseline, evidence, losses, digests, gates, arrays, mixture, clone_distance=0.0
+):
+    if (
+        not math.isfinite(pool)
+        or pool < 0
+        or baseline is None
+        or not math.isfinite(baseline)
+        or baseline <= 0
+    ):
+        raise ValueError("invalid pool or baseline loss")
+    ordered = sorted(miners, key=lambda m: m.miner_id)
+    wallets = {m.miner_id for m in ordered}
+    if len(wallets) != len(miners) or any(
+        not m.miner_id or not math.isfinite(m.stake) or m.stake < 0 for m in miners
+    ):
+        raise ValueError("invalid or duplicate miner or stake")
+    receipts = evidence.commitments if evidence else {}
+    if receipts.keys() - wallets:
+        raise ValueError("committed wallet missing from epoch roster")
+    status = {}
+    revealed = []
     for m in ordered:
-        reward = (
-            pool_amount * (pos_weights[m.miner_id] / total_pos_weight)
-            if total_pos_weight > 0.0 and pos_weights[m.miner_id] > 0.0
-            else 0.0
+        k = m.miner_id
+        receipt = receipts.get(k)
+        if m.protocol_fault:
+            status[k] = "protocol_fault"
+        elif receipt is None:
+            status[k] = "uncommitted"
+        elif digests.get(k) != receipt.digest:
+            status[k] = "non_reveal_or_mismatch"
+        elif receipt.received_at >= evidence.init_time:
+            status[k] = "late"
+        elif m.stake < params.k_min:
+            status[k] = "below_minimum"
+        elif digests[k] == evidence.gefs_digest or not gates.get(k, False) or losses[k] >= baseline:
+            status[k] = "gefs_gate"
+        else:
+            revealed.append(m)
+    winners = []
+    for m in sorted(revealed, key=lambda m: (receipts[m.miner_id].received_at, m.miner_id)):
+        k = m.miner_id
+        is_clone = any(
+            digests[k] == digests[earlier]
+            or (k in arrays and _mean_wasserstein(arrays[k], arrays[earlier]) <= clone_distance)
+            for earlier in winners
         )
+        if is_clone:
+            status[k] = "clone"
+        else:
+            status[k] = "eligible"
+            winners.append(k)
+    winners.sort()
+    meta = mixture(winners) if winners else None
+    payouts = []
+    weights = []
+    for m in ordered:
+        k = m.miner_id
+        loss = losses.get(k)
+        crpss = None if loss is None else 1 - loss / baseline
+        delta = score = None
+        slash = weight = 0.0
+        if status[k] in ("non_reveal_or_mismatch", "protocol_fault"):
+            slash = m.stake * params.max_slash_cap
+        elif status[k] == "eligible":
+            others = [j for j in winners if j != k]
+            delta = ((mixture(others) if others else baseline) - meta) / baseline
+            score = (1 - params.w_delta) * crpss + params.w_delta * delta
+            weight = m.stake**params.stake_exponent * max(0.0, score)
+        elif status[k] == "gefs_gate" and loss is not None:
+            # Measure harm against the already-fixed eligible pool only for the
+            # excluded miner's own downside. It never affects a winner's Delta.
+            delta = min(0.0, (meta - mixture(sorted([*winners, k]))) / baseline) if winners else 0.0
+            score = min(0.0, (1 - params.w_delta) * crpss + params.w_delta * delta)
+        if score is not None and score < 0:
+            slash = m.stake * min(params.max_slash_cap, params.alpha_slash * abs(score))
+        weights.append(weight)
         payouts.append(
             MinerPayout(
-                miner_id=m.miner_id,
-                stake=float(m.stake),
-                protocol_fault=m.protocol_fault,
-                loss=None if m.protocol_fault else indiv_losses[m.miner_id],
-                crpss=None if m.protocol_fault else crpss_map[m.miner_id],
-                delta_crps=None if m.protocol_fault else delta_crps_map[m.miner_id],
-                composite_score=None if m.protocol_fault else scores[m.miner_id],
-                reward=float(reward),
-                slash=float(slashes[m.miner_id]),
+                k,
+                m.stake,
+                m.protocol_fault or status[k] == "non_reveal_or_mismatch",
+                loss,
+                crpss,
+                delta,
+                score,
+                0.0,
+                slash,
+                status[k],
             )
         )
-
-    total_paid = float(np.sum([p.reward for p in payouts]))
-    unpaid_remainder = float(pool_amount) if total_pos_weight == 0.0 else 0.0
-    total_slashed = float(np.sum([p.slash for p in payouts]))
-
+    total = math.fsum(weights)
+    if total:
+        payouts = [replace(p, reward=pool * (w / total)) for p, w in zip(payouts, weights, strict=True)]
     return ComputePoolSettlement(
-        pool_amount=float(pool_amount),
-        baseline_loss=float(baseline_loss),
-        meta_ensemble_loss=meta_loss,
-        payouts=tuple(payouts),
-        total_paid=total_paid,
-        unpaid_remainder=unpaid_remainder,
-        total_slashed=total_slashed,
+        pool,
+        baseline,
+        meta,
+        tuple(payouts),
+        math.fsum(p.reward for p in payouts),
+        0.0 if total else pool,
+        math.fsum(p.slash for p in payouts),
     )
 
 
@@ -617,6 +735,9 @@ def settle_data_pool(
 def settle_epoch(
     *,
     epoch_emission: float,
+    evidence: EpochEvidence | None = None,
+    issue_times: np.ndarray | None = None,
+    lead_hours: float | None = None,
     miners: list[MinerEntry],
     stations: list[StationEntry],
     params: ShadowLedgerParams,
@@ -638,6 +759,9 @@ def settle_epoch(
         pool_amount=p_comp,
         params=params,
         baseline_loss=baseline_loss,
+        evidence=evidence,
+        issue_times=issue_times,
+        lead_hours=lead_hours,
         baseline_forecast=baseline_forecast,
         obs=obs,
         tail_threshold=tail_threshold,
@@ -696,7 +820,7 @@ def miners_from_scorecards(
     scorecards: Mapping[str, Scorecard] | Sequence[tuple[str, Scorecard]],
     *,
     baseline_key: str,
-    stakes: Mapping[str, float] | float = 100.0,
+    stakes: Mapping[str, float] | float = DEFAULT_REPLAY_STAKE,
     variables: Sequence[str] | None = None,
     leads: Sequence[int] | None = None,
     fault_ids: Collection[str] = (),
@@ -799,23 +923,106 @@ def settle_from_scorecards(
     baseline_key: str,
     pool_amount: float,
     params: ShadowLedgerParams,
-    stakes: Mapping[str, float] | float = 100.0,
+    stakes: Mapping[str, float] | float = DEFAULT_REPLAY_STAKE,
     variables: Sequence[str] | None = None,
     leads: Sequence[int] | None = None,
     fault_ids: Collection[str] = (),
+    evidence: EpochEvidence | None = None,
 ) -> ComputePoolSettlement:
     """Validate ``wrfcomp-eval`` scorecards and settle the compute pool in pointwise-loss mode."""
-    miners, baseline_loss, _, _ = miners_from_scorecards(
-        scorecards,
-        baseline_key=baseline_key,
-        stakes=stakes,
-        variables=variables,
-        leads=leads,
-        fault_ids=fault_ids,
-    )
-    return settle_compute_pool(
-        miners,
-        pool_amount=pool_amount,
-        params=params,
-        baseline_loss=baseline_loss,
-    )
+    cards = dict(scorecards)
+    if len(cards) != len(scorecards) or baseline_key not in cards:
+        raise ValueError("duplicate scorecard wallet or missing GEFS reference")
+    ref = cards[baseline_key]
+    if ref.model_id != "noaa-gefs" or baseline_key in fault_ids or ref.sealed_data_used:
+        raise ValueError("scorecard settlement requires a valid NOAA GEFS baseline")
+    if evidence and (
+        evidence.gefs_digest != ref.forecast_sha256 or evidence.init_time != np.datetime64(ref.period_start)
+    ):
+        raise ValueError("epoch GEFS digest or init differs from reference scorecard")
+    cfg = load_config()
+    primary = tuple(cfg.evaluation.variables.primary)
+    chosen_vars = tuple(variables) if variables is not None else primary
+    chosen_leads = tuple(leads) if leads is not None else tuple(ref.leads_scored)
+    if (
+        not chosen_vars
+        or not chosen_leads
+        or not set(chosen_vars) <= set(ref.metrics)
+        or not set(chosen_leads) <= set(ref.leads_scored)
+    ):
+        raise ValueError("invalid diagnostic variables or leads")
+    base = {v: scorecard_variable_loss(ref, v, chosen_leads) for v in chosen_vars}
+    if min(base.values()) <= 0:
+        raise ValueError("nonpositive GEFS loss")
+    single = len(chosen_vars) == 1
+    baseline_loss = base[chosen_vars[0]] if single else 1.0
+    losses, digests, gates = {}, {}, {}
+    miners = []
+    roster = set(cards) | set(fault_ids)
+    if evidence:
+        roster.update(evidence.commitments)
+    for key in sorted(roster):
+        stake = float(stakes[key] if isinstance(stakes, Mapping) else stakes)
+        miners.append(MinerEntry(key, stake, protocol_fault=key in fault_ids))
+        if key not in cards or key in fault_ids:
+            continue
+        sc = cards[key]
+        if (
+            any(
+                getattr(sc, k) != getattr(ref, k)
+                for k in (
+                    "harness_version",
+                    "protocol_version",
+                    "truth_sha256",
+                    "thresholds_sha256",
+                    "period_start",
+                    "period_end",
+                    "init_hours_scored",
+                    "n_init_times",
+                    "n_stations",
+                )
+            )
+            or sc.sealed_data_used
+        ):
+            continue
+        if not set(chosen_vars) <= set(sc.metrics) or not set(chosen_leads) <= set(sc.leads_scored):
+            continue
+        try:
+            per_var = {v: scorecard_variable_loss(sc, v, chosen_leads) for v in chosen_vars}
+        except ValueError:
+            continue  # Undefined loss cannot substantiate a committed reveal.
+        losses[key] = (
+            per_var[chosen_vars[0]] if single else float(np.mean([per_var[v] / base[v] for v in base]))
+        )
+        # Preserve historical loss diagnostics, but recognize a reveal only
+        # after checking integrity on the entire epoch, even for a diagnostic slice.
+        if sc == ref:
+            digests[key] = sc.forecast_sha256  # authentic GEFS stays ineligible
+            continue
+        if (
+            sc.baseline_id != "noaa-gefs"
+            or sc.baseline_sha256 != ref.forecast_sha256
+            or sc.variables_missing
+            or set(sc.metrics) != set(primary)
+            or sc.leads_scored != ref.leads_scored
+        ):
+            continue
+        if any(
+            sc.metrics[v][h].n_pairs != ref.metrics[v][h].n_pairs
+            or sc.metrics[v][h].n_masked_no_threshold != ref.metrics[v][h].n_masked_no_threshold
+            for v in primary
+            for h in ref.metrics[v]
+        ):
+            continue
+        derived = {v: evaluate_gates({"all": sc.metrics[v]["all"].model_dump()}, cfg) for v in primary}
+        if derived != sc.gates:
+            continue
+        digests[key] = sc.forecast_sha256
+        gates[key] = (
+            sc.passed_gate and set(chosen_vars) == set(primary) and list(chosen_leads) == ref.leads_scored
+        )
+
+    def mixture(ids):
+        return float(np.mean([losses[k] for k in ids]))
+
+    return _settle(miners, pool_amount, params, baseline_loss, evidence, losses, digests, gates, {}, mixture)
