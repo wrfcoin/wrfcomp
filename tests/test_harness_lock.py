@@ -223,8 +223,8 @@ def _symlink(repo: Path) -> None:
     try:
         (repo / "configs/splits.yaml").symlink_to(Path("..") / "elsewhere.yaml")
     except OSError as exc:
-        if os.name == "nt":
-            pytest.skip(f"Windows symlink creation requires elevated privileges: {exc}")
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip(f"Windows symlink creation requires elevated privileges (winerror 1314): {exc}")
         raise
     commit(repo)
 
