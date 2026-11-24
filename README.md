@@ -73,7 +73,10 @@ per-year scoring data bundle from Zenodo (truth, p95 tail thresholds, and the pi
 quarterly climatology and GEFS reference stores — no citizen data and no sealed 2025+ data):
 
 ```bash
-uv run python -P scripts/fetch_scoring_data.py --url <ZENODO_RECORD_URL> --year 2024
+uv run python -P scripts/fetch_scoring_data.py \
+  --url <ZENODO_RECORD_URL> \
+  --expected-sha256 <ARCHIVE_SHA256> \
+  --year 2024
 ```
 
 `scripts/fetch_scoring_data.py` verifies every unpacked file against both the archive's

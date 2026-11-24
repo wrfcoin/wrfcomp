@@ -1,13 +1,18 @@
 """Download, verify, and unpack a WRFComp scoring data bundle from a Zenodo record URL.
 
 No Zenodo record URL is hard-coded. Pass ``--url <ZENODO_RECORD_OR_FILE_URL>`` (or
-``--archive <LOCAL_ARCHIVE>`` for offline use). Every unpacked file is verified in a private
-staging directory against both the archive's ``MANIFEST.json`` (size and byte SHA-256) and the
-repository's ``experiments/REFERENCES.json`` (harness ``content_sha256`` and sealed-split guard)
-before anything is moved into ``--data-dir``.
+``--archive <LOCAL_ARCHIVE>`` for offline use) together with an independently trusted physical
+pin (``--expected-sha256``, ``--expected-sha256-file``, or ``--expected-manifest``).
+
+Extraction streams members with bounded download size, member count, per-member size, manifest
+size, total expanded bytes, and staging disk space. Every unpacked dataset is validated against
+strict Zarr v2 / NetCDF layout rules, bounded decoded size, per-file byte SHA-256 in
+``MANIFEST.json``, ``references_sha256``, and the harness ``content_sha256`` pins in
+``experiments/REFERENCES.json`` before symlink-checked atomic installation into ``--data-dir``.
 
 Usage:
-    uv run python -P scripts/fetch_scoring_data.py --url <ZENODO_RECORD_URL> --year 2024
+    uv run python -P scripts/fetch_scoring_data.py \
+      --url <ZENODO_RECORD_URL> --expected-sha256 <SHA256> --year 2024
 """
 
 from __future__ import annotations
@@ -15,18 +20,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
+import numpy as np
 import xarray as xr
 
 from wrfcomp.harness.align import check_forecast_not_sealed, check_not_sealed
@@ -36,6 +44,16 @@ from wrfcomp.harness.hashing import content_sha256
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REFERENCES = ROOT / "experiments" / "REFERENCES.json"
 DEFAULT_CONFIG = ROOT / "configs" / "splits.yaml"
+DEFAULT_MAX_ARCHIVE_BYTES = 8 * 1024**3
+DEFAULT_MAX_MEMBERS = 50_000
+DEFAULT_MAX_MEMBER_BYTES = 512 * 1024**2
+DEFAULT_MAX_TOTAL_BYTES = 10 * 1024**3
+DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024**2
+DEFAULT_MAX_README_BYTES = 1 * 1024**2
+DEFAULT_MAX_METADATA_BYTES = 1 * 1024**2
+DEFAULT_MAX_CHUNK_BYTES = 256 * 1024**2
+DEFAULT_MAX_DATASET_BYTES = 2 * 1024**3
+DEFAULT_MIN_FREE_BYTES = 256 * 1024**2
 MANIFEST_VERSION = 1
 REQUIRED_BASELINES = ("climatology", "noaa-gefs")
 FORBIDDEN_PATH_PARTS = frozenset(
@@ -49,9 +67,23 @@ FORBIDDEN_PATH_PARTS = frozenset(
         "bundle",
     }
 )
+WINDOWS_RESERVED_NAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{i}" for i in range(1, 10)),
+        *(f"lpt{i}" for i in range(1, 10)),
+    }
+)
 PERIOD_RE = re.compile(r"^(?P<year>[0-9]{4})-(?:[0-9]{2}|Q[1-4])$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CHUNK_INDEX_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+ZARR_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 ZENODO_RECORD_RE = re.compile(r"^/(?:records?|api/records)/(?P<id>[0-9]+)/?$")
 ZENODO_DOI_RE = re.compile(r"^/10\.5281/zenodo\.(?P<id>[0-9]+)/?$")
+NETCDF_MAGICS = (b"\x89HDF\r\n\x1a\n", b"CDF\x01", b"CDF\x02")
 
 
 class FetchError(RuntimeError):
@@ -68,11 +100,23 @@ def default_data_dir() -> Path:
 def _validate_relpath(relpath: str, what: str) -> Path:
     if not isinstance(relpath, str) or not relpath:
         raise FetchError(f"{what}: empty or non-string relative path")
-    if relpath.startswith("/") or "\\" in relpath:
-        raise FetchError(f"{what}: path must be a relative POSIX path, got {relpath!r}")
-    p = Path(relpath)
-    if p.is_absolute() or ".." in p.parts or "." in p.parts:
-        raise FetchError(f"{what}: unsafe relative path {relpath!r}")
+    if "\x00" in relpath or any(ord(ch) < 32 for ch in relpath):
+        raise FetchError(f"{what}: control characters are forbidden in path {relpath!r}")
+    if relpath.startswith("/") or "\\" in relpath or ":" in relpath or "//" in relpath:
+        raise FetchError(f"{what}: unsafe path syntax {relpath!r}")
+    win = PureWindowsPath(relpath)
+    if win.is_absolute() or win.drive:
+        raise FetchError(f"{what}: Windows drive/absolute path forbidden: {relpath!r}")
+    raw_parts = relpath.split("/")
+    for part in raw_parts:
+        if not part or part in (".", ".."):
+            raise FetchError(f"{what}: unsafe path component {part!r} in {relpath!r}")
+        if part.endswith(" ") or part.endswith("."):
+            raise FetchError(f"{what}: Windows-unsafe trailing space/dot in {part!r}")
+        stem = part.split(".", 1)[0].lower()
+        if stem in WINDOWS_RESERVED_NAMES:
+            raise FetchError(f"{what}: Windows reserved device name in {relpath!r}")
+    p = Path(*raw_parts)
     lowered = {part.lower() for part in p.parts}
     forbidden = lowered & FORBIDDEN_PATH_PARTS
     if forbidden:
@@ -80,9 +124,26 @@ def _validate_relpath(relpath: str, what: str) -> Path:
     return p
 
 
+def _open_regular_nofollow(path: Path, what: str) -> tuple[Any, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise FetchError(f"{what}: cannot safely open {path.name}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise FetchError(f"{what}: not a regular file: {path.name}")
+        return os.fdopen(fd, "rb"), st
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def _sha256_file(path: Path) -> str:
+    fh, _ = _open_regular_nofollow(path, f"file {path.name}")
     h = hashlib.sha256()
-    with path.open("rb") as fh:
+    with fh:
         while True:
             chunk = fh.read(1024 * 1024)
             if not chunk:
@@ -92,8 +153,9 @@ def _sha256_file(path: Path) -> str:
 
 
 def _md5_file(path: Path) -> str:
+    fh, _ = _open_regular_nofollow(path, f"file {path.name}")
     h = hashlib.md5()
-    with path.open("rb") as fh:
+    with fh:
         while True:
             chunk = fh.read(1024 * 1024)
             if not chunk:
@@ -102,13 +164,207 @@ def _md5_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def _open_dataset(path: Path, what: str) -> xr.Dataset:
-    if not path.exists():
-        raise FetchError(f"{what}: missing path {path.name}")
-    if path.is_symlink():
-        raise FetchError(f"{what}: symlinks are refused ({path.name})")
+def _read_bounded_bytes(path: Path, max_bytes: int, what: str) -> bytes:
+    fh, st = _open_regular_nofollow(path, what)
+    with fh:
+        if st.st_size > max_bytes:
+            raise FetchError(f"{what}: file exceeds {max_bytes} bytes")
+        raw = fh.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise FetchError(f"{what}: file exceeds {max_bytes} bytes")
+    return raw
+
+
+def _read_bounded_json(path: Path, max_bytes: int, what: str) -> Any:
+    raw = _read_bounded_bytes(path, max_bytes, what)
     try:
-        if path.is_dir():
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise FetchError(f"{what}: invalid JSON: {exc}") from exc
+
+
+def _assert_tree_no_symlinks(root: Path, relpath: str, what: str, *, must_exist: bool) -> Path:
+    """Validate that every existing ancestor (and nested entry, if any) under ``root`` has no symlinks."""
+    rel = _validate_relpath(relpath, what)
+    root_real = root.resolve(strict=True)
+    cur = root
+    for idx, part in enumerate(rel.parts):
+        cur = cur / part
+        is_last = idx == len(rel.parts) - 1
+        if not os.path.lexists(cur):
+            if must_exist:
+                raise FetchError(f"{what}: missing path {relpath}")
+            continue
+        st = os.lstat(cur)
+        if stat.S_ISLNK(st.st_mode):
+            raise FetchError(f"{what}: symlink refused at {cur.relative_to(root).as_posix()}")
+        if not is_last and not stat.S_ISDIR(st.st_mode):
+            raise FetchError(f"{what}: non-directory ancestor in {relpath}")
+        if not cur.resolve().is_relative_to(root_real):
+            raise FetchError(f"{what}: path escapes root directory: {relpath}")
+    if os.path.lexists(cur) and stat.S_ISDIR(os.lstat(cur).st_mode):
+        for dirpath, dirnames, filenames in os.walk(cur, followlinks=False):
+            dp = Path(dirpath)
+            for name in (*dirnames, *filenames):
+                child = dp / name
+                cst = os.lstat(child)
+                if stat.S_ISLNK(cst.st_mode):
+                    raise FetchError(
+                        f"{what}: symlink refused inside {relpath}: {child.relative_to(cur).as_posix()}"
+                    )
+                if not (stat.S_ISREG(cst.st_mode) or stat.S_ISDIR(cst.st_mode)):
+                    raise FetchError(f"{what}: non-regular entry inside {relpath}: {name!r}")
+                if not child.resolve().is_relative_to(root_real):
+                    raise FetchError(f"{what}: nested entry escapes root: {relpath}")
+    return cur
+
+
+def _validate_zarr_store(
+    root: Path,
+    relpath: str,
+    *,
+    max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
+    max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
+    max_metadata_bytes: int = DEFAULT_MAX_METADATA_BYTES,
+) -> set[str]:
+    """Validate strict Zarr v2 layout and chunk/dataset bounds BEFORE opening with xarray."""
+    store = _assert_tree_no_symlinks(root, relpath, f"zarr store {relpath}", must_exist=True)
+    if not stat.S_ISDIR(os.lstat(store).st_mode):
+        raise FetchError(f"{relpath}: expected a Zarr store directory")
+
+    root_files: dict[str, Path] = {}
+    var_dirs: dict[str, Path] = {}
+    for child in sorted(store.iterdir(), key=lambda p: p.name):
+        st = os.lstat(child)
+        if stat.S_ISREG(st.st_mode):
+            if child.name not in (".zgroup", ".zattrs", ".zmetadata"):
+                raise FetchError(f"{relpath}: unexpected file at Zarr store root: {child.name!r}")
+            root_files[child.name] = child
+        elif stat.S_ISDIR(st.st_mode):
+            if not ZARR_VAR_NAME_RE.fullmatch(child.name):
+                raise FetchError(f"{relpath}: unexpected subdirectory in Zarr store: {child.name!r}")
+            var_dirs[child.name] = child
+        else:
+            raise FetchError(f"{relpath}: non-regular entry in Zarr store: {child.name!r}")
+
+    if ".zgroup" not in root_files:
+        raise FetchError(f"{relpath}: missing .zgroup in Zarr v2 store")
+    zgroup = _read_bounded_json(root_files[".zgroup"], max_metadata_bytes, f"{relpath}/.zgroup")
+    if not isinstance(zgroup, dict) or zgroup.get("zarr_format") != 2:
+        raise FetchError(f"{relpath}: only Zarr v2 groups are supported")
+
+    parsed_metadata: dict[str, Any] = {".zgroup": zgroup}
+    if ".zattrs" in root_files:
+        zattrs = _read_bounded_json(root_files[".zattrs"], max_metadata_bytes, f"{relpath}/.zattrs")
+        if not isinstance(zattrs, dict):
+            raise FetchError(f"{relpath}/.zattrs must be a JSON object")
+        parsed_metadata[".zattrs"] = zattrs
+
+    if not var_dirs:
+        raise FetchError(f"{relpath}: Zarr store contains no arrays")
+
+    total_decoded_bytes = 0
+    for var_name, vdir in sorted(var_dirs.items()):
+        zarray_path = vdir / ".zarray"
+        if not os.path.lexists(zarray_path) or not stat.S_ISREG(os.lstat(zarray_path).st_mode):
+            raise FetchError(f"{relpath}/{var_name}: missing regular .zarray metadata")
+        za = _read_bounded_json(zarray_path, max_metadata_bytes, f"{relpath}/{var_name}/.zarray")
+        if not isinstance(za, dict) or za.get("zarr_format") != 2:
+            raise FetchError(f"{relpath}/{var_name}: unsupported .zarray format")
+        shape = za.get("shape")
+        chunks = za.get("chunks")
+        dtype_raw = za.get("dtype")
+        sep = za.get("dimension_separator", ".")
+        if sep not in (".", "/"):
+            raise FetchError(f"{relpath}/{var_name}: unsupported dimension_separator {sep!r}")
+        if (
+            not isinstance(shape, list)
+            or not isinstance(chunks, list)
+            or len(shape) != len(chunks)
+            or any(not isinstance(s, int) or s < 0 for s in shape)
+            or any(not isinstance(c, int) or c <= 0 for c in chunks)
+        ):
+            raise FetchError(f"{relpath}/{var_name}: invalid shape/chunks in .zarray")
+        try:
+            itemsize = max(int(np.dtype(dtype_raw).itemsize), 8)
+        except Exception as exc:
+            raise FetchError(f"{relpath}/{var_name}: invalid dtype {dtype_raw!r}") from exc
+        chunk_elems = math.prod(chunks) if chunks else 1
+        array_elems = math.prod(shape) if shape else 1
+        if chunk_elems * itemsize > max_chunk_bytes:
+            raise FetchError(
+                f"{relpath}/{var_name}: chunk size {chunk_elems * itemsize} exceeds limit {max_chunk_bytes}"
+            )
+        total_decoded_bytes += array_elems * itemsize
+        if total_decoded_bytes > max_dataset_bytes:
+            raise FetchError(f"{relpath}: decoded dataset size exceeds limit {max_dataset_bytes} bytes")
+
+        parsed_metadata[f"{var_name}/.zarray"] = za
+        grid_limits = [math.ceil(s / c) for s, c in zip(shape, chunks, strict=True)] if shape else [1]
+
+        for dirpath, dirnames, filenames in os.walk(vdir, followlinks=False):
+            cur_dir = Path(dirpath)
+            if cur_dir != vdir and sep != "/":
+                raise FetchError(
+                    f"{relpath}/{var_name}: unexpected subdirectory {cur_dir.relative_to(vdir).as_posix()!r}"
+                )
+            for dname in dirnames:
+                if sep != "/" or not CHUNK_INDEX_RE.fullmatch(dname):
+                    raise FetchError(f"{relpath}/{var_name}: unexpected directory {dname!r}")
+            for fname in filenames:
+                fpath = cur_dir / fname
+                inner_rel = fpath.relative_to(vdir).as_posix()
+                if inner_rel == ".zarray":
+                    continue
+                if inner_rel == ".zattrs":
+                    vattrs = _read_bounded_json(fpath, max_metadata_bytes, f"{relpath}/{var_name}/.zattrs")
+                    if not isinstance(vattrs, dict):
+                        raise FetchError(f"{relpath}/{var_name}/.zattrs must be a JSON object")
+                    parsed_metadata[f"{var_name}/.zattrs"] = vattrs
+                    continue
+                parts = inner_rel.split(sep)
+                if len(parts) != len(grid_limits):
+                    raise FetchError(
+                        f"{relpath}/{var_name}: unrelated file or malformed chunk key {inner_rel!r}"
+                    )
+                for part, lim in zip(parts, grid_limits, strict=True):
+                    if not CHUNK_INDEX_RE.fullmatch(part) or int(part) >= lim:
+                        raise FetchError(
+                            f"{relpath}/{var_name}: out-of-bounds or unrelated file {inner_rel!r}"
+                        )
+
+    if ".zmetadata" in root_files:
+        zmeta = _read_bounded_json(root_files[".zmetadata"], max_metadata_bytes, f"{relpath}/.zmetadata")
+        if (
+            not isinstance(zmeta, dict)
+            or zmeta.get("zarr_consolidated_format") != 1
+            or not isinstance(zmeta.get("metadata"), dict)
+        ):
+            raise FetchError(f"{relpath}/.zmetadata is malformed")
+        meta_map = zmeta["metadata"]
+        if set(meta_map) != set(parsed_metadata):
+            raise FetchError(f"{relpath}/.zmetadata keys do not match on-disk Zarr metadata files")
+        for mkey, mval in meta_map.items():
+            if mval != parsed_metadata[mkey]:
+                raise FetchError(f"{relpath}/.zmetadata disagrees with on-disk {mkey}")
+
+    return set(var_dirs)
+
+
+def _validate_netcdf_header(root: Path, relpath: str) -> None:
+    target = _assert_tree_no_symlinks(root, relpath, f"netcdf {relpath}", must_exist=True)
+    if not stat.S_ISREG(os.lstat(target).st_mode):
+        raise FetchError(f"{relpath}: expected a regular NetCDF file")
+    fh, _ = _open_regular_nofollow(target, f"netcdf {relpath}")
+    with fh:
+        head = fh.read(8)
+    if not any(head.startswith(magic) for magic in NETCDF_MAGICS):
+        raise FetchError(f"{relpath}: file does not start with a NetCDF/HDF5 header")
+
+
+def _open_dataset(path: Path, fmt: str, what: str) -> xr.Dataset:
+    try:
+        if fmt == "zarr":
             try:
                 return xr.open_zarr(path, chunks=None, consolidated=True)
             except (KeyError, ValueError, FileNotFoundError):
@@ -116,6 +372,22 @@ def _open_dataset(path: Path, what: str) -> xr.Dataset:
         return xr.open_dataset(path)
     except Exception as exc:
         raise FetchError(f"{what}: failed to open {path.name}: {exc}") from exc
+
+
+def _check_dataset_bounds(
+    ds: xr.Dataset,
+    relpath: str,
+    *,
+    max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
+) -> None:
+    total = 0
+    for vname, var in ds.variables.items():
+        if any(s < 0 for s in var.shape):
+            raise FetchError(f"{relpath}: negative dimension on {vname}")
+        itemsize = max(int(var.dtype.itemsize), 8)
+        total += int(var.size) * itemsize
+        if total > max_dataset_bytes:
+            raise FetchError(f"{relpath}: decoded dataset size exceeds limit {max_dataset_bytes} bytes")
 
 
 def _check_not_sealed(ds: xr.Dataset, kind: str, relpath: str, cfg: HarnessConfig) -> None:
@@ -165,9 +437,7 @@ def expected_pins(
         entry = inventory["periods"][period]
         refs = entry.get("references")
         if not isinstance(refs, dict) or set(refs) != set(REQUIRED_BASELINES):
-            raise FetchError(
-                f"Period {period} must pin exactly {', '.join(REQUIRED_BASELINES)}"
-            )
+            raise FetchError(f"Period {period} must pin exactly {', '.join(REQUIRED_BASELINES)}")
         for baseline in REQUIRED_BASELINES:
             rec = refs[baseline]
             record(entry["truth"], "truth", rec["truth_sha256"])
@@ -191,22 +461,14 @@ def _check_url_scheme(url: str) -> urllib.parse.ParseResult:
 
 
 def resolve_download_url(url: str, year: int, *, timeout: float = 60.0) -> tuple[str, str | None]:
-    """Resolve a Zenodo record URL (or direct archive URL) to ``(file_url, expected_md5)``.
-
-    Supports:
-    - Direct download URLs (returned as-is with ``expected_md5=None``)
-    - Zenodo record pages: ``https://zenodo.org/records/<id>`` or ``/record/<id>``
-    - Zenodo record API URLs: ``https://zenodo.org/api/records/<id>``
-    - Zenodo DOI URLs: ``https://doi.org/10.5281/zenodo.<id>``
-    """
+    """Resolve a Zenodo record URL (or direct archive URL) to ``(file_url, expected_md5)``."""
     parsed = _check_url_scheme(url)
     api_url: str | None = None
     host = (parsed.hostname or "").lower()
     if host in ("zenodo.org", "www.zenodo.org", "sandbox.zenodo.org", "127.0.0.1", "localhost"):
         m = ZENODO_RECORD_RE.fullmatch(parsed.path)
         if m:
-            netloc = parsed.netloc
-            api_url = f"{parsed.scheme}://{netloc}/api/records/{m.group('id')}"
+            api_url = f"{parsed.scheme}://{parsed.netloc}/api/records/{m.group('id')}"
     elif host in ("doi.org", "dx.doi.org"):
         m = ZENODO_DOI_RE.fullmatch(parsed.path)
         if m:
@@ -221,7 +483,10 @@ def resolve_download_url(url: str, year: int, *, timeout: float = 60.0) -> tuple
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            meta = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read(DEFAULT_MAX_METADATA_BYTES + 1)
+        if len(raw) > DEFAULT_MAX_METADATA_BYTES:
+            raise FetchError("Zenodo record metadata exceeds maximum allowed size")
+        meta = json.loads(raw.decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
         raise FetchError(f"Failed to query Zenodo record metadata at {api_url}: {exc}") from exc
 
@@ -239,9 +504,7 @@ def resolve_download_url(url: str, year: int, *, timeout: float = 60.0) -> tuple
     ]
     if not candidates:
         keys = [str(f.get("key", "")) for f in files if isinstance(f, dict)]
-        raise FetchError(
-            f"Zenodo record has no {target_prefix}* archive (found: {', '.join(keys)})"
-        )
+        raise FetchError(f"Zenodo record has no {target_prefix}* archive (found: {', '.join(keys)})")
     chosen = sorted(candidates, key=lambda f: str(f["key"]))[0]
     links = chosen.get("links") if isinstance(chosen.get("links"), dict) else {}
     file_url = links.get("self") or links.get("content")
@@ -255,46 +518,134 @@ def resolve_download_url(url: str, year: int, *, timeout: float = 60.0) -> tuple
     return file_url, expected_md5
 
 
-def download_file(url: str, dest: Path, *, timeout: float = 300.0) -> None:
+def download_file(
+    url: str,
+    dest: Path,
+    *,
+    timeout: float = 300.0,
+    max_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
+) -> int:
+    """Download ``url`` to ``dest`` while enforcing a hard streaming byte ceiling."""
     _check_url_scheme(url)
     req = urllib.request.Request(url, headers={"User-Agent": "wrfcomp-fetch-scoring-data/1"})
+    written = 0
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp, dest.open("wb") as fh:
-            shutil.copyfileobj(resp, fh, length=1024 * 1024)
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise FetchError(
+                        f"Download exceeded maximum allowed archive size ({max_bytes} bytes)"
+                    )
+                fh.write(chunk)
+    except FetchError:
+        dest.unlink(missing_ok=True)
+        raise
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        dest.unlink(missing_ok=True)
         raise FetchError(f"Download failed for {url}: {exc}") from exc
+    return written
 
 
-def _safe_extract_archive(archive_path: Path, staging_dir: Path) -> set[str]:
-    """Safely extract regular files from ``archive_path`` into ``staging_dir``."""
+def _safe_extract_archive(
+    archive_path: Path,
+    staging_dir: Path,
+    *,
+    max_members: int = DEFAULT_MAX_MEMBERS,
+    max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
+    max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+    max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
+    max_readme_bytes: int = DEFAULT_MAX_README_BYTES,
+    min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+) -> set[str]:
+    """Stream-extract regular files into ``staging_dir`` with strict size/count/disk limits."""
     extracted_files: set[str] = set()
+    staging_real = staging_dir.resolve(strict=True)
+    member_count = 0
+    total_written = 0
     try:
         with tarfile.open(archive_path, mode="r:*") as tf:
-            members = tf.getmembers()
-            for member in members:
+            for member in tf:
+                member_count += 1
+                if member_count > max_members:
+                    raise FetchError(
+                        f"Archive exceeds maximum allowed member count ({max_members})"
+                    )
                 if member.issym() or member.islnk() or member.isdev() or member.isfifo():
                     raise FetchError(f"Refusing non-regular tar member: {member.name!r}")
                 if not (member.isfile() or member.isdir()):
                     raise FetchError(f"Refusing unsupported tar member type: {member.name!r}")
                 clean_name = member.name.rstrip("/")
                 if not clean_name or clean_name == ".":
+                    tf.members = []
                     continue
                 rel = _validate_relpath(clean_name, f"archive member {member.name!r}")
+                rel_posix = rel.as_posix()
                 dest = (staging_dir / rel).resolve()
-                if not dest.is_relative_to(staging_dir.resolve()):
+                if not dest.is_relative_to(staging_real):
                     raise FetchError(f"Archive member escapes staging directory: {member.name!r}")
                 if member.isdir():
                     dest.mkdir(parents=True, exist_ok=True)
+                    tf.members = []
                     continue
-                if rel.as_posix() in extracted_files:
-                    raise FetchError(f"Duplicate archive member: {rel.as_posix()!r}")
+                if rel_posix in extracted_files:
+                    raise FetchError(f"Duplicate archive member: {rel_posix!r}")
+                if member.size < 0:
+                    raise FetchError(f"Negative member size in archive: {rel_posix!r}")
+
+                per_limit = max_member_bytes
+                if rel_posix == "MANIFEST.json":
+                    per_limit = min(per_limit, max_manifest_bytes)
+                elif rel_posix == "README.md":
+                    per_limit = min(per_limit, max_readme_bytes)
+                if member.size > per_limit:
+                    raise FetchError(
+                        f"Archive member {rel_posix!r} size {member.size} exceeds limit {per_limit}"
+                    )
+                if total_written + member.size > max_total_bytes:
+                    raise FetchError(
+                        f"Archive expanded size exceeds limit ({max_total_bytes} bytes)"
+                    )
+                free_bytes = shutil.disk_usage(staging_real).free
+                if free_bytes - member.size < min_free_bytes:
+                    raise FetchError(
+                        f"Insufficient staging disk space for {rel_posix!r} "
+                        f"({free_bytes} bytes free)"
+                    )
+
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 src = tf.extractfile(member)
                 if src is None:
                     raise FetchError(f"Cannot read archive member: {member.name!r}")
+                member_written = 0
                 with src, dest.open("wb") as out_fh:
-                    shutil.copyfileobj(src, out_fh, length=1024 * 1024)
-                extracted_files.add(rel.as_posix())
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        member_written += len(chunk)
+                        total_written += len(chunk)
+                        if member_written > per_limit:
+                            raise FetchError(
+                                f"Archive member {rel_posix!r} stream exceeded limit {per_limit}"
+                            )
+                        if total_written > max_total_bytes:
+                            raise FetchError(
+                                f"Archive expanded stream exceeded limit ({max_total_bytes} bytes)"
+                            )
+                        out_fh.write(chunk)
+                if member_written != member.size:
+                    raise FetchError(
+                        f"Truncated or mismatched stream for {rel_posix!r}: "
+                        f"wrote {member_written}, header {member.size}"
+                    )
+                extracted_files.add(rel_posix)
+                tf.members = []
+    except FetchError:
+        raise
     except (tarfile.TarError, OSError) as exc:
         raise FetchError(f"Failed to read archive {archive_path.name}: {exc}") from exc
     return extracted_files
@@ -307,20 +658,34 @@ def verify_staged_bundle(
     year: int,
     references_path: Path,
     cfg: HarnessConfig,
+    expected_manifest_bytes: bytes | None = None,
+    max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
+    max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
+    max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
 ) -> dict[str, Any]:
-    """Verify staged archive contents against ``MANIFEST.json`` AND ``REFERENCES.json``."""
+    """Verify staged archive contents against ``MANIFEST.json``, strict layout, and ``REFERENCES.json``."""
     manifest_path = staging_dir / "MANIFEST.json"
     if not manifest_path.is_file():
         raise FetchError("Archive is missing MANIFEST.json")
+    manifest_raw = _read_bounded_bytes(manifest_path, max_manifest_bytes, "MANIFEST.json")
+    if expected_manifest_bytes is not None and manifest_raw != expected_manifest_bytes:
+        raise FetchError("Archive MANIFEST.json does not match trusted --expected-manifest")
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
         raise FetchError(f"Cannot parse MANIFEST.json: {exc}") from exc
 
     if manifest.get("manifest_version") != MANIFEST_VERSION:
         raise FetchError(f"Unsupported manifest_version: {manifest.get('manifest_version')!r}")
     if manifest.get("year") != year:
         raise FetchError(f"Manifest year {manifest.get('year')!r} does not match requested year {year}")
+
+    actual_ref_sha = _sha256_file(references_path)
+    if manifest.get("references_sha256") != actual_ref_sha:
+        raise FetchError(
+            f"MANIFEST.json references_sha256 ({manifest.get('references_sha256')}) "
+            f"does not match {references_path.name} ({actual_ref_sha})"
+        )
 
     expected_periods, pins = expected_pins(references_path, year, cfg)
     if manifest.get("periods") != expected_periods:
@@ -352,10 +717,12 @@ def verify_staged_bundle(
             _validate_relpath(str(fpath), f"MANIFEST.json file under {relpath}")
             if fpath != relpath and not fpath.startswith(f"{relpath}/"):
                 raise FetchError(f"MANIFEST.json file {fpath!r} does not lie under {relpath!r}")
-            staged_file = staging_dir / fpath
-            if not staged_file.is_file():
-                raise FetchError(f"Missing file listed in MANIFEST.json: {fpath}")
-            actual_size = staged_file.stat().st_size
+            staged_file = _assert_tree_no_symlinks(
+                staging_dir, str(fpath), f"staged file {fpath}", must_exist=True
+            )
+            if not stat.S_ISREG(os.lstat(staged_file).st_mode):
+                raise FetchError(f"Missing regular file listed in MANIFEST.json: {fpath}")
+            actual_size = os.lstat(staged_file).st_size
             if actual_size != fmeta.get("size_bytes"):
                 raise FetchError(
                     f"Size mismatch for {fpath}: got {actual_size}, manifest has {fmeta.get('size_bytes')}"
@@ -366,7 +733,7 @@ def verify_staged_bundle(
                     f"Byte SHA-256 mismatch for {fpath}: got {actual_sha}, manifest has {fmeta.get('sha256')}"
                 )
             entry_total += actual_size
-            allowed_files.add(fpath)
+            allowed_files.add(str(fpath))
         if entry_total != entry.get("size_bytes"):
             raise FetchError(
                 f"Entry total size mismatch for {relpath}: sum={entry_total}, "
@@ -384,7 +751,8 @@ def verify_staged_bundle(
     if extra_in_manifest:
         raise FetchError(f"Archive contains unpinned artifacts: {extra_in_manifest}")
 
-    # Verify dataset-level content_sha256 against BOTH MANIFEST.json and REFERENCES.json
+    # Strictly validate physical Zarr v2 / NetCDF layout + chunk bounds BEFORE opening with xarray,
+    # then verify dataset content_sha256 against BOTH MANIFEST.json and REFERENCES.json.
     for relpath, (kind, ref_sha256) in sorted(pins.items()):
         entry = manifest_paths[relpath]
         if entry.get("kind") != kind:
@@ -394,9 +762,33 @@ def verify_staged_bundle(
                 f"MANIFEST.json content_sha256 disagrees with REFERENCES.json for {relpath}: "
                 f"manifest={entry.get('content_sha256')}, pinned={ref_sha256}"
             )
-        staged_target = staging_dir / relpath
-        with _open_dataset(staged_target, f"{kind} {relpath}") as ds:
+        staged_target = _assert_tree_no_symlinks(
+            staging_dir, relpath, f"staged {kind} {relpath}", must_exist=True
+        )
+        fmt = entry.get("format")
+        expected_var_dirs: set[str] | None = None
+        if fmt == "zarr":
+            expected_var_dirs = _validate_zarr_store(
+                staging_dir,
+                relpath,
+                max_chunk_bytes=max_chunk_bytes,
+                max_dataset_bytes=max_dataset_bytes,
+            )
+        elif fmt == "netcdf":
+            _validate_netcdf_header(staging_dir, relpath)
+        else:
+            raise FetchError(f"Unsupported format {fmt!r} for {relpath}")
+
+        with _open_dataset(staged_target, fmt, f"{kind} {relpath}") as ds:
+            _check_dataset_bounds(ds, relpath, max_dataset_bytes=max_dataset_bytes)
             _check_not_sealed(ds, kind, relpath, cfg)
+            if expected_var_dirs is not None:
+                ds_vars = {str(name) for name in ds.variables}
+                if ds_vars != expected_var_dirs:
+                    raise FetchError(
+                        f"{relpath}: Zarr directories {sorted(expected_var_dirs)} "
+                        f"do not match dataset variables {sorted(ds_vars)}"
+                    )
             actual_content = content_sha256(ds)
         if actual_content != ref_sha256:
             raise FetchError(
@@ -407,6 +799,22 @@ def verify_staged_bundle(
     return manifest
 
 
+def _mkdir_contained_no_symlinks(root: Path, rel_parent: Path, what: str) -> None:
+    """Create parent directories under ``root`` while refusing any symlinked ancestor."""
+    root_real = root.resolve(strict=True)
+    cur = root
+    for part in rel_parent.parts:
+        cur = cur / part
+        if os.path.lexists(cur):
+            st = os.lstat(cur)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                raise FetchError(f"{what}: unsafe non-directory/symlink ancestor {cur.relative_to(root)}")
+        else:
+            cur.mkdir(mode=0o755)
+        if not cur.resolve().is_relative_to(root_real):
+            raise FetchError(f"{what}: parent escapes destination root")
+
+
 def _publish_staged(
     staging_dir: Path,
     data_dir: Path,
@@ -414,21 +822,34 @@ def _publish_staged(
     *,
     overwrite: bool,
     cfg: HarnessConfig,
+    max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
+    max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
 ) -> list[str]:
     """Atomically install verified entries from ``staging_dir`` into ``data_dir``."""
-    # Pre-check every destination before modifying data_dir so failures leave data_dir untouched.
-    actions: list[tuple[str, str]] = []  # (relpath, "install" | "replace" | "keep")
+    actions: list[tuple[str, str]] = []
     for entry in entries:
         relpath = entry["path"]
-        dest = data_dir / relpath
-        if not dest.exists():
+        dest = _assert_tree_no_symlinks(
+            data_dir, relpath, f"destination {relpath}", must_exist=False
+        )
+        if not os.path.lexists(dest):
             actions.append((relpath, "install"))
             continue
         if overwrite:
             actions.append((relpath, "replace"))
             continue
-        # If target already exists, allow it only if it already has the exact pinned content hash.
-        with _open_dataset(dest, f"existing {relpath}") as ds:
+        fmt = entry["format"]
+        if fmt == "zarr":
+            _validate_zarr_store(
+                data_dir,
+                relpath,
+                max_chunk_bytes=max_chunk_bytes,
+                max_dataset_bytes=max_dataset_bytes,
+            )
+        else:
+            _validate_netcdf_header(data_dir, relpath)
+        with _open_dataset(dest, fmt, f"existing {relpath}") as ds:
+            _check_dataset_bounds(ds, relpath, max_dataset_bytes=max_dataset_bytes)
             _check_not_sealed(ds, entry["kind"], relpath, cfg)
             existing_hash = content_sha256(ds)
         if existing_hash != entry["content_sha256"]:
@@ -443,20 +864,27 @@ def _publish_staged(
     for relpath, action in actions:
         if action == "keep":
             continue
-        src = staging_dir / relpath
-        dest = data_dir / relpath
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        rel = _validate_relpath(relpath, f"install {relpath}")
+        if rel.parent != Path("."):
+            _mkdir_contained_no_symlinks(data_dir, rel.parent, f"destination {relpath}")
+        dest = _assert_tree_no_symlinks(
+            data_dir, relpath, f"destination {relpath}", must_exist=(action == "replace")
+        )
+        src = staging_dir / rel
         if action == "replace":
             backup = dest.parent / f".{dest.name}.old.{os.getpid()}"
-            if backup.exists():
-                shutil.rmtree(backup) if backup.is_dir() else backup.unlink()
+            if os.path.lexists(backup):
+                if stat.S_ISDIR(os.lstat(backup).st_mode):
+                    shutil.rmtree(backup)
+                else:
+                    backup.unlink()
             os.replace(dest, backup)
             try:
                 os.replace(src, dest)
             except Exception:
                 os.replace(backup, dest)
                 raise
-            if backup.is_dir():
+            if stat.S_ISDIR(os.lstat(backup).st_mode):
                 shutil.rmtree(backup)
             else:
                 backup.unlink()
@@ -464,6 +892,16 @@ def _publish_staged(
             os.replace(src, dest)
         installed.append(relpath)
     return installed
+
+
+def _parse_sha256_file(path: Path) -> str:
+    raw = _read_bounded_bytes(path, 4096, f"sha256 file {path.name}").decode("utf-8").strip()
+    if not raw:
+        raise FetchError(f"Empty sha256 file: {path.name}")
+    token = raw.splitlines()[0].split()[0].strip().lower()
+    if not SHA256_RE.fullmatch(token):
+        raise FetchError(f"Invalid SHA-256 digest in {path.name}: {token!r}")
+    return token
 
 
 def fetch_scoring_data(
@@ -475,18 +913,54 @@ def fetch_scoring_data(
     references_path: Path = DEFAULT_REFERENCES,
     config_path: Path = DEFAULT_CONFIG,
     expected_sha256: str | None = None,
+    expected_sha256_file: Path | None = None,
+    expected_manifest: Path | None = None,
+    allow_unverified_archive: bool = False,
     overwrite: bool = False,
     keep_archive: bool = False,
     timeout: float = 300.0,
+    max_archive_bytes: int = DEFAULT_MAX_ARCHIVE_BYTES,
+    max_members: int = DEFAULT_MAX_MEMBERS,
+    max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
+    max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+    max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
+    max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
+    max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
 ) -> dict[str, Any]:
     """Download (or open local), verify, and unpack a scoring data bundle into ``data_dir``."""
     if (url is None) == (archive is None):
         raise FetchError("Specify exactly one of --url or --archive")
 
+    resolved_sha256: str | None = None
+    if expected_sha256 is not None:
+        token = expected_sha256.strip().lower()
+        if not SHA256_RE.fullmatch(token):
+            raise FetchError(f"Invalid --expected-sha256 digest: {expected_sha256!r}")
+        resolved_sha256 = token
+    if expected_sha256_file is not None:
+        file_sha = _parse_sha256_file(expected_sha256_file)
+        if resolved_sha256 is not None and resolved_sha256 != file_sha:
+            raise FetchError("--expected-sha256 disagrees with --expected-sha256-file")
+        resolved_sha256 = file_sha
+
+    expected_manifest_bytes: bytes | None = None
+    if expected_manifest is not None:
+        expected_manifest_bytes = _read_bounded_bytes(
+            expected_manifest, max_manifest_bytes, f"expected manifest {expected_manifest.name}"
+        )
+
+    if resolved_sha256 is None and expected_manifest_bytes is None and not allow_unverified_archive:
+        raise FetchError(
+            "An independently trusted physical pin is required: pass --expected-sha256, "
+            "--expected-sha256-file, or --expected-manifest (or pass --allow-unverified-archive "
+            "to skip archive-level pinning)"
+        )
+
     cfg = load_config(config_path)
-    # Fail fast if the year is sealed or unpinned before downloading anything.
     expected_pins(references_path, year, cfg)
 
+    if os.path.lexists(data_dir) and stat.S_ISLNK(os.lstat(data_dir).st_mode):
+        raise FetchError("Destination --data-dir cannot be a symlink")
     data_dir = data_dir.resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -499,17 +973,23 @@ def fetch_scoring_data(
         if url is not None:
             file_url, expected_md5 = resolve_download_url(url, year, timeout=min(timeout, 60.0))
             archive_path = tmp_dir / f"wrfcomp-scoring-{year}.tar.gz"
-            download_file(file_url, archive_path, timeout=timeout)
+            download_file(file_url, archive_path, timeout=timeout, max_bytes=max_archive_bytes)
         else:
             assert archive is not None
+            if os.path.lexists(archive) and stat.S_ISLNK(os.lstat(archive).st_mode):
+                raise FetchError(f"Refusing symlinked --archive: {archive.name}")
             archive_path = archive.resolve()
             if not archive_path.is_file():
                 raise FetchError(f"Archive not found: {archive_path.name}")
+            if archive_path.stat().st_size > max_archive_bytes:
+                raise FetchError(
+                    f"Archive size exceeds maximum allowed ({max_archive_bytes} bytes)"
+                )
 
         archive_sha256 = _sha256_file(archive_path)
-        if expected_sha256 is not None and archive_sha256 != expected_sha256.strip().lower():
+        if resolved_sha256 is not None and archive_sha256 != resolved_sha256:
             raise FetchError(
-                f"Archive SHA-256 mismatch: got {archive_sha256}, expected {expected_sha256.strip().lower()}"
+                f"Archive SHA-256 mismatch: got {archive_sha256}, expected {resolved_sha256}"
             )
         if expected_md5 is not None:
             actual_md5 = _md5_file(archive_path)
@@ -519,13 +999,24 @@ def fetch_scoring_data(
                     f"got {actual_md5}, expected {expected_md5}"
                 )
 
-        extracted_files = _safe_extract_archive(archive_path, staging_dir)
+        extracted_files = _safe_extract_archive(
+            archive_path,
+            staging_dir,
+            max_members=max_members,
+            max_member_bytes=max_member_bytes,
+            max_total_bytes=max_total_bytes,
+            max_manifest_bytes=max_manifest_bytes,
+        )
         manifest = verify_staged_bundle(
             staging_dir,
             extracted_files,
             year=year,
             references_path=references_path,
             cfg=cfg,
+            expected_manifest_bytes=expected_manifest_bytes,
+            max_manifest_bytes=max_manifest_bytes,
+            max_chunk_bytes=max_chunk_bytes,
+            max_dataset_bytes=max_dataset_bytes,
         )
         installed = _publish_staged(
             staging_dir,
@@ -533,12 +1024,16 @@ def fetch_scoring_data(
             manifest["entries"],
             overwrite=overwrite,
             cfg=cfg,
+            max_chunk_bytes=max_chunk_bytes,
+            max_dataset_bytes=max_dataset_bytes,
         )
 
         if keep_archive and url is not None:
-            bundle_dir = data_dir / "bundle"
-            bundle_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(archive_path, bundle_dir / f"wrfcomp-scoring-{year}.tar.gz")
+            _mkdir_contained_no_symlinks(data_dir, Path("bundle"), "bundle archive copy")
+            bundle_dest = data_dir / "bundle" / f"wrfcomp-scoring-{year}.tar.gz"
+            if os.path.lexists(bundle_dest) and stat.S_ISLNK(os.lstat(bundle_dest).st_mode):
+                raise FetchError("Refusing symlinked destination for --keep-archive")
+            shutil.copy2(archive_path, bundle_dest)
 
     return {
         "archive_sha256": archive_sha256,
@@ -589,7 +1084,24 @@ def main(argv: list[str] | None = None) -> int:
         "--expected-sha256",
         type=str,
         default=None,
-        help="Optional expected SHA-256 hex digest of the downloaded archive.",
+        help="Trusted SHA-256 hex digest of the archive (required unless --expected-manifest is set).",
+    )
+    parser.add_argument(
+        "--expected-sha256-file",
+        type=Path,
+        default=None,
+        help="Path to a .sha256 sidecar file containing the trusted archive SHA-256.",
+    )
+    parser.add_argument(
+        "--expected-manifest",
+        type=Path,
+        default=None,
+        help="Path to an independently trusted MANIFEST.json sidecar that the archive must match.",
+    )
+    parser.add_argument(
+        "--allow-unverified-archive",
+        action="store_true",
+        help="Allow installing without --expected-sha256 or --expected-manifest (not recommended).",
     )
     parser.add_argument(
         "--overwrite",
@@ -612,6 +1124,9 @@ def main(argv: list[str] | None = None) -> int:
             references_path=args.references,
             config_path=args.config,
             expected_sha256=args.expected_sha256,
+            expected_sha256_file=args.expected_sha256_file,
+            expected_manifest=args.expected_manifest,
+            allow_unverified_archive=args.allow_unverified_archive,
             overwrite=args.overwrite,
             keep_archive=args.keep_archive,
         )

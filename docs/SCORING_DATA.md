@@ -20,20 +20,23 @@ data is ever included.**
 
 Set `WRFCOMP_DATA_DIR` if you want the data stored somewhere other than the default
 `~/wrfcomp-data/`, then run `scripts/fetch_scoring_data.py` with the Zenodo record URL (or direct
-archive URL) published for that year:
+archive URL) and the trusted archive SHA-256 (or `.sha256` / `.MANIFEST.json` sidecar) published
+for that year:
 
 ```bash
 uv run python -P scripts/fetch_scoring_data.py \
   --url <ZENODO_RECORD_URL> \
+  --expected-sha256 <ARCHIVE_SHA256> \
   --year 2024
 ```
 
-You can also pass `--expected-sha256 <SHA256>` to verify the archive before extraction, or
-`--archive <PATH>` to verify and unpack an archive you already downloaded:
+You can also pass `--expected-sha256-file <PATH>` or `--expected-manifest <PATH>` for the trusted
+physical pin, or `--archive <PATH>` to verify and unpack an archive you already downloaded:
 
 ```bash
 uv run python -P scripts/fetch_scoring_data.py \
   --archive wrfcomp-scoring-2024.tar.gz \
+  --expected-sha256 <ARCHIVE_SHA256> \
   --year 2024
 ```
 
@@ -42,16 +45,26 @@ uv run python -P scripts/fetch_scoring_data.py \
 Before anything is moved into your data directory, the script unpacks into a private staging
 directory and checks:
 
-1. **Archive safety:** rejects path traversal (`..`), absolute paths, symlinks, hardlinks, device
-   nodes, forbidden directories (such as `citizen/`), and any unmanifested extra files.
-2. **`MANIFEST.json` integrity:** checks every member file's exact byte size and byte SHA-256.
-3. **Repository pins (`experiments/REFERENCES.json`):** opens every NetCDF and Zarr dataset with
+1. **Physical archive pinning:** requires an independently trusted `--expected-sha256`,
+   `--expected-sha256-file`, or `--expected-manifest` by default, and checks `MANIFEST.json`'s
+   `references_sha256` against the repository's `experiments/REFERENCES.json`.
+2. **Bounded streaming download & extraction:** enforces download size, member count, per-member
+   size, manifest size, total expanded bytes, staging free space, and decoded Zarr chunk/dataset
+   size limits before hashing.
+3. **Archive & destination safety:** rejects POSIX and Windows path traversal (`..`, drive letters,
+   colons, backslashes, reserved device names), symlinks and hardlinks (at staging, source, and
+   final destination ancestors), special files, forbidden directories (such as `citizen/`), and any
+   unmanifested or unrelated files inside Zarr stores.
+4. **`MANIFEST.json` & strict Zarr layout:** verifies every member file's exact byte size and byte
+   SHA-256 and enforces strict Zarr v2 metadata/chunk-grid layout before opening with `xarray`.
+5. **Repository pins (`experiments/REFERENCES.json`):** opens every NetCDF and Zarr dataset with
    `xarray`, verifies that no timestamps reach the sealed split in `configs/splits.yaml`, and checks
    that the harness `content_sha256` matches **both** `MANIFEST.json` and
    `experiments/REFERENCES.json`.
-4. **Atomic install:** moves verified datasets into `$WRFCOMP_DATA_DIR` only after all checks pass.
-   Existing files that already match the pinned hash are left untouched; existing files with
-   different content are refused unless `--overwrite` is passed.
+6. **Atomic install:** moves verified datasets into `$WRFCOMP_DATA_DIR` only after all checks pass
+   and destination ancestors are confirmed symlink-free. Existing files that already match the
+   pinned hash are left untouched; existing files with different content are refused unless
+   `--overwrite` is passed.
 
 Once unpacked, you can run the locked promotion check immediately:
 
