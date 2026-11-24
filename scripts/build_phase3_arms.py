@@ -3,6 +3,10 @@
 Inputs under the data directory: ``candidates/gefs-station-corrected-v3/<year>-MM.zarr`` (arm A),
 ``truth/isd_conus_<year>.nc`` and ``citizen/conus/issue_extract_<year>.nc`` (from ``run_phase3_qc.py``).
 
+Everything is checked before anything is written: the extract must be complete and made under the
+current arrival policy, and the extract, the truth file and the v3 stores must all be on exactly the
+year's issue schedule and the stations of ``configs/stations_conus.csv``.
+
 Outputs: ``candidates/gefs-station-corrected-own/`` and ``candidates/gefs-station-corrected-citizen/``
 (one store a month), and under ``phase3/<year>/``: ``build.json`` (paths, content hashes, learned gains,
 counts) and ``covered_stations.csv`` with its sha256. Official station ids only; no citizen identifier
@@ -19,9 +23,13 @@ from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
-from wrfcomp.baselines.io import write
+from wrfcomp.assimilation import phase3_qc as p3
+from wrfcomp.assimilation.madis_archive import ARRIVAL_POLICY
+from wrfcomp.baselines.io import CONFIG, write
+from wrfcomp.harness.config import load_config
 from wrfcomp.harness.hashing import content_sha256
 from wrfcomp.models import citizen_arms as arms
 from wrfcomp.models import gefs_station_v2 as v2
@@ -29,32 +37,64 @@ from wrfcomp.models import gefs_station_v2 as v2
 A_DIR = "gefs-station-corrected-v3"
 
 
-def load_extract(path: Path):
+class BuildRefusedError(RuntimeError):
+    """An input is incomplete, stale, or not on the registered schedule or station list."""
+
+
+def registered_stations() -> list[str]:
+    path = CONFIG.parent / Path(load_config(CONFIG).evaluation.stations_file).name
+    return pd.read_csv(path, dtype=str, usecols=["station_id"])["station_id"].tolist()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_extract(path: Path, year: int, issues: np.ndarray, stations: list[str]):
+    if not path.is_file():
+        raise BuildRefusedError("there is no citizen extract for the year")
     with xr.open_dataset(path, engine="h5netcdf") as ds:
         ds = ds.load()
-    names = ds.attrs["variables"].split(",")
-    if tuple(names) != arms.VARIABLES or int(ds.attrs["window_minutes"]) != 15:
-        raise ValueError("extract does not match the registered rule")
+    a = ds.attrs
+    if a.get("format") != p3.EXTRACT_FORMAT or a.get("arrival_policy") != ARRIVAL_POLICY:
+        raise BuildRefusedError("the extract was not made under the current format and arrival policy")
+    if int(a.get("complete", 0)) != 1 or int(a.get("year", 0)) != year or not a.get("run_digest"):
+        raise BuildRefusedError("the extract is not marked as a complete QC run of this year")
+    if (
+        tuple(str(a.get("variables", "")).split(",")) != arms.VARIABLES
+        or int(a.get("window_minutes", 0)) != 15
+    ):
+        raise BuildRefusedError("the extract does not match the registered rule")
+    issue_time = ds.issue_time.values.astype(np.int64).astype("datetime64[s]").astype("datetime64[ns]")
+    if not np.array_equal(issue_time, np.asarray(issues, dtype="datetime64[ns]")):
+        raise BuildRefusedError("the extract is not on the year's issue schedule")
+    if ds.official_station_id.values.astype(str).tolist() != list(stations):
+        raise BuildRefusedError("the extract was not made for the registered official stations")
     n = ds.sizes["station"]
     order = np.argsort(ds.row_issue.values, kind="stable")
     issue = ds.row_issue.values[order]
     bounds = np.searchsorted(issue, np.arange(ds.sizes["issue"] + 1))
-    columns = {k: ds[k].values[order] for k in ("row_station", "row_var", "row_value", "row_weight")}
-    issue_time = ds.issue_time.values.astype(np.int64).astype("datetime64[s]").astype("datetime64[ns]")
+    names = ("row_station", "row_var", "row_value", "row_weight", "row_age_s")
+    columns = {k: ds[k].values[order] for k in names}
 
     def snapshot(i: int) -> dict:
         rows = slice(bounds[i], bounds[i + 1])
         out = {}
         for v, var in enumerate(arms.VARIABLES):
-            value, weight = np.full(n, np.nan), np.zeros(n)
+            value, weight, age = np.full(n, np.nan), np.zeros(n), np.zeros(n)
             pick = columns["row_var"][rows] == v
             station = columns["row_station"][rows][pick]
             value[station] = columns["row_value"][rows][pick]
             weight[station] = columns["row_weight"][rows][pick]
-            out[var] = (value, weight)
+            age[station] = columns["row_age_s"][rows][pick]
+            out[var] = (value, weight, age)
         return out
 
-    return ds, issue_time, snapshot
+    return ds, snapshot
 
 
 def publish(parts, directory: Path, period: str) -> dict:
@@ -76,16 +116,28 @@ def publish(parts, directory: Path, period: str) -> dict:
         }
 
 
-def build(data: Path, year: int) -> dict:
+def build(data: Path, year: int, *, issues=None, stations=None) -> dict:
+    """``issues`` and ``stations`` default to the registered schedule and stations; tests pass their own."""
     start, _ = v2.year_bounds(year)
-    extract, issue_time, snapshot = load_extract(data / "citizen" / "conus" / f"issue_extract_{year}.nc")
+    start = np.datetime64(start, "ns")
+    issues = p3.issue_times(year) if issues is None else np.asarray(issues, dtype="datetime64[ns]")
+    stations = registered_stations() if stations is None else list(stations)
+    extract_path = data / "citizen" / "conus" / f"issue_extract_{year}.nc"
+    extract, snapshot = load_extract(extract_path, year, issues, stations)
     months = sorted((data / "candidates" / A_DIR).glob(f"{year}-??.zarr"))
-    if not months:
-        raise ValueError("no v3 stores for the year")
+    seen = []
+    for path in months:
+        with xr.open_zarr(path, chunks=None) as source:
+            if source.station_id.values.astype(str).tolist() != stations:
+                raise BuildRefusedError(f"v3 store {path.stem} is not on the registered stations")
+            seen.append(source.init_time.values.astype("datetime64[ns]"))
+    if not seen or not np.array_equal(np.concatenate(seen), issues):
+        raise BuildRefusedError("the v3 stores are not exactly the year's issue schedule")
     with xr.open_dataset(data / "truth" / f"isd_conus_{year}.nc") as archive:
-        truth = archive.sel(
-            valid_time=slice(np.datetime64(start, "ns"), None)
-        ).load()  # nothing from before 1 January
+        # No label before 1 January; a reading measured before it is refused where it is read.
+        truth = archive.sel(valid_time=slice(start, None)).load()
+    if truth.station_id.values.astype(str).tolist() != stations:
+        raise BuildRefusedError("the truth file is not on the registered stations")
     pairs = arms.neighbour_pairs(
         extract.lat.values,
         extract.lon.values,
@@ -94,9 +146,20 @@ def build(data: Path, year: int) -> dict:
         truth.longitude.values,
         truth.elevation_m.values,
     )
-    replay = arms.Replay(year, truth, pairs, flagged=extract.ever_copycat.values)
-    out = {"year": year, "arm_a": [], "arm_b": [], "arm_c": [], "issues": []}
-    n_issues = 0
+    replay = arms.Replay(
+        year, truth, pairs, flagged=extract.ever_copycat.values, token=extract.station_token.values
+    )
+    out = {
+        "year": year,
+        "extract_sha256": sha256_file(extract_path),
+        "extract_run_digest": str(extract.attrs["run_digest"]),
+        "arrival_policy": ARRIVAL_POLICY,
+        "arm_a": [],
+        "arm_b": [],
+        "arm_c": [],
+        "issues": [],
+    }
+    i = 0
     for path in months:
         with xr.open_zarr(path, chunks=None) as source:
             a_month = source.load()
@@ -105,14 +168,11 @@ def build(data: Path, year: int) -> dict:
         )
         parts_b, parts_c = [], []
         for t in a_month.init_time.values:
-            i = int(np.searchsorted(issue_time, t))
-            if i >= len(issue_time) or issue_time[i] != t:
-                raise ValueError("an issue of the v3 store is not in the citizen extract schedule")
             b, c, diag = replay.issue(a_month.sel(init_time=[t]), snapshot(i))
             parts_b.append(b)
             parts_c.append(c)
             out["issues"].append(asdict(diag))
-            n_issues += 1
+            i += 1
         out["arm_b"].append(publish(parts_b, data / "candidates" / arms.MODEL_OWN, path.stem))
         out["arm_c"].append(publish(parts_c, data / "candidates" / arms.MODEL_CITIZEN, path.stem))
         print(
@@ -125,9 +185,7 @@ def build(data: Path, year: int) -> dict:
             ),
             flush=True,
         )
-    if n_issues != len(issue_time):
-        raise ValueError("the v3 stores do not cover the year's schedule")
-    covered = arms.covered_stations(truth.station_id.values, replay.citizen_defined_count, n_issues)
+    covered = arms.covered_stations(truth.station_id.values, replay.citizen_defined_count, len(issues))
     folder = data / "phase3" / f"{year}"
     folder.mkdir(parents=True, exist_ok=True)
     text = "station_id\n" + "".join(f"{s}\n" for s in covered)
@@ -135,8 +193,10 @@ def build(data: Path, year: int) -> dict:
     total = sum(d["weight_total"].get("t2m", 0.0) for d in out["issues"])
     flagged = sum(d["weight_flagged"].get("t2m", 0.0) for d in out["issues"])
     out.update(
-        n_issues=n_issues,
-        citizen_stations=int(extract.sizes["station"]),
+        n_issues=len(issues),
+        official_stations=len(stations),
+        citizen_station_rows=int(extract.sizes["station"]),
+        citizen_tokens=int(len(set(extract.station_token.values.tolist()))),
         neighbour_pairs=int(pairs.citizen.size),
         covered_count=len(covered),
         covered_sha256=hashlib.sha256(text.encode()).hexdigest(),
@@ -147,7 +207,9 @@ def build(data: Path, year: int) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--year", type=int, default=2024, choices=(2024,))
     parser.add_argument(
         "--data-dir",
@@ -156,21 +218,11 @@ def main() -> None:
     )
     args = parser.parse_args()
     out = build(args.data_dir.resolve(), args.year)
-    print(
-        json.dumps(
-            {
-                k: out[k]
-                for k in (
-                    "n_issues",
-                    "citizen_stations",
-                    "neighbour_pairs",
-                    "covered_count",
-                    "covered_sha256",
-                    "copycat_weight_share_t2m",
-                )
-            }
-        )
-    )
+    keys = (
+        "n_issues", "official_stations", "citizen_station_rows", "citizen_tokens", "neighbour_pairs",
+        "covered_count", "covered_sha256", "copycat_weight_share_t2m", "extract_sha256",
+    )  # fmt: skip
+    print(json.dumps({k: out[k] for k in keys}))
 
 
 if __name__ == "__main__":

@@ -113,7 +113,9 @@ class Diagnostics:
 class Replay:
     """One ordered same-year replay of both arms."""
 
-    def __init__(self, year: int, truth: xr.Dataset, pairs: Pairs, flagged=None):
+    def __init__(self, year: int, truth: xr.Dataset, pairs: Pairs, flagged=None, token=None):
+        """``token``: one label per citizen station row. Rows that share a label are one physical
+        station stored at several positions; they count once (see ``_one_per_token``)."""
         self.year = year
         self.start, self.end = v2.year_bounds(year)
         if truth.valid_time.values.min() < self.start:
@@ -121,6 +123,7 @@ class Replay:
         self.truth = truth
         self.pairs = pairs
         self.flagged = np.zeros(0, bool) if flagged is None else np.asarray(flagged, dtype=bool)
+        self.token = None if token is None else np.unique(np.asarray(token), return_inverse=True)[1]
         self.pair_weight = np.exp(-np.square(pairs.distance_km / DISTANCE_SCALE_KM) / 2)
         order = np.argsort(pairs.official, kind="stable")
         self.by_official = (
@@ -139,9 +142,24 @@ class Replay:
         slot = self.truth.sel(valid_time=t)
         value = slot[var].values.astype(np.float64)
         offset = slot[var + "_offset_min"].values.astype(np.float64)
-        return np.where(np.isfinite(value) & (offset >= -MAX_OFFSET_MIN) & (offset <= 0), value, np.nan)
+        ok = np.isfinite(value) & (offset >= -MAX_OFFSET_MIN) & (offset <= 0)
+        # Year isolation on the measurement time: a 00Z label on 1 January with a negative offset
+        # was measured in the previous year.
+        ok &= offset >= (self.start - t) / MINUTE
+        return np.where(ok, value, np.nan)
 
-    def _neighbourhood(self, var, t, reading, value, weight, diag):
+    def _one_per_token(self, use, age, weights):
+        """Of several rows of one token, keep the one with the newest report (then the larger
+        weight, then the lower row). A station counts once towards the three-station minimum and
+        once in the median, whatever positions it is stored at."""
+        if self.token is None or use.size < 2:
+            return np.arange(use.size)
+        token = self.token[self.pairs.citizen[use]]
+        order = np.lexsort((np.arange(use.size), -weights, age[self.pairs.citizen[use]], token))
+        first = np.r_[True, token[order][1:] != token[order][:-1]]
+        return np.sort(order[first])
+
+    def _neighbourhood(self, var, t, reading, value, weight, age, diag):
         """Rules 3 to 7 for every official station: the neighbourhood value and the pair differences."""
         p = self.pairs
         size = self.truth.sizes["station_id"]
@@ -170,9 +188,11 @@ class Replay:
         total = flagged = 0.0
         for rows in self.by_official:
             use = rows[np.isfinite(departure[rows])]
+            weights = w[use] * self.pair_weight[use]
+            keep = self._one_per_token(use, age, weights)
+            use, weights = use[keep], weights[keep]
             if use.size < MIN_NEIGHBOURS or np.unique(p.cell[use]).size < MIN_CELLS:
                 continue
-            weights = w[use] * self.pair_weight[use]
             result[p.official[use[0]]] = weighted_lower_median(departure[use], weights)
             total += float(weights.sum())
             if self.flagged.size:
@@ -211,9 +231,9 @@ class Replay:
     # -- one issue ---------------------------------------------------------------------------
 
     def issue(self, a: xr.Dataset, snapshot: dict):
-        """``a`` is one v3 issue. ``snapshot[var]`` is (value, weight) per citizen station at this issue:
-        the latest report measured in the 15 minutes up to the issue time and its final QC weight
-        (NaN and 0 when there is none). Returns (B, C, diagnostics)."""
+        """``a`` is one v3 issue. ``snapshot[var]`` is (value, weight) or (value, weight, age in
+        seconds) per citizen station row at this issue: the latest positive-weight report measured in
+        the 15 minutes up to the issue time (NaN and 0 when there is none). Returns (B, C, diagnostics)."""
         if (
             a.sizes["init_time"] != 1
             or a.attrs.get("model_id") != "gefs-station-corrected"
@@ -248,10 +268,10 @@ class Replay:
             mean = members.mean(axis=-1)
             reading = self._reading(var, t)
             own = reading - previous.mean_own_lead[var] if previous is not None else np.full(size, np.nan)
-            value, weight = snapshot[var]
-            citizen, difference = self._neighbourhood(
-                var, t, reading, np.asarray(value, float), np.asarray(weight, float), diag
-            )
+            value, weight, *rest = snapshot[var]
+            value, weight = np.asarray(value, float), np.asarray(weight, float)
+            age = np.asarray(rest[0], float) if rest else np.zeros(len(value))
+            citizen, difference = self._neighbourhood(var, t, reading, value, weight, age, diag)
             out_b, out_c = members.copy(), members.copy()
             mean_b = np.empty((len(LEAD_HOURS), size))
             diag.phi[var], diag.gamma[var] = [], []

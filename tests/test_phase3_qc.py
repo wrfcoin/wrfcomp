@@ -239,50 +239,239 @@ def test_reports_after_the_issue_time_change_nothing_at_or_before_it(world):
                     np.testing.assert_array_equal(a, b)
 
 
-def test_issue_snapshot_takes_the_latest_report_of_the_last_15_minutes_only():
+def _channel(seconds_before, values, weights, issue):
+    when = (issue + np.array(seconds_before) * S).astype("datetime64[ns]")
+    n = len(when)
+    return p3.ChannelResult(
+        when,
+        np.array(values, float),
+        np.array(weights, float),
+        np.ones(n, bool),
+        np.zeros(n, bool),
+        np.zeros(n, bool),
+    )
+
+
+def test_issue_snapshot_takes_the_latest_positive_weight_report_of_the_last_15_minutes():
+    """Review case (rule 3): a zero-weight report does not suppress an earlier eligible one."""
     issue = START + 12 * H
-    when = issue + np.array([-40 * 60, -16 * 60, -15 * 60, -4 * 60, 1]) * S
-    result = p3.ChannelResult(
-        when.astype("datetime64[ns]"),
-        np.array([1.0, 2, 3, 4, 5]),
-        np.array([0.5, 0.4, 0.3, 0.0, 0.9]),
-        np.ones(5, bool),
-        np.array([False, False, False, True, False]),
-        np.zeros(5, bool),
+    result = _channel(
+        [-40 * 60, -16 * 60, -15 * 60, -4 * 60, 1], [1, 2, 3, 4, 5], [0.5, 0.4, 0.3, 0.0, 0.9], issue
     )
-    has, value, weight, earned = p3.issue_snapshot(result, [issue])
-    assert has[0] and value[0] == 4 and weight[0] == 0 and earned[0]  # a later zero-weight report supersedes
-    shorter = p3.ChannelResult(
-        *(getattr(result, f)[:3] for f in ("when", "values", "weights", "scored", "earned", "copycat"))
-    )
-    has, value, weight, _ = p3.issue_snapshot(shorter, [issue, issue + M])
-    assert has[0] and value[0] == 3 and weight[0] == 0.3  # exactly 15 minutes old counts
-    assert not has[1] and np.isnan(value[1]) and weight[1] == 0  # 16 minutes old does not
-    assert not p3.issue_snapshot(shorter, [when[0].astype("datetime64[ns]") - S])[0][0]
+    has, value, weight, _, age = p3.issue_snapshot(result, [issue])
+    assert (
+        has[0] and value[0] == 3 and weight[0] == 0.3 and age[0] == 900
+    )  # the 4-minute-old report has weight 0
+    has, value, *_ = p3.issue_snapshot(result, [issue + M])
+    assert has[0] and value[0] == 5  # the report measured one second after T counts later, never at T
+    earlier = _channel([-40 * 60, -16 * 60, -15 * 60, -4 * 60], [1, 2, 3, 4], [0.5, 0.4, 0.3, 0.0], issue)
+    has, value, weight, _, _ = p3.issue_snapshot(earlier, [issue + M])
+    assert not has[0] and np.isnan(value[0]) and weight[0] == 0  # 16 minutes old does not count
+    only_zero = _channel([-300, -100], [1, 2], [0.0, 0.0], issue)
+    assert not p3.issue_snapshot(only_zero, [issue])[0][0]
+    newest = _channel([-600, -100], [1, 2], [0.4, 0.2], issue)
+    assert p3.issue_snapshot(newest, [issue])[1][0] == 2  # of two eligible reports, the later one
 
 
-def test_a_report_that_had_not_arrived_by_the_next_issue_time_is_never_used():
-    noon = int(np.datetime64("2024-03-02T12:00:00", "s").astype(np.int64))
-    #            measured            delay   kept?
-    cases = [
-        (noon - 600, 300, True),  # measured 11:50, arrived 11:55
-        (noon - 600, 600, True),  # arrived exactly at the issue time
-        (noon - 600, 601, False),  # arrived one second after it
-        (noon, 0, True),  # measured and arrived at the issue time
-        (noon, 1, False),
-        (noon + 1, 700, True),  # after the issue: the next one is twelve hours away
-        (noon - 3600, -1, False),  # no arrival time
-        (noon - 3600, p3.UNKNOWN_DELAY_S, False),  # saturated delay
-        (noon + 12 * 3600 - 5, 4, True),  # just before midnight, arrived before it
-        (noon + 12 * 3600 - 5, 6, False),
-    ]
-    measured, delay, expected = (np.array(c) for c in zip(*cases, strict=True))
-    kept = p3.arrived_by_next_issue(measured.astype("datetime64[s]"), delay.astype(np.int16))
-    np.testing.assert_array_equal(kept, expected.astype(bool))
-    # Whatever is kept and measured at or before an issue time had arrived by that issue time.
-    rng = np.random.default_rng(8)
-    m = noon + rng.integers(-40 * 3600, 40 * 3600, 20000)
-    d = rng.integers(-1, 1500, 20000)
-    k = p3.arrived_by_next_issue(m, d)
-    for issue in noon + np.arange(-3, 4) * 12 * 3600:
-        assert np.all((m + d)[k & (m <= issue)] <= issue)
+def test_official_readings_measured_before_the_year_are_removed():
+    """Review case: a 00Z label on 1 January with a negative offset was measured the year before."""
+    start = np.datetime64("2024-01-01T00", "ns")
+    labels = np.arange(start - 2 * H, start + 3 * H, H)
+    truth = xr.Dataset(coords={"valid_time": labels, "station_id": ["00000000001", "00000000002"]})
+    for var in ("t2m", "td2m"):
+        truth[var] = (("valid_time", "station_id"), np.full((5, 2), 280.0, dtype="f4"))
+        truth[var + "_offset_min"] = (("valid_time", "station_id"), np.array([[-7, 0]] * 5, dtype=np.int16))
+    truth["t2m_offset_min"].values[3, 0] = 7
+    out = p3.within_year(truth, start)
+    assert out.valid_time.values[0] == start and out.sizes["valid_time"] == 3
+    np.testing.assert_array_equal(np.isfinite(out.t2m.values), [[False, True], [True, True], [True, True]])
+    np.testing.assert_array_equal(np.isfinite(out.td2m.values), [[False, True], [True, True], [True, True]])
+    assert np.isfinite(truth.t2m.values).all()  # the input is not changed
+
+
+# ----------------------------------------------------------------------------- incomplete or stale products
+
+
+def _script():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "run_phase3_qc", Path(__file__).parents[1] / "scripts/run_phase3_qc.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _day_table(day, n=4):
+    from wrfcomp.assimilation.madis_archive import ReportTable
+
+    base = np.datetime64(day + "T06:00:00", "s")
+    return ReportTable(
+        station_id=np.array([f"CW{i:09d}" for i in range(n)]),
+        obs_time=base + np.arange(n) * 60,
+        lat=np.float32([40.0, 40.1, 41.2, 40.0][:n]),
+        lon=np.float32([-100.0, -99.9, -101.3, -100.0][:n]),
+        elevation_m=np.full(n, 500, dtype=np.float32),
+        t2m=np.full(n, 280, dtype=np.float32),
+        td2m=np.full(n, 275, dtype=np.float32),
+        wind_speed=np.full(n, 2, dtype=np.float32),
+        wind_dir=np.full(n, 90, dtype=np.float32),
+        received_delay_s=np.full(n, 300, dtype=np.int32),
+    )
+
+
+def _year_dir(tmp_path, script, monkeypatch, days=("2024-01-01", "2024-01-02", "2024-02-01")):
+    from wrfcomp.assimilation.madis_archive import save_table
+
+    monkeypatch.setattr(script, "expected_days", lambda year: list(days))
+    citizen = tmp_path / "citizen"
+    for day in days:
+        attrs = {"day": day, "hours_requested": 24, "hours_missing": "07" if day.endswith("02") else ""}
+        save_table(_day_table(day), citizen / "conus" / "2024" / f"{day}.nc", attrs=attrs)
+    return citizen
+
+
+def test_partition_needs_every_day_and_records_missing_source_hours(tmp_path, monkeypatch):
+    script = _script()
+    citizen = _year_dir(tmp_path, script, monkeypatch)
+    (citizen / "conus" / "2024" / "2024-01-02.nc").rename(tmp_path / "aside.nc")
+    with pytest.raises(script.IncompleteError, match="1 of 3 day files are missing"):
+        script.partition(citizen, 2024)
+    assert not (citizen / "conus" / "2024-tiles").exists()
+    (tmp_path / "aside.nc").rename(citizen / "conus" / "2024" / "2024-01-02.nc")
+    manifest = script.partition(citizen, 2024)
+    assert manifest["days"] == 3 and manifest["reports"] == 12 and len(manifest["tiles"]) == 2
+    assert manifest["missing_source_hours"] == {"2024-01-02": ["07"]}  # a fact about the archive, kept
+    assert script.partition(citizen, 2024)["digest"] == manifest["digest"]  # same inputs: accepted as done
+
+
+def test_partition_refuses_tiles_made_from_other_files_and_stale_day_files(tmp_path, monkeypatch):
+    from wrfcomp.assimilation.madis_archive import StaleTableError, save_table
+
+    script = _script()
+    citizen = _year_dir(tmp_path, script, monkeypatch)
+    script.partition(citizen, 2024)
+    day = citizen / "conus" / "2024" / "2024-02-01.nc"
+    save_table(_day_table("2024-02-01", n=3), day, attrs={"day": "2024-02-01", "hours_missing": ""})
+    with pytest.raises(script.IncompleteError, match="other daily files"):
+        script.partition(citizen, 2024)
+    # A day file written before the amendment (no arrival policy) is refused.
+    import shutil
+
+    shutil.rmtree(citizen / "conus" / "2024-tiles")
+    with xr.open_dataset(day, engine="h5netcdf", decode_times=False) as ds:
+        old = ds.load()
+    del old.attrs["arrival_policy"]
+    day.unlink()
+    old.to_netcdf(day, engine="h5netcdf")
+    with pytest.raises(StaleTableError):
+        script.partition(citizen, 2024)
+    assert not (citizen / "conus" / "2024-tiles").exists()
+
+
+def _fake_run(tmp_path, script, monkeypatch, tiles):
+    citizen = _year_dir(tmp_path, script, monkeypatch)
+    manifest = script.partition(citizen, 2024)
+    truth = xr.Dataset(
+        coords={"valid_time": [np.datetime64("2024-01-01", "ns")], "station_id": ["00000000001"]}
+    )
+    (tmp_path / "truth").mkdir()
+    truth.to_netcdf(tmp_path / "truth" / "isd_conus_2024.nc")
+    (tmp_path / "baselines" / "gefs").mkdir(parents=True)
+    record = script.run_inputs(tmp_path, 2024, manifest)
+    out = citizen / "conus" / "2024-qc"
+    out.mkdir()
+    (out / "run.json").write_text(__import__("json").dumps(record))
+    rows = {
+        "station": [0],
+        "issue": [3],
+        "var": [0],
+        "value": [280.0],
+        "weight": [0.4],
+        "earned": [False],
+        "age_s": [60],
+    }
+    for name in tiles:
+        script.write_tile_output(
+            out / f"{name}.npz",
+            record["digest"],
+            ["CW000000000"],
+            [40.0],
+            [-100.0],
+            [500.0],
+            [[9, 9, 4, 4, 0, 0]],
+            rows,
+        )
+    return manifest, record, out
+
+
+def test_merge_refuses_a_partial_run_and_a_run_from_other_inputs(tmp_path, monkeypatch):
+    script = _script()
+    manifest, record, out = _fake_run(tmp_path, script, monkeypatch, tiles=())
+    first, second = manifest["tiles"]
+    rows = {
+        "station": [0],
+        "issue": [3],
+        "var": [0],
+        "value": [280.0],
+        "weight": [0.4],
+        "earned": [False],
+        "age_s": [60],
+    }
+    args = (["CW000000000"], [40.0], [-100.0], [500.0], [[9, 9, 4, 4, 0, 0]], rows)
+    script.write_tile_output(out / f"{first}.npz", record["digest"], *args)
+    with pytest.raises(script.IncompleteError, match="1 of 2 tiles have no QC output"):
+        script.merge(tmp_path, 2024)  # a run on a subset of tiles cannot become an extract
+    script.write_tile_output(out / f"{second}.npz", "made-from-something-else", *args)
+    with pytest.raises(script.IncompleteError, match="other inputs"):
+        script.merge(tmp_path, 2024)
+    script.write_tile_output(out / f"{second}.npz", record["digest"], *args)
+    summary = script.merge(tmp_path, 2024)
+    assert (
+        summary["stations_weighted"] == 2
+        and summary["issue_rows"] == 2
+        and summary["missing_source_hours"] == 1
+    )
+    with xr.open_dataset(tmp_path / "citizen" / "conus" / "issue_extract_2024.nc", engine="h5netcdf") as ds:
+        assert ds.attrs["complete"] == 1 and ds.attrs["run_digest"] == record["digest"]
+        assert ds.sizes["issue"] == 704 and ds.official_station_id.values.astype(str).tolist() == [
+            "00000000001"
+        ]
+    # The truth file changes after the run: what is on disk no longer describes the outputs.
+    xr.Dataset(
+        coords={"valid_time": [np.datetime64("2024-01-02", "ns")], "station_id": ["00000000001"]}
+    ).to_netcdf(tmp_path / "truth" / "isd_conus_2024.nc")
+    with pytest.raises(script.IncompleteError, match="other inputs or code"):
+        script.merge(tmp_path, 2024)
+
+
+def test_a_timing_run_has_its_own_folder_and_merge_never_reads_it(tmp_path, monkeypatch):
+    script = _script()
+    manifest, record, out = _fake_run(tmp_path, script, monkeypatch, tiles=())
+    timing = out.with_name("2024-qc.timing")
+    out.rename(timing)
+    rows = {
+        "station": [0],
+        "issue": [3],
+        "var": [0],
+        "value": [280.0],
+        "weight": [0.4],
+        "earned": [False],
+        "age_s": [60],
+    }
+    for name in manifest["tiles"]:
+        script.write_tile_output(
+            timing / f"{name}.npz",
+            record["digest"],
+            ["CW000000000"],
+            [40.0],
+            [-100.0],
+            [500.0],
+            [[9, 9, 4, 4, 0, 0]],
+            rows,
+        )
+    with pytest.raises(script.IncompleteError, match="no manifest"):
+        script.merge(tmp_path, 2024)
+    assert not (tmp_path / "citizen" / "conus" / "issue_extract_2024.nc").exists()

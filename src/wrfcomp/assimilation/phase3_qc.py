@@ -36,12 +36,19 @@ from .qc import (
 )
 from .trust import StationState, advance_state, suspected_copy, veto_recent_copy
 
-ISSUE_STEP_S = 12 * 3600  # issue times are 00Z and 12Z
-UNKNOWN_DELAY_S = 32767  # the stored delay saturates here; such a report is treated as never arrived
 THERMAL = ("t2m", "td2m")
+YEAR_END = {2024: "2024-12-17T12"}  # the last issue of each year that may be built
+EXTRACT_FORMAT = "phase3-extract.v2"
 WIND = ("u10", "v10", "wind_speed")
 HALF_HOUR_NS = 1_800_000_000_000
 _TRIAL_PATH = Path(__file__).resolve().parents[3] / "scripts" / "run_qc_trial.py"
+
+
+def issue_times(year: int) -> np.ndarray:
+    """The 00Z and 12Z issue times of the year's schedule."""
+    from wrfcomp.harness.metrics import evaluation_init_times
+
+    return evaluation_init_times(np.datetime64(f"{year}-01-01T00"), np.datetime64(YEAR_END[year]), [0, 12])
 
 
 def load_trial_module(origin: np.datetime64):
@@ -57,19 +64,6 @@ def load_trial_module(origin: np.datetime64):
     spec.loader.exec_module(module)
     module.START = np.datetime64(origin, "ns")
     return module
-
-
-def arrived_by_next_issue(obs_time_s, received_delay_s) -> np.ndarray:
-    """Amendment 1 of the design: which reports may be used at all.
-
-    A report is kept only if it had arrived by the first issue time (00Z or 12Z) at or after its
-    measurement. A report with no arrival time, or a saturated delay, is not kept. Everything the QC
-    and the forecast read at an issue time T was then both measured and received at or before T.
-    """
-    measured = np.asarray(obs_time_s).astype("datetime64[s]").astype(np.int64)
-    delay = np.asarray(received_delay_s).astype(np.int64)
-    next_issue = -(-measured // ISSUE_STEP_S) * ISSUE_STEP_S
-    return (delay >= 0) & (delay < UNKNOWN_DELAY_S) & (measured + delay <= next_issue)
 
 
 # ----------------------------------------------------------------------------- forecasts
@@ -193,6 +187,26 @@ class Official:
     lon: np.ndarray
     height: np.ndarray
     series: dict  # variable -> list over stations of (measured, value, z)
+
+
+def within_year(truth: xr.Dataset, start, variables=("t2m", "td2m", "u10", "v10", "msl")) -> xr.Dataset:
+    """Official truth for one year's state: no label before ``start`` and no reading measured before it.
+
+    A label at 00Z on 1 January with a negative offset was measured in the previous year. Its value
+    is removed, so it cannot enter January state.
+    """
+    start = np.datetime64(start, "ns")
+    out = truth.sel(valid_time=slice(start, None)).copy(deep=True)
+    labels = out.valid_time.values.astype("datetime64[ns]")
+    for var in variables:
+        if var not in out:
+            continue
+        offset = out[var + "_offset_min"].values.astype(np.int64)
+        measured = labels[:, None].astype(np.int64) + offset * 60 * 10**9
+        early = measured < start.astype(np.int64)
+        values = out[var].values
+        values[early] = np.nan
+    return out
 
 
 def official_from_truth(truth: xr.Dataset, forecasts: ForecastArchive, trial) -> Official:
@@ -419,20 +433,34 @@ def station_weights(
 
 
 def issue_snapshot(result: ChannelResult, issues: np.ndarray, window_minutes: int = 15):
-    """For each issue time: the latest report measured in [T - window, T], or nothing.
+    """Rule 3 of the design, for each issue time T: the latest report measured in [T - window, T]
+    whose final QC weight is above zero, or nothing.
 
-    Returns (has_report, value, weight, earned). A report after T is never read.
+    A report with weight zero is not a report that counts, so it does not hide an earlier one that
+    does. A report after T is never read. Returns (has_report, value, weight, earned, age_seconds).
     """
     issues = np.asarray(issues, dtype="datetime64[ns]")
-    ix = np.searchsorted(result.when, issues, side="right") - 1
+    usable = np.flatnonzero(result.weights > 0)
+    when = result.when[usable]
+    ix = np.searchsorted(when, issues, side="right") - 1
     ok = ix >= 0
     safe = np.where(ok, ix, 0)
-    age_ns = (issues - result.when[safe]).astype(np.int64)
+    if not usable.size:
+        none = np.zeros(len(issues), dtype=bool)
+        return (
+            none,
+            np.full(len(issues), np.nan),
+            np.zeros(len(issues)),
+            none.copy(),
+            np.zeros(len(issues), np.int64),
+        )
+    age_ns = (issues - when[safe]).astype(np.int64)
     ok &= (age_ns >= 0) & (age_ns <= window_minutes * 60 * 10**9)
-    safe = np.where(ok, ix, 0)
+    row = usable[np.where(ok, ix, 0)]
     return (
         ok,
-        np.where(ok, result.values[safe], np.nan),
-        np.where(ok, result.weights[safe], 0.0),
-        np.where(ok, result.earned[safe], False),
+        np.where(ok, result.values[row], np.nan),
+        np.where(ok, result.weights[row], 0.0),
+        np.where(ok, result.earned[row], False),
+        np.where(ok, age_ns // 10**9, 0),
     )
