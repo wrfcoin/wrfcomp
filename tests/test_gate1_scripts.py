@@ -718,7 +718,7 @@ def test_quarter_assembly_checks_the_sealed_split_before_loading_a_month_store(
         },
         attrs={"model_id": "noaa-gefs", "model_version": "1"},
     )
-    store.to_zarr(tmp_path / "october.zarr", mode="w")
+    store.to_zarr(tmp_path / "october.zarr", mode="w", consolidated=False)
 
     def no_values(self, **kwargs):
         raise AssertionError("a month store was loaded before the sealed-split check")
