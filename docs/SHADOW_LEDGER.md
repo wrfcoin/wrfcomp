@@ -1,8 +1,7 @@
 # PoFS Shadow Payout Ledger (`src/wrfcomp/pofs_shadow.py`)
 
 `src/wrfcomp/pofs_shadow.py` is a paper-only, deterministic NumPy implementation of the Proof-of-Forecast-Skill
-(PoFS) reward and slashing formulas drafted in `docs/TOKENOMICS.md`. It performs no network I/O, touches no
-wallet or chain, and modifies no numbers in `docs/TOKENOMICS.md`.
+(PoFS) reward and slashing formulas drafted in `docs/TOKENOMICS.md`. It computes paper rewards and slashes locally. No funds move.
 
 ## Compute settlement after the 2026-11-24 owner ruling
 
@@ -13,7 +12,7 @@ does not authenticate timestamps, hold keys or implement drand. A batch commitme
 forecast and must arrive strictly before the **first** initialization. A receipt at that instant is late.
 
 The single-field array adapter hashes the domain tag, two little-endian uint64 dimensions and C-order
-little-endian float64 member values using SHA-256. The scorecard adapter uses the locked evaluator's
+little-endian float64 member values using SHA-256. Both IEEE-754 signs of zero encode as positive zero. The scorecard adapter uses the locked evaluator's
 forecast content hash. Supply evaluator-produced scorecards from the same epoch and the trusted GEFS
 reference. Arbitrary self-reported metrics cannot establish forecast provenance. A standalone loss
 vector or a scalar baseline provides no paired skill, calibration or commitment evidence.
@@ -26,11 +25,20 @@ single lead, the actual GEFS array and a tail threshold. It computes the paired 
 spread ratio and locked DM test directly. A scalar loss cannot replace that GEFS input. A partial
 scorecard variable selection can report diagnostics but cannot authorize payment.
 
-Sort valid timely reveals by receipt time, then wallet ID for an exact tie. The first representative of
-each forecast is retained. Raw ensembles also compare ordered member values per observation using RMS
-distance (this handles member permutation). Scorecards support exact forecast-content deduplication
-only; they contain no arrays for a distance test. Subsequent clones earn zero. Eligible representatives
-each contribute one equally weighted forecast to the meta-ensemble. The excluded miner's own diagnostic
+A wallet may represent a forecast only after its timely reveal matches its commitment, its stake
+meets the floor and it passes the GEFS gates. An invalid or sealed scorecard provides no reveal
+digest. A committed wallet that submits one incurs the maximum slash. Among eligible wallets,
+receipt time determines priority, with wallet ID breaking exact ties. Subsequent clones earn zero.
+
+For raw ensembles, each member in a row has mass 1/M. The ledger takes the exact 1-Wasserstein
+distance between the two empirical distributions at each observation, then averages over rows.
+This integrates the absolute difference between their quantile functions even when the member counts
+differ. The field scale is the larger of GEFS RMS within-row spread and the standard deviation of
+observations (both population SD). At zero scale only zero distribution distance qualifies. Changing
+units rescales the distance and cutoff together. Scorecards support exact forecast-content deduplication
+only; they contain no arrays for a distance test.
+
+Eligible representatives each contribute one equally weighted forecast to the meta-ensemble. The excluded miner's own diagnostic
 downside may be computed by adding it to this fixed pool; its presence never changes an eligible
 miner's marginal score. The scorecard approximation uses the mean of normalized losses across models;
 it cannot measure physical ensemble diversity.
@@ -43,11 +51,26 @@ This is nondecreasing in k. If the representative misses the floor its reward is
 the splitting bound at every m, including the tested range 1–100. It compares the same forecast and
 competing submissions. New forecasting information is a different comparison.
 
-A committed forecast withheld, corrupted or mismatched loses the maximum fraction of stake. An honest
+A committed forecast withheld, corrupted or mismatched loses the maximum fraction of stake. An explicit
+protocol fault also incurs that slash, even without a receipt or payload. An honest
 negative score loses at most that fraction. Missing historical receipt evidence produces no reward and
 does not establish a slashable commitment. Below-floor stakes, late matching reveals and duplicate
 reveals earn zero. Reward returns to `unpaid_remainder` when no wallet earns. Slashes are accounted for
 separately from emissions. The station and validator pool rules are unchanged.
+
+### Residual risks
+
+A distance cutoff can accept an independent but similar forecast as a clone and can miss a copy just
+above the cutoff. Equal mixture weight per representative makes undetected copies consequential even
+at minimum stake. Scorecard-only settlement cannot distinguish near-copies with different hashes:
+a one-bit numerical change can change the digest. Keeping forecasts confidential until init time
+through pre-init timelock encryption is the intended defense against live copying; the paper recorder
+does not implement encryption.
+
+The locked spread-skill gate pools squared errors and ensemble variances across observations for
+each variable. A forecast can meet the global band while remaining overconfident during extreme events
+if it concentrates spread in a different regime. Passing the aggregate band does not certify
+calibration conditional on weather regime or threshold exceedance.
 
 ### Shadow defaults
 
@@ -58,7 +81,7 @@ The owner may change these research defaults. Ledger settings are centralized in
 | --- | ---: | --- |
 | Minimum wallet stake | 10 paper units | One tenth of the illustrative 100-unit stake; dust wallets cannot participate. |
 | Stake exponent | 1 | Linear stake weight gives each unit equal payout leverage. Exponents below 1 are rejected. |
-| Raw clone RMS tolerance | 0.002 field units | Covers tiny member perturbations at the red-team 0.001 noise scale. The raw adapter handles one field in its native units. |
+| Raw clone distance tolerance | 0.05 times field scale | A single member carries about 3% of a 31-member empirical distribution. A 5% allowance covers small distribution changes from a missing member or numerical jitter. This is a shadow policy choice, not a universal similarity threshold. |
 | Maximum slash | 10% | Same ceiling for the worst honest loss and a failed reveal. |
 | Negative-score multiplier | Caller-supplied | The replay uses 0.50; this rate has no owner-set default. |
 | Compute/data/validator shares | 55% / 35% / 10% | Existing shadow emission split. |

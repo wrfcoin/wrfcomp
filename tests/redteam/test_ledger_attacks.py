@@ -501,3 +501,76 @@ def test_uncalibrated_sharp_forecast_gated_out_despite_better_mean() -> None:
     )
     assert _by_id(res_pair)["sharp_uncalibrated"].reward == 0.0
     assert _by_id(res_solo)["sharp_uncalibrated"].reward == 0.0
+
+
+@pytest.mark.parametrize("variant", ["30_members", "sigma_0.003"])
+@pytest.mark.parametrize("unit_scale", [1.0, 100.0])
+def test_clone_reward_is_invariant_to_member_count_noise_and_field_units(variant, unit_scale):
+    fx = _make_synoptic_fixture()
+    original = fx["innov1_fc"]
+    if variant == "30_members":
+        copy = original[:, :-1]
+    else:
+        copy = original + np.random.default_rng(46).normal(0, 0.003, original.shape)
+    miners = [
+        MinerEntry("first", 100, forecast=unit_scale * original),
+        MinerEntry("later", 100, forecast=unit_scale * copy),
+    ]
+    result = recorded_epoch(
+        miners,
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        obs=unit_scale * fx["obs"],
+        tail_threshold=unit_scale * fx["tail_thr"],
+        baseline_forecast=unit_scale * fx["gefs_fc"],
+    )
+    payouts = _by_id(result)
+    assert payouts["later"].status == "clone" and payouts["later"].reward == 0
+    assert payouts["first"].reward == pytest.approx(POOL_AMOUNT)
+
+
+def test_minimum_stake_spoiler_does_not_increase_combined_reward():
+    fx = _make_synoptic_fixture(n_obs=250)
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        obs=fx["obs"],
+        baseline_forecast=fx["gefs_fc"],
+        tail_threshold=fx["tail_thr"],
+    )
+    original = MinerEntry("first", 100, forecast=fx["innov1_fc"])
+    rival = fx["innov2_fc"]
+    control = recorded_epoch([original, MinerEntry("rival", 100, forecast=rival)], **kwargs)
+    floor = DEFAULT_PARAMS.k_min
+    split = recorded_epoch(
+        [
+            original,
+            MinerEntry("rival", 100 - floor, forecast=rival),
+            MinerEntry("copy", floor, forecast=original.forecast[:, :-1]),
+        ],
+        **kwargs,
+    )
+    before, after = _by_id(control), _by_id(split)
+    assert before["rival"].reward > 0 and before["first"].reward > 0
+    assert after["copy"].status == "clone" and after["copy"].reward == 0
+    assert after["first"].delta_crps == before["first"].delta_crps
+    assert after["rival"].reward + after["copy"].reward <= before["rival"].reward
+
+
+@pytest.mark.parametrize("stake", [0.0, np.nextafter(DEFAULT_PARAMS.k_min, 0)])
+def test_below_minimum_commit_cannot_reserve_clone_slot(stake):
+    fx = _make_synoptic_fixture()
+    result = recorded_epoch(
+        [
+            MinerEntry("early", stake, forecast=fx["innov1_fc"]),
+            MinerEntry("first_eligible", 100, forecast=fx["innov1_fc"]),
+        ],
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        obs=fx["obs"],
+        tail_threshold=fx["tail_thr"],
+        baseline_forecast=fx["gefs_fc"],
+    )
+    payouts = _by_id(result)
+    assert payouts["early"].status == "below_minimum"
+    assert payouts["first_eligible"].reward == pytest.approx(POOL_AMOUNT)

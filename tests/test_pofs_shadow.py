@@ -564,6 +564,29 @@ def test_scorecard_gate_checks_gefs_and_every_variable_and_missing_wallet():
         row[stat] = value
         assert settle()["miner"].reward == 0
         row[stat] = old
+    # Invalid evidence carries the exact honest digest and an earlier receipt.
+    # It must neither claim a representative slot nor escape the missing-reveal penalty.
+    for changes in ({"sealed_data_used": True}, {"truth_sha256": "0" * 64}, {"baseline_sha256": "0" * 64}):
+        wrong = type(ref).model_validate({**candidate, **changes})
+        proof = EpochEvidence(
+            t,
+            ref.forecast_sha256,
+            {
+                "miner": receipt,
+                "early": Commitment(receipt.digest, receipt.received_at - np.timedelta64(1, "s")),
+            },
+        )
+        rows = settle_from_scorecards(
+            {"gefs": ref, "early": wrong, "miner": type(ref).model_validate(candidate)},
+            baseline_key="gefs",
+            pool_amount=550,
+            params=ShadowLedgerParams(alpha_slash=0.5),
+            evidence=proof,
+        )
+        by_id = {p.miner_id: p for p in rows.payouts}
+        assert by_id["early"].status == "non_reveal_or_mismatch" and by_id["early"].slash == 10
+        assert by_id["miner"].reward == 550
+
     candidate["baseline_sha256"] = "0" * 64
     assert settle()["miner"].reward == 0
 
@@ -586,3 +609,31 @@ def test_excluded_forecasts_do_not_change_the_valid_marginal():
     assert solo.payouts[0].reward > 0
     assert with_losers.meta_ensemble_loss == solo.meta_ensemble_loss
     assert next(p for p in with_losers.payouts if p.miner_id == "innovator") == solo.payouts[0]
+
+
+def test_explicit_fault_without_evidence_or_payload_gets_maximum_slash():
+    params = ShadowLedgerParams(alpha_slash=0.5)
+    payout = settle_compute_pool(
+        [MinerEntry("fault", 100, protocol_fault=True)], pool_amount=550, params=params, baseline_loss=1
+    ).payouts[0]
+    assert payout.protocol_fault and payout.status == "protocol_fault"
+    assert payout.reward == 0 and payout.slash == params.max_slash_cap * payout.stake
+
+
+def test_raw_commitment_canonicalizes_signed_zero_without_mutating_reveal():
+    from wrfcomp.pofs_shadow import forecast_digest
+
+    left = np.array([[-0.0, 1.0], [2.0, 0.0]])
+    right = left + 0.0
+    assert forecast_digest(left) == forecast_digest(right)
+    assert np.signbit(left[0, 0])
+
+
+def test_rowwise_wasserstein_uses_member_probability_mass():
+    from wrfcomp.pofs_shadow import _mean_wasserstein
+
+    left = np.array([[0.0, 3.0], [4.0, 4.0]])
+    right = np.array([[0.0, 0.0, 3.0], [4.0, 4.0, 4.0]])
+    # First row moves 1/6 of its mass by 3; second row is identical.
+    assert _mean_wasserstein(left, right) == pytest.approx(0.25)
+    assert _mean_wasserstein(right, left) == pytest.approx(0.25)

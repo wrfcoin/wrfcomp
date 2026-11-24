@@ -42,7 +42,7 @@ class ShadowLedgerParams:
     max_slash_cap: float = 0.10
     stake_exponent: float = 1.0
     k_min: float = 10.0
-    clone_rms_tolerance: float = 0.002
+    clone_relative_tolerance: float = 0.05
     h3_cell_cap: int = 1
 
     def __post_init__(self) -> None:
@@ -62,8 +62,8 @@ class ShadowLedgerParams:
                 raise ValueError(f"{name} must be in [0, 1], got {val}")
         if not math.isfinite(self.k_min) or self.k_min <= 0:
             raise ValueError("k_min must be finite and positive")
-        if not math.isfinite(self.clone_rms_tolerance) or self.clone_rms_tolerance < 0:
-            raise ValueError("clone_rms_tolerance must be finite and nonnegative")
+        if not math.isfinite(self.clone_relative_tolerance) or self.clone_relative_tolerance < 0:
+            raise ValueError("clone_relative_tolerance must be finite and nonnegative")
         if not math.isfinite(self.stake_exponent) or self.stake_exponent < 1.0:
             raise ValueError(
                 f"stake_exponent must be at least 1 for split resistance, got {self.stake_exponent}"
@@ -112,7 +112,8 @@ def forecast_digest(forecast: np.ndarray) -> str:
     if arr.ndim != 2:
         raise ValueError("expected a 2-D ensemble")
     h = hashlib.sha256(b"wrfcomp-shadow-forecast-v1" + struct.pack("<QQ", *arr.shape))
-    h.update(arr.tobytes(order="C"))
+    canonical = np.where(arr == 0, 0.0, arr).astype("<f8", copy=False)
+    h.update(canonical.tobytes(order="C"))
     return h.hexdigest()
 
 
@@ -211,9 +212,7 @@ def _as_2d_forecast(forecast: np.ndarray, n_obs: int) -> np.ndarray:
     if arr.ndim == 1:
         arr = arr[:, np.newaxis]
     if arr.ndim != 2 or arr.shape[0] != n_obs or arr.shape[1] < 1:
-        raise ValueError(
-            f"forecast must have shape ({n_obs},) or ({n_obs}, M>=1), got {arr.shape}"
-        )
+        raise ValueError(f"forecast must have shape ({n_obs},) or ({n_obs}, M>=1), got {arr.shape}")
     if not np.isfinite(arr).all():
         raise ValueError("forecast contains non-finite values")
     return arr
@@ -320,18 +319,14 @@ def _validate_tail_threshold(
         with np.errstate(over="ignore"):
             thr = np.asarray(raw, dtype=np.float64)
     except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"tail_threshold must be finite and representable in float64: {exc}"
-        ) from exc
+        raise ValueError(f"tail_threshold must be finite and representable in float64: {exc}") from exc
     if thr.ndim > 1:
         raise ValueError(f"tail_threshold must be a scalar or 1-D array, got shape {thr.shape}")
     if thr.ndim == 1:
         if thr.size == 0:
             raise ValueError("tail_threshold must be non-empty")
         if n_obs is not None and thr.shape != (n_obs,):
-            raise ValueError(
-                f"tail_threshold length {thr.shape[0]} does not match obs length {n_obs}"
-            )
+            raise ValueError(f"tail_threshold length {thr.shape[0]} does not match obs length {n_obs}")
     if not np.isfinite(thr).all():
         raise ValueError(
             "tail_threshold must be finite (NaN, +/-infinity, and float64-overflowing values are refused)"
@@ -434,6 +429,19 @@ def _array_gate(fc, gefs, obs, threshold, issue_times, lead_hours, cfg):
     return all(evaluate_gates({"all": metrics}, cfg).values())
 
 
+def _mean_wasserstein(left: np.ndarray, right: np.ndarray) -> float:
+    """Mean row-wise W1 of sorted, equally weighted empirical ensembles."""
+    m, n = left.shape[1], right.shape[1]
+    if m == n:
+        return float(np.abs(left - right).mean())
+    # On each interval between empirical quantile jumps both quantiles
+    # are constant. Integer coordinates on [0, m*n] keep the jumps exact.
+    edges = np.union1d(np.arange(m + 1) * n, np.arange(n + 1) * m)
+    lower = edges[:-1]
+    distances = np.abs(left[:, lower // n] - right[:, lower // m]).mean(axis=0)
+    return float(np.dot(np.diff(edges) / (m * n), distances))
+
+
 def settle_compute_pool(
     miners: list[MinerEntry],
     *,
@@ -515,12 +523,28 @@ def settle_compute_pool(
     def mixture(ids):
         return meta_ensemble_loss([arrays[k] for k in ids], np.ones(len(ids)), y, params, tail_threshold)
 
+    clone_distance = 0.0
+    if gefs is not None:
+        field_scale = max(float(np.sqrt(gefs.var(axis=1).mean())), float(np.std(y)))
+        clone_distance = params.clone_relative_tolerance * field_scale
     return _settle(
-        miners, pool_amount, params, baseline_loss, evidence, losses, digests, gates, arrays, mixture
+        miners,
+        pool_amount,
+        params,
+        baseline_loss,
+        evidence,
+        losses,
+        digests,
+        gates,
+        arrays,
+        mixture,
+        clone_distance,
     )
 
 
-def _settle(miners, pool, params, baseline, evidence, losses, digests, gates, arrays, mixture):
+def _settle(
+    miners, pool, params, baseline, evidence, losses, digests, gates, arrays, mixture, clone_distance=0.0
+):
     if (
         not math.isfinite(pool)
         or pool < 0
@@ -543,7 +567,7 @@ def _settle(miners, pool, params, baseline, evidence, losses, digests, gates, ar
     for m in ordered:
         k = m.miner_id
         receipt = receipts.get(k)
-        if m.protocol_fault and (m.forecast is not None or m.pointwise_loss is not None):
+        if m.protocol_fault:
             status[k] = "protocol_fault"
         elif receipt is None:
             status[k] = "uncommitted"
@@ -551,29 +575,22 @@ def _settle(miners, pool, params, baseline, evidence, losses, digests, gates, ar
             status[k] = "non_reveal_or_mismatch"
         elif receipt.received_at >= evidence.init_time:
             status[k] = "late"
+        elif m.stake < params.k_min:
+            status[k] = "below_minimum"
+        elif digests[k] == evidence.gefs_digest or not gates.get(k, False) or losses[k] >= baseline:
+            status[k] = "gefs_gate"
         else:
             revealed.append(m)
-    representatives = []
     winners = []
     for m in sorted(revealed, key=lambda m: (receipts[m.miner_id].received_at, m.miner_id)):
         k = m.miner_id
         is_clone = any(
             digests[k] == digests[earlier]
-            or (
-                k in arrays
-                and arrays[k].shape == arrays[earlier].shape
-                and np.sqrt(np.mean((arrays[k] - arrays[earlier]) ** 2)) <= params.clone_rms_tolerance
-            )
-            for earlier in representatives
+            or (k in arrays and _mean_wasserstein(arrays[k], arrays[earlier]) <= clone_distance)
+            for earlier in winners
         )
         if is_clone:
             status[k] = "clone"
-            continue
-        representatives.append(k)
-        if m.stake < params.k_min:
-            status[k] = "below_minimum"
-        elif digests[k] == evidence.gefs_digest or not gates.get(k, False) or losses[k] >= baseline:
-            status[k] = "gefs_gate"
         else:
             status[k] = "eligible"
             winners.append(k)
@@ -950,7 +967,6 @@ def settle_from_scorecards(
         if key not in cards or key in fault_ids:
             continue
         sc = cards[key]
-        digests[key] = sc.forecast_sha256
         if (
             any(
                 getattr(sc, k) != getattr(ref, k)
@@ -971,28 +987,39 @@ def settle_from_scorecards(
             continue
         if not set(chosen_vars) <= set(sc.metrics) or not set(chosen_leads) <= set(sc.leads_scored):
             continue
-        per_var = {v: scorecard_variable_loss(sc, v, chosen_leads) for v in chosen_vars}
+        try:
+            per_var = {v: scorecard_variable_loss(sc, v, chosen_leads) for v in chosen_vars}
+        except ValueError:
+            continue  # Undefined loss cannot substantiate a committed reveal.
         losses[key] = (
             per_var[chosen_vars[0]] if single else float(np.mean([per_var[v] / base[v] for v in base]))
         )
+        # Preserve historical loss diagnostics, but recognize a reveal only
+        # after checking integrity on the entire epoch, even for a diagnostic slice.
+        if sc == ref:
+            digests[key] = sc.forecast_sha256  # authentic GEFS stays ineligible
+            continue
+        if (
+            sc.baseline_id != "noaa-gefs"
+            or sc.baseline_sha256 != ref.forecast_sha256
+            or sc.variables_missing
+            or set(sc.metrics) != set(primary)
+            or sc.leads_scored != ref.leads_scored
+        ):
+            continue
+        if any(
+            sc.metrics[v][h].n_pairs != ref.metrics[v][h].n_pairs
+            or sc.metrics[v][h].n_masked_no_threshold != ref.metrics[v][h].n_masked_no_threshold
+            for v in primary
+            for h in ref.metrics[v]
+        ):
+            continue
+        derived = {v: evaluate_gates({"all": sc.metrics[v]["all"].model_dump()}, cfg) for v in primary}
+        if derived != sc.gates:
+            continue
+        digests[key] = sc.forecast_sha256
         gates[key] = (
-            sc.baseline_id == "noaa-gefs"
-            and sc.baseline_sha256 == ref.forecast_sha256
-            and not sc.variables_missing
-            and sc.passed_gate
-            and set(chosen_vars) == set(primary)
-            and list(chosen_leads) == ref.leads_scored
-            and sc.leads_scored == ref.leads_scored
-            and all(
-                all(evaluate_gates({"all": sc.metrics[v]["all"].model_dump()}, cfg).values())
-                and all(
-                    sc.metrics[v][str(h)].n_pairs == ref.metrics[v][str(h)].n_pairs
-                    and sc.metrics[v][str(h)].n_masked_no_threshold
-                    == ref.metrics[v][str(h)].n_masked_no_threshold
-                    for h in chosen_leads
-                )
-                for v in primary
-            )
+            sc.passed_gate and set(chosen_vars) == set(primary) and list(chosen_leads) == ref.leads_scored
         )
 
     def mixture(ids):
