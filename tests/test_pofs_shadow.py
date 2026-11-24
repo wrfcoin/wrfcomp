@@ -107,9 +107,7 @@ def test_baseline_copy_earns_near_zero_at_090_and_third_of_innovator_at_zero() -
         miners, pool_amount=1000.0, params=params_zero, baseline_loss=l_base, obs=obs
     )
     by_id_zero = {p.miner_id: p for p in res_zero.payouts}
-    assert by_id_zero["public_copy"].reward == pytest.approx(
-        by_id_zero["innovator"].reward / 3.0, rel=1e-9
-    )
+    assert by_id_zero["public_copy"].reward == pytest.approx(by_id_zero["innovator"].reward / 3.0, rel=1e-9)
 
     res_strict = settle_compute_pool(
         miners, pool_amount=1000.0, params=params_strict, baseline_loss=l_base, obs=obs
@@ -287,8 +285,7 @@ def test_protocol_fault_gets_flat_slash_and_is_excluded_from_meta_ensemble() -> 
 def test_eight_stations_in_one_cell_split_one_station_capacity() -> None:
     params = ShadowLedgerParams(alpha_slash=0.5, h3_cell_cap=1)
     crowded = [
-        StationEntry(station_id=f"crowded_{i}", cell_id="872a1072bffffff", qod=1.0, pol=1.0)
-        for i in range(8)
+        StationEntry(station_id=f"crowded_{i}", cell_id="872a1072bffffff", qod=1.0, pol=1.0) for i in range(8)
     ]
     solo = StationEntry(station_id="solo_0", cell_id="872a1072cffffff", qod=1.0, pol=1.0)
 

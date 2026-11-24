@@ -39,9 +39,17 @@ def _load():
 tool = _load()
 
 
-def _eval(root: Path, forecast: Path, out: Path, model_id: str, baseline: tuple[Path, str] | None) -> None:
-    args = ["--forecast", str(forecast), "--truth", str(root / "data/truth/truth.nc")]
-    args += ["--thresholds", str(root / "data/thresholds/tail.nc"), "--out", str(out)]
+def _eval(
+    root: Path,
+    forecast: Path,
+    out: Path,
+    model_id: str,
+    baseline: tuple[Path, str] | None,
+    truth: str = "truth/truth.nc",
+    thresholds: str = "thresholds/tail.nc",
+) -> None:
+    args = ["--forecast", str(forecast), "--truth", str(root / "data" / truth)]
+    args += ["--thresholds", str(root / "data" / thresholds), "--out", str(out)]
     args += ["--model-id", model_id, "--model-version", "1", "--config", str(root / "configs/splits.yaml")]
     if baseline:
         args += ["--baseline", str(baseline[0]), "--baseline-id", baseline[1]]
@@ -164,19 +172,36 @@ def good_cards(base_world: dict) -> tuple[dict, dict]:
 
 def test_evaluate_runs_both_evaluations_and_promotes_a_better_candidate(base_world: dict) -> None:
     assert base_world["reasons"] == []
-    # one published directory, named by the program from the period and the forecast's content hash
+    # one published directory, named by the program from the period and the hash of its verdict file
     directory = base_world["directory"]
     digest = base_world["cards"][0]["forecast_sha256"]
     assert [p.name for p in base_world["out"].iterdir()] == [directory.name]
-    assert directory.name == f"promotion_{PERIOD}_{digest[:16]}"
+    assert directory.name == tool._result_name(PERIOD, (directory / "verdict.json").read_text())
     assert sorted(p.name for p in directory.iterdir()) == [
         "candidate_vs_climatology.json",
         "candidate_vs_noaa-gefs.json",
         "verdict.json",
     ]
     verdict = json.loads((directory / "verdict.json").read_text())
-    assert verdict["verdict"] == "PROMOTED" and verdict["reasons"] == [] and verdict["period"] == PERIOD
+    assert verdict["scorecards"] == {
+        name: tool._sha256_file(directory / name) for name in sorted(tool.STAGED_NAMES.values())
+    }
+    # one period passed: PASSED, never PROMOTED (promotion is decided on quarters, by `promote`)
+    assert verdict["verdict"] == "PASSED" and verdict["reasons"] == [] and verdict["period"] == PERIOD
     assert verdict["candidate"] == {"model_id": "synth", "model_version": "1", "forecast_sha256": digest}
+    assert verdict["promotion_rule_version"] == tool.PROMOTION_RULE_VERSION == 2
+    assert verdict["harness_version"] == base_world["inventory"]["harness_version"]
+    assert verdict["protocol_version"] == base_world["inventory"]["protocol_version"]
+    assert verdict["references_sha256"] == tool._sha256_file(base_world["root"] / tool.INVENTORY)
+    assert verdict["forecast_inputs"] == [
+        {
+            "content_sha256": digest,
+            "init_first": "2024-03-01T00:00:00",
+            "init_last": "2024-03-15T12:00:00",
+            "n_init_times": 30,
+        }
+    ]
+    assert "PROMOTED" not in (directory / "verdict.json").read_text()
     against_climatology, against_gefs = good_cards(base_world)
     for card in (against_climatology, against_gefs):
         Scorecard.model_validate(card)
@@ -197,11 +222,12 @@ def test_command_line_verdicts(base_world: dict, locked: None, monkeypatch, caps
     args = ["--data-dir", str(data), "--period", PERIOD, "--out", str(tmp_path / "out")]
     assert tool.main(["evaluate", "--forecast", str(data / "candidates/good.zarr"), *args]) == 0
     out = capsys.readouterr().out
-    assert f"PROMOTED for {PERIOD}" in out and "NOT PROMOTED" not in out
+    assert f"PASSED for {PERIOD}" in out and "NOT PASSED" not in out
+    assert "A monthly result is diagnostic only" in out and "PROMOTED" not in out
 
     assert tool.main(["evaluate", "--forecast", str(data / "candidates/weak.zarr"), *args]) == 1
     out = capsys.readouterr().out
-    assert "NOT PROMOTED" in out and "gate not passed against" in out
+    assert f"NOT PASSED for {PERIOD}" in out and "gate not passed against" in out and "PROMOTED" not in out
 
     # verify: the same good scorecards are only ever CONSISTENT
     paths = [str(base_world["directory"] / name) for name in tool.STAGED_NAMES.values()]
@@ -209,7 +235,7 @@ def test_command_line_verdicts(base_world: dict, locked: None, monkeypatch, caps
     out = capsys.readouterr().out
     assert "CONSISTENT" in out and "proves nothing about where the scorecards came from" in out
     assert "This is not a promotion." in out
-    assert "PROMOTED" not in out.replace("NOT PROMOTED", "")
+    assert "PROMOTED" not in out and "PASSED" not in out
     bad = tmp_path / "edited.json"
     card = json.loads(Path(paths[0]).read_text())
     card["truth_sha256"] = "0" * 64
@@ -438,6 +464,41 @@ def test_stand_in_reference_store_is_refused(base_world: dict, locked: None, tmp
         tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, tmp_path / "out", root)
 
 
+@pytest.mark.parametrize("reference", ["climatology", "gefs"])
+def test_reference_store_with_a_sealed_valid_time_is_refused_before_it_is_hashed(
+    base_world: dict, locked: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reference: str
+) -> None:
+    """A store in the data directory under a reference's pinned name, with a valid time in the
+    sealed split: refused on its coordinates. Its content hash is never taken, so no value is read."""
+    import wrfcomp.harness.hashing as hashing
+
+    root = tmp_path / "repo"
+    shutil.copytree(base_world["root"], root)
+    sealed_start = tool._load_locked_config(root).splits.sealed_test.start
+    store = root / f"data/refs/{reference}.zarr"
+    misplaced = open_zarr(store).load()
+    # init times stay in March 2024; the longest lead now ends on the first sealed instant
+    leads = misplaced["lead_time"].values.copy()
+    leads[-1] = sealed_start - misplaced["init_time"].values.max()
+    misplaced = misplaced.assign_coords(lead_time=leads)
+    assert misplaced["init_time"].values.max() < sealed_start
+    shutil.rmtree(store)
+    write_zarr(misplaced, store)
+
+    real = hashing.content_sha256
+
+    def sentinel(ds):
+        latest = ds["init_time"].values.max() + ds["lead_time"].values.max()
+        assert latest < sealed_start, "a store with sealed valid times was hashed"
+        return real(ds)
+
+    monkeypatch.setattr(hashing, "content_sha256", sentinel)
+    name = {"climatology": "climatology", "gefs": "noaa-gefs"}[reference]
+    with pytest.raises(tool.Refused, match=f"reference {name} at .* refused before it is read.*sealed split"):
+        tool.evaluate(root / "data/candidates/good.zarr", root / "data", PERIOD, tmp_path / "out", root)
+    assert not (tmp_path / "out").exists()
+
+
 def test_tampered_inventory_or_reference_scorecard_is_refused(base_world: dict, tmp_path: Path) -> None:
     def world() -> Path:
         root = tmp_path / f"repo{len(list(tmp_path.iterdir()))}"
@@ -520,7 +581,7 @@ def test_weaker_candidate_is_not_promoted_and_refused_inputs_stop_early(
     assert "gate not passed against climatology" in outcome.reasons
     assert "gate not passed against noaa-gefs" in outcome.reasons
     verdict = json.loads((outcome.directory / "verdict.json").read_text())
-    assert verdict["verdict"] == "NOT PROMOTED" and verdict["reasons"] == outcome.reasons
+    assert verdict["verdict"] == "NOT PASSED" and verdict["reasons"] == outcome.reasons
     assert len(list(outcome.directory.glob("candidate_vs_*.json"))) == 2  # both evaluations ran and were kept
 
     good = root / "data/candidates/good.zarr"
@@ -540,7 +601,12 @@ def test_weaker_candidate_is_not_promoted_and_refused_inputs_stop_early(
         "wrfcomp-eval refused the candidate against climatology (exit code 3)",
         "wrfcomp-eval refused the candidate against noaa-gefs (exit code 3)",
     ]
-    assert outcome.directory.name.startswith(f"promotion_{PERIOD}_unscored-")
+    assert outcome.directory.name == tool._result_name(
+        PERIOD, (outcome.directory / "verdict.json").read_text()
+    )
+    assert (
+        json.loads((outcome.directory / "verdict.json").read_text())["candidate"]["forecast_sha256"] is None
+    )
     assert [p.name for p in outcome.directory.iterdir()] == ["verdict.json"]
 
 
@@ -832,11 +898,13 @@ def test_scoring_packages_must_come_from_the_environment(monkeypatch: pytest.Mon
 
 
 MONTHS = [f"2024-{month:02d}" for month in range(1, 13)]
+QUARTERS = [f"2024-Q{quarter}" for quarter in range(1, 5)]
 
 
 def test_committed_inventory_pins_the_committed_reference_scorecards() -> None:
     inventory = tool.load_inventory(ROOT)
-    assert sorted(inventory["periods"]) == MONTHS  # every month of the 2024 validation split
+    # every month of the 2024 validation split (diagnostic) and its four quarters (promotion)
+    assert sorted(inventory["periods"]) == sorted(MONTHS + QUARTERS)
     assert inventory["harness_version"] == {"scores": "2.7.0", "wrfcomp": "0.1.0"}
     periods = {
         label: {
@@ -854,7 +922,7 @@ def test_committed_inventory_pins_the_committed_reference_scorecards() -> None:
             },
             "others": [f"experiments/persistence_{label}.json"],
         }
-        for label in MONTHS
+        for label in MONTHS + QUARTERS
     }
     assert tool.build_inventory(ROOT, periods) == json.loads((ROOT / tool.INVENTORY).read_text())
     truth = {r["truth_sha256"] for e in inventory["periods"].values() for r in e["references"].values()}
@@ -869,15 +937,40 @@ def test_committed_inventory_pins_the_committed_reference_scorecards() -> None:
         assert references["noaa-gefs"]["leads_scored"] == [3, 6, 12, 24, 48]  # 3 h and longer
         for record in references.values():
             assert (record["n_stations"], record["init_hours_scored"]) == (500, [0, 12])
-            assert record["period_start"] == f"{label}-01T00:00:00"
+            first_month = label[-2:] if label in MONTHS else f"{3 * int(label[-1]) - 2:02d}"
+            assert record["period_start"] == f"2024-{first_month}-01T00:00:00"
             assert record["n_init_times"] == references["climatology"]["n_init_times"]
         init_times[label] = references["climatology"]["n_init_times"]
         assert len(entry["other_reference_forecasts"]) == 1, label
     # 00Z and 12Z of every day; December stops at the last init inside the validation split
     days = {"2024-02": 29, "2024-04": 30, "2024-06": 30, "2024-09": 30, "2024-11": 30, "2024-12": 17}
-    assert init_times == {label: 2 * days.get(label, 31) for label in MONTHS}
+    assert {m: init_times[m] for m in MONTHS} == {label: 2 * days.get(label, 31) for label in MONTHS}
     assert inventory["periods"]["2024-12"]["references"]["noaa-gefs"]["period_end"] == "2024-12-17T12:00:00"
-    assert len(tool.reference_forecast_hashes(inventory)) == 36  # no forecast is shared between periods
+    # a quarter is its three months as one period; Q4 ends where December does
+    for number, label in enumerate(QUARTERS, start=1):
+        months = MONTHS[3 * number - 3 : 3 * number]
+        assert init_times[label] == sum(init_times[m] for m in months)
+        for baseline, record in inventory["periods"][label]["references"].items():
+            last = inventory["periods"][months[-1]]["references"][baseline]
+            assert record["period_end"] == last["period_end"]
+            assert (
+                record["store"]
+                == f"gate1/{label}_h00-12/{'gefs' if baseline == 'noaa-gefs' else baseline}.zarr"
+            )
+            for key in ("truth_sha256", "thresholds_sha256", "leads_scored", "n_stations"):
+                assert record[key] == last[key]
+            quarter_card = json.loads((ROOT / record["scorecard"]).read_text())
+            for variable, per_lead in quarter_card["metrics"].items():
+                for lead, entry in per_lead.items():
+                    monthly = [
+                        json.loads(
+                            (ROOT / inventory["periods"][m]["references"][baseline]["scorecard"]).read_text()
+                        )
+                        for m in months
+                    ]
+                    assert entry["n_pairs"] == sum(c["metrics"][variable][lead]["n_pairs"] for c in monthly)
+    assert inventory["periods"]["2024-Q4"]["references"]["noaa-gefs"]["period_end"] == "2024-12-17T12:00:00"
+    assert len(tool.reference_forecast_hashes(inventory)) == 48  # no forecast is shared between periods
     # the inventory pins exactly the reference scorecards the manifest locks
     pinned = {r["scorecard"] for e in inventory["periods"].values() for r in e["references"].values()}
     pinned |= {
@@ -901,3 +994,571 @@ def test_real_reference_scorecards_are_never_a_promotion(capsys: pytest.CaptureF
     # a period that is not pinned
     assert tool.main(["verify", *cards, "--period", "2023-12"]) == 2
     assert "REFUSED" in capsys.readouterr().out
+
+
+# =============================================================================== quarters, 3 of 4
+
+QUARTER_STARTS = {"2024-Q1": "2024-01-01T00:00", "2024-Q2": "2024-04-01T00:00"}
+QUARTER_STARTS |= {"2024-Q3": "2024-07-01T00:00", "2024-Q4": "2024-10-01T00:00"}
+PARTS = ("a", "b", "c")  # a quarter's candidate in three stores, standing in for its three months
+
+
+def build_quarter_world(root: Path) -> Path:
+    """Like `build_world`, with the four quarters of 2024 pinned, each with its own truth and thresholds.
+
+    Per quarter: a good candidate split into three stores of ten init times, the same candidate under
+    another model id, and a weak candidate in one store.
+    """
+    data = root / "data"
+    for sub in ("truth", "thresholds", "refs", "candidates"):
+        (data / sub).mkdir(parents=True)
+    write_config(root, list(station_ids(N_STATIONS)))
+    (root / "experiments").mkdir()
+    periods = {}
+    for number, (label, start) in enumerate(QUARTER_STARTS.items()):
+        syn = make_synthetic(seed=500 + number, start=start)
+        rng = np.random.default_rng(900 + number)
+        write_netcdf(syn.truth, data / f"truth/{label}.nc")
+        write_netcdf(syn.thresholds, data / f"thresholds/{label}.nc")
+        gefs = syn.baseline.isel(lead_time=[1, 2]).copy(deep=True)
+        gefs.attrs["model_id"] = "noaa-gefs"
+        climatology = syn.baseline.copy(deep=True)
+        for name in climatology.data_vars:
+            noise = rng.normal(0, float(syn.truth[name].std()) * 0.5, climatology[name].shape).astype(
+                "float32"
+            )
+            climatology[name] = (
+                climatology[name].dims,
+                climatology[name].values + noise,
+                climatology[name].attrs,
+            )
+        climatology.attrs["model_id"] = "climatology"
+        weak = climatology.copy(deep=True)
+        weak.attrs["model_id"] = "synth"  # the same candidate, having a bad quarter
+        for name in weak.data_vars:
+            weak[name] = (weak[name].dims, weak[name].values + np.float32(0.25), weak[name].attrs)
+        other = syn.candidate.copy(deep=True)
+        other.attrs["model_id"] = "someone-else"
+
+        write_zarr(climatology, data / f"refs/climatology_{label}.zarr")
+        write_zarr(gefs, data / f"refs/gefs_{label}.zarr")
+        write_zarr(weak, data / f"candidates/weak_{label}.zarr")
+        write_zarr(other, data / f"candidates/other_{label}.zarr")
+        write_zarr(syn.candidate, data / f"candidates/whole_{label}.zarr", {"init_time": 7, "station_id": 3})
+        for index, part in enumerate(PARTS):
+            piece = syn.candidate.isel(init_time=slice(10 * index, 10 * index + 10))
+            write_zarr(piece, data / f"candidates/good_{label}_{part}.zarr")
+
+        files = {"truth": f"truth/{label}.nc", "thresholds": f"thresholds/{label}.nc"}
+        clim_card, gefs_card = f"experiments/climatology_{label}.json", f"experiments/gefs_{label}.json"
+        _eval(root, data / f"refs/climatology_{label}.zarr", root / clim_card, "climatology", None, **files)
+        reference = (data / f"refs/climatology_{label}.zarr", "climatology")
+        _eval(root, data / f"refs/gefs_{label}.zarr", root / gefs_card, "noaa-gefs", reference, **files)
+        periods[label] = {
+            **files,
+            "references": {
+                "climatology": {"scorecard": clim_card, "store": f"refs/climatology_{label}.zarr"},
+                "noaa-gefs": {"scorecard": gefs_card, "store": f"refs/gefs_{label}.zarr"},
+            },
+        }
+    inventory = tool.build_inventory(root, periods)
+    (root / tool.INVENTORY).write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n")
+    return root
+
+
+def good_parts(root: Path, label: str, order: str = "abc") -> list[Path]:
+    return [root / f"data/candidates/good_{label}_{part}.zarr" for part in order]
+
+
+LABELS = list(QUARTER_STARTS)
+
+
+def year_stores(root: Path, kinds: str) -> list[Path]:
+    """The candidate's stores for the year. `kinds` has one letter per quarter: g good (three
+    stores), w weak (one store), - none."""
+    stores: list[Path] = []
+    for label, kind in zip(LABELS, kinds, strict=True):
+        if kind == "g":
+            stores += good_parts(root, label)
+        elif kind == "w":
+            stores.append(root / f"data/candidates/weak_{label}.zarr")
+    return stores
+
+
+@pytest.fixture(scope="module")
+def quarter_world(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    """Built once, never modified. `good` is the published Q2 result of the good candidate, given as
+    three stores that are deliberately not in time order."""
+    root = build_quarter_world(tmp_path_factory.mktemp("quarters") / "repo")
+    data, out = root / "data", root.parent / "results"
+    with pytest.MonkeyPatch.context() as patch:
+        trust(patch)
+        outcome = tool.evaluate(good_parts(root, "2024-Q2", "cab"), data, "2024-Q2", out, root)
+        assert outcome.reasons == []
+    return {"root": root, "data": data, "good": outcome.directory, "cfg": tool._load_locked_config(root)}
+
+
+def decide(world: dict, kinds: str | list[Path], out: Path):
+    stores = year_stores(world["root"], kinds) if isinstance(kinds, str) else kinds
+    return tool.promote(stores, world["data"], 2024, out, world["root"])
+
+
+def passed(decision) -> list[str]:
+    return [q.period for q in decision.quarters if q.passed]
+
+
+def shifted(source: Path, dest: Path, first: str) -> Path:
+    """A copy of a store with its init times moved to start at `first` (same 12 h step)."""
+    ds = open_zarr(source).load()
+    times = np.datetime64(first, "ns") + np.arange(ds.sizes["init_time"]) * np.timedelta64(12, "h")
+    return write_zarr(ds.assign_coords(init_time=times), dest)
+
+
+def test_quarter_given_as_monthly_stores_is_joined_and_hashed_reproducibly(
+    quarter_world: dict, locked: None, tmp_path: Path
+) -> None:
+    from wrfcomp.harness.hashing import content_sha256
+
+    root, data, label = quarter_world["root"], quarter_world["data"], "2024-Q2"
+    published = quarter_world["good"]  # given as c, a, b
+    assert sorted(p.name for p in published.iterdir()) == [
+        "candidate_vs_climatology.json",
+        "candidate_vs_noaa-gefs.json",
+        "verdict.json",
+    ]  # the joined store is not kept
+    verdict = json.loads((published / "verdict.json").read_text())
+    whole = open_zarr(data / f"candidates/whole_{label}.zarr")
+    digest = content_sha256(whole)
+    # the hash of the joined forecast is the hash of the same forecast stored whole, with other chunks
+    assert verdict["candidate"] == {"model_id": "synth", "model_version": "1", "forecast_sha256": digest}
+    assert published.name == tool._result_name(label, (published / "verdict.json").read_text())
+    assert verdict["verdict"] == "PASSED" and verdict["promotion_rule_version"] == 2
+    inputs = verdict["forecast_inputs"]
+    assert [i["n_init_times"] for i in inputs] == [10, 10, 10]
+    assert [i["init_first"] for i in inputs] == sorted(i["init_first"] for i in inputs)  # time order
+    assert [i["content_sha256"] for i in inputs] == [
+        content_sha256(open_zarr(path)) for path in good_parts(root, label, "abc")
+    ]
+    assert (
+        inputs[0]["init_first"] == "2024-04-01T00:00:00" and inputs[-1]["init_last"] == "2024-04-15T12:00:00"
+    )
+
+    # the order the stores are given in changes nothing: the same hash, the same bytes, the same name
+    again = tool.evaluate(good_parts(root, label, "bca"), data, label, tmp_path / "again", root)
+    assert again.directory.name == published.name
+    for name in (*tool.STAGED_NAMES.values(), "verdict.json"):
+        assert (again.directory / name).read_bytes() == (published / name).read_bytes()
+    # nothing but the published directory is left in the output directory
+    assert [p.name for p in (tmp_path / "again").iterdir()] == [published.name]
+
+
+def test_candidate_stores_that_do_not_form_one_forecast_are_refused(
+    quarter_world: dict, locked: None, tmp_path: Path
+) -> None:
+    root, data, label = quarter_world["root"], quarter_world["data"], "2024-Q1"
+    a, b, c = good_parts(root, label)
+    out = tmp_path / "out"
+
+    def refused(forecast: list[Path], match: str, period: str = label) -> None:
+        with pytest.raises(tool.Refused, match=match):
+            tool.evaluate(forecast, data, period, out, root)
+
+    refused([a, b, a], "listed twice")
+    assert not out.exists()  # refused before anything is created
+    overlap = open_zarr(b).load()
+    write_zarr(overlap.assign_coords(init_time=open_zarr(a)["init_time"].values), tmp_path / "overlap.zarr")
+    refused([a, tmp_path / "overlap.zarr", c], "an init time in common")
+    # b moved half a step: no init time in common with a, but in between a's
+    shifted(b, tmp_path / "between.zarr", "2024-01-01T06:00")
+    refused([a, tmp_path / "between.zarr"], "interleave in time")
+    version = open_zarr(b).load()
+    version.attrs["model_version"] = "2"
+    write_zarr(version, tmp_path / "version.zarr")
+    refused([a, tmp_path / "version.zarr", c], "not one model and version")
+    refused([a, data / f"candidates/other_{label}.zarr"], "not one model and version")
+    fewer = open_zarr(b).load().isel(station_id=slice(0, N_STATIONS - 1))
+    write_zarr(fewer, tmp_path / "fewer.zarr")
+    refused([a, tmp_path / "fewer.zarr", c], "fewer.zarr: .* differs from")
+    dropped = open_zarr(b).load().drop_vars("u10")
+    write_zarr(dropped, tmp_path / "dropped.zarr")
+    refused([a, tmp_path / "dropped.zarr", c], "other variables or coordinates")
+    refused([a, tmp_path / "nowhere.zarr"], "no such forecast store")
+    assert not list(out.glob("promotion_*"))
+
+    # two of the three stores: scored, but it is not the pinned quarter, so it does not pass
+    outcome = tool.evaluate([a, b], data, label, tmp_path / "short", root)
+    assert any("n_init_times against climatology differs" in line for line in outcome.reasons)
+    assert not list((tmp_path / "short").glob(".promotion-run-*"))
+
+
+def test_several_stores_are_for_quarters_only(base_world: dict, locked: None, tmp_path: Path) -> None:
+    good = base_world["root"] / "data/candidates/good.zarr"
+    weak = base_world["root"] / "data/candidates/weak.zarr"
+    with pytest.raises(tool.Refused, match="for a quarter only"):
+        tool.evaluate([good, weak], base_world["root"] / "data", PERIOD, tmp_path / "x", base_world["root"])
+    with pytest.raises(tool.Refused, match="no candidate forecast"):
+        tool.evaluate([], base_world["root"] / "data", PERIOD, tmp_path / "x", base_world["root"])
+    assert not (tmp_path / "x").exists()
+
+
+# ------------------------------------------------------------------ review items: inputs and identity
+
+
+def test_candidate_is_checked_against_the_sealed_split_before_it_is_hashed(
+    quarter_world: dict, locked: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store that reaches the sealed split, or is not a forecast, is refused on its coordinates
+    and attributes: no content hash is taken, so none of its values is read."""
+    import wrfcomp.harness.hashing as hashing
+
+    root, data = quarter_world["root"], quarter_world["data"]
+    a, b, c = good_parts(root, "2024-Q4")
+    sealed_start = quarter_world["cfg"].splits.sealed_test.start
+    late = shifted(c, tmp_path / "late.zarr", "2024-12-28T00:00")  # ten init times: the last is in 2025
+    assert open_zarr(late)["init_time"].values.max() >= sealed_start
+    # init times all in 2024, but the longest lead carries the valid times past the start of 2025
+    edge = shifted(c, tmp_path / "edge.zarr", "2024-12-26T12:00")
+    assert open_zarr(edge)["init_time"].values.max() < sealed_start
+    wrong_units = open_zarr(b).load()
+    wrong_units["t2m"].attrs["units"] = "degF"
+    write_zarr(wrong_units, tmp_path / "degf.zarr")
+
+    def never(ds):
+        raise AssertionError("a candidate store was hashed before it was checked")
+
+    monkeypatch.setattr(hashing, "content_sha256", never)
+    out = tmp_path / "out"
+    for stores, match in (
+        ([a, b, late], "sealed split"),
+        ([edge], "sealed split"),
+        ([a, tmp_path / "degf.zarr", c], "has units 'degF'"),
+    ):
+        with pytest.raises(tool.Refused, match=match):
+            tool.evaluate(stores, data, "2024-Q4", out, root)
+        with pytest.raises(tool.Refused, match=match):
+            tool.promote(stores, data, 2024, out, root)
+    assert not out.exists()
+
+
+def test_units_survive_the_join_and_must_agree_between_stores(
+    quarter_world: dict, locked: None, tmp_path: Path
+) -> None:
+    root, data, cfg = quarter_world["root"], quarter_world["data"], quarter_world["cfg"]
+    a, b, c = good_parts(root, "2024-Q1")
+    (tmp_path / "staging").mkdir()
+    joined_path, _, _, _ = tool._combine_forecasts([c, a, b], tmp_path / "staging", cfg)
+    with open_zarr(joined_path) as joined, open_zarr(a) as first:
+        assert joined.sizes["init_time"] == 30 and set(joined.data_vars) == set(first.data_vars)
+        for name in first.data_vars:
+            assert joined[name].attrs == first[name].attrs and joined[name].attrs["units"]
+        assert joined.attrs == first.attrs
+
+    # a later store that declares another unit: an accepted spelling of the same unit still differs
+    # from the first store, and no unit at all would otherwise vanish in the join
+    kelvin = open_zarr(b).load()
+    kelvin["t2m"].attrs["units"] = "kelvin"
+    write_zarr(kelvin, tmp_path / "kelvin.zarr")
+    bare = open_zarr(c).load()
+    del bare["msl"].attrs["units"]
+    write_zarr(bare, tmp_path / "bare.zarr")
+    for stores, variable in (
+        ([a, tmp_path / "kelvin.zarr", c], "t2m"),
+        ([a, b, tmp_path / "bare.zarr"], "msl"),
+    ):
+        with pytest.raises(tool.Refused, match=f"{variable} has other attributes \\(units\\)"):
+            tool.evaluate(stores, data, "2024-Q1", tmp_path / "out", root)
+    assert not list((tmp_path / "out").glob("promotion_*"))
+
+
+def test_a_repeated_evaluation_is_the_same_result_whatever_form_the_input_took(
+    quarter_world: dict, locked: None, tmp_path: Path
+) -> None:
+    """One output directory, the same quarter scored from one store and from three, twice each:
+    every run is accepted, and each form has one directory with a name the program derives."""
+    root, data, label = quarter_world["root"], quarter_world["data"], "2024-Q2"
+    out = tmp_path / "out"
+    whole = data / f"candidates/whole_{label}.zarr"
+    runs = [
+        tool.evaluate(whole, data, label, out, root),
+        tool.evaluate(good_parts(root, label), data, label, out, root),
+        tool.evaluate(good_parts(root, label, "cba"), data, label, out, root),
+        tool.evaluate(whole, data, label, out, root),
+    ]
+    assert all(run.reasons == [] for run in runs)
+    one, three = runs[0].directory, runs[1].directory
+    assert runs[3].directory == one and runs[2].directory == three and one != three
+    assert sorted(p.name for p in out.iterdir()) == sorted([one.name, three.name])  # nothing suffixed
+    for directory in (one, three):
+        assert directory.name == tool._result_name(label, (directory / "verdict.json").read_text())
+    # the same forecast: the same scorecards byte for byte; only the list of input stores differs
+    for name in tool.STAGED_NAMES.values():
+        assert (one / name).read_bytes() == (three / name).read_bytes()
+    verdicts = [json.loads((d / "verdict.json").read_text()) for d in (one, three)]
+    assert [len(v.pop("forecast_inputs")) for v in verdicts] == [1, 3]
+    assert verdicts[0] == verdicts[1] and verdicts[0]["verdict"] == "PASSED"
+
+    # the whole year twice into one directory: the same decision, the same directories
+    first = decide(quarter_world, "gggw", tmp_path / "year")
+    listing = sorted(p.name for p in (tmp_path / "year").iterdir())
+    second = decide(quarter_world, "gggw", tmp_path / "year")
+    assert passed(first) == passed(second) == LABELS[:3]
+    assert first.directory == second.directory
+    assert sorted(p.name for p in (tmp_path / "year").iterdir()) == listing and len(listing) == 5
+
+    # a published result that was changed afterwards is neither overwritten nor taken over
+    (three / "verdict.json").write_text((three / "verdict.json").read_text() + " ")
+    with pytest.raises(tool.Refused, match="is not the result this run produced"):
+        tool.evaluate(good_parts(root, label), data, label, out, root)
+
+
+def test_the_hash_does_not_depend_on_the_order_of_the_input(
+    quarter_world: dict, locked: None, tmp_path: Path
+) -> None:
+    """Whole or split, a forecast has one content hash: init times must be in time order in every
+    store, so a store with the same forecasts in another order is refused, not hashed differently."""
+    from wrfcomp.harness.hashing import content_sha256
+
+    root, data, label = quarter_world["root"], quarter_world["data"], "2024-Q2"
+    whole = open_zarr(data / f"candidates/whole_{label}.zarr").load()
+    backwards = whole.isel(init_time=slice(None, None, -1))
+    assert content_sha256(backwards) != content_sha256(whole)  # why the order has to be fixed
+    write_zarr(backwards, tmp_path / "backwards.zarr")
+    a, b, c = good_parts(root, label)
+    part = open_zarr(b).load()
+    write_zarr(part.isel(init_time=slice(None, None, -1)), tmp_path / "part.zarr")
+    for stores in ([tmp_path / "backwards.zarr"], [a, tmp_path / "part.zarr", c]):
+        with pytest.raises(tool.Refused, match="init times are not in time order"):
+            tool.evaluate(stores, data, label, tmp_path / "out", root)
+        with pytest.raises(tool.Refused, match="init times are not in time order"):
+            tool.promote(stores, data, 2024, tmp_path / "out", root)
+    assert not (tmp_path / "out").exists()
+
+    # in time order, every way of giving the quarter is the one forecast with the one hash
+    digest = content_sha256(whole)
+    forms = [[data / f"candidates/whole_{label}.zarr"], [a, b, c], [c, b, a], [b, c, a]]
+    for number, stores in enumerate(forms):
+        outcome = tool.evaluate(stores, data, label, tmp_path / f"form{number}", root)
+        verdict = json.loads((outcome.directory / "verdict.json").read_text())
+        assert verdict["candidate"]["forecast_sha256"] == digest and outcome.reasons == []
+
+
+# ------------------------------------------------------------------------- promote: 3 of 4 quarters
+
+
+def test_three_of_four_quarters_promote_and_two_do_not(
+    quarter_world: dict, locked: None, tmp_path: Path
+) -> None:
+    all_four = decide(quarter_world, "gggg", tmp_path / "four")
+    assert passed(all_four) == LABELS and all(q.reasons == [] for q in all_four.quarters)
+    assert all_four.promoted and (all_four.model_id, all_four.model_version) == ("synth", "1")
+
+    # exactly three pass: promoted, and the fourth says why it did not pass
+    three = decide(quarter_world, "gggw", tmp_path / "three")
+    assert passed(three) == LABELS[:3] and three.promoted
+    assert "gate not passed against climatology" in three.quarters[3].reasons
+    assert "gate not passed against noaa-gefs" in three.quarters[3].reasons
+    assert tool._report_promotion(three) == 0
+
+    # two pass, two do not: not promoted
+    two = decide(quarter_world, "gwgw", tmp_path / "two")
+    assert passed(two) == [LABELS[0], LABELS[2]] and not two.promoted
+    assert tool._report_promotion(two) == 1
+    assert tool.QUARTERS_REQUIRED == 3
+
+    # the order the stores are given in does not matter: the same record, byte for byte
+    stores = year_stores(quarter_world["root"], "gggw")
+    shuffled = decide(quarter_world, stores[::-1], tmp_path / "shuffled")
+    assert shuffled.directory.name == three.directory.name
+    assert (shuffled.directory / "decision.json").read_bytes() == (
+        three.directory / "decision.json"
+    ).read_bytes()
+
+    # the record of the run: what was decided, from which quarter results, under which rule
+    record = json.loads((three.directory / "decision.json").read_text())
+    assert record["decision"] == "PROMOTED" and record["quarters_passed"] == 3
+    assert record["promotion_rule_version"] == 2 and record["quarters_required"] == 3
+    assert record["candidate"] == {"model_id": "synth", "model_version": "1"}
+    assert [q["verdict"] for q in record["quarters"]] == ["PASSED"] * 3 + ["NOT PASSED"]
+    for entry, quarter in zip(record["quarters"], three.quarters, strict=True):
+        assert entry["result"] == quarter.directory.name and quarter.directory.parent == tmp_path / "three"
+        assert entry["verdict_sha256"] == tool._sha256_file(quarter.directory / "verdict.json")
+    assert json.loads((two.directory / "decision.json").read_text())["decision"] == "NOT PROMOTED"
+
+
+def test_a_missing_quarter_counts_as_not_passed(quarter_world: dict, locked: None, tmp_path: Path) -> None:
+    three_given = decide(quarter_world, "ggg-", tmp_path / "three")
+    assert passed(three_given) == LABELS[:3]
+    last = three_given.quarters[3]
+    assert last.reasons == ["no candidate store was given for this quarter"] and last.directory is None
+    assert tool._report_promotion(three_given) == 0  # 3 of 4 passed
+
+    two_given = decide(quarter_world, "-g-g", tmp_path / "two")
+    assert passed(two_given) == [LABELS[1], LABELS[3]]
+    assert tool._report_promotion(two_given) == 1  # two passing quarters are not enough
+    record = json.loads((two_given.directory / "decision.json").read_text())
+    assert record["quarters"][0]["result"] is None and record["quarters_passed"] == 2
+
+    # a quarter given only in part is scored and does not pass: it is not the pinned quarter
+    stores = year_stores(quarter_world["root"], "ggg-")[:-1]  # Q3 without its last store
+    partial = decide(quarter_world, stores, tmp_path / "partial")
+    assert passed(partial) == LABELS[:2]
+    assert any("n_init_times against climatology differs" in line for line in partial.quarters[2].reasons)
+
+
+def test_stores_of_another_candidate_or_another_harness_are_refused(
+    quarter_world: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, data = quarter_world["root"], quarter_world["data"]
+    good = year_stores(root, "ggg-")
+    out = tmp_path / "out"
+
+    # the synthetic root has no lock: nothing is decided on a tree that is not the locked harness
+    with pytest.raises(tool.Refused, match="is not the locked harness"):
+        decide(quarter_world, good, out)
+    monkeypatch.setattr(tool, "_harness_lock_problems", lambda root: [])
+    with pytest.raises(tool.Refused, match="the harness in use is not the one under"):
+        decide(quarter_world, good, out)
+    monkeypatch.setattr(tool, "_modules_outside_root", lambda root: [])
+    # a scoring process that finds it is not running the harness under the root: nothing counts
+    monkeypatch.setattr(tool, "_run_eval", lambda root, args: tool.EXIT_CHILD_REFUSED)
+    with pytest.raises(tool.Refused, match="did not run the harness under"):
+        decide(quarter_world, good, out)
+    assert not list(out.glob("promotion_*"))
+    monkeypatch.setattr(tool, "_run_eval", in_process_eval)
+
+    # another candidate's passing quarter cannot stand in for one of this candidate's
+    other = data / "candidates/other_2024-Q4.zarr"
+    with pytest.raises(tool.Refused, match="not one model and version"):
+        decide(quarter_world, [*good, other], out)
+    version = open_zarr(good[-1]).load()
+    version.attrs["model_version"] = "2"
+    write_zarr(version, tmp_path / "version.zarr")
+    with pytest.raises(tool.Refused, match="not one model and version"):
+        decide(quarter_world, [*good[:-1], tmp_path / "version.zarr"], out)
+    assert not list(out.glob("promotion_*"))
+    # the other candidate, given all its own stores, is judged on its own
+    own = [data / f"candidates/other_{label}.zarr" for label in LABELS]
+    decision = decide(quarter_world, own, tmp_path / "own")
+    assert decision.model_id == "someone-else" and passed(decision) == LABELS
+
+
+def test_promote_trusts_no_file_supplied_by_the_caller(
+    quarter_world: dict, locked: None, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The verdict comes from this run's own scoring. Result directories that are already in the
+    output directory, whoever wrote them, are not read as evidence."""
+    honest = decide(quarter_world, "ggww", tmp_path / "honest")
+    assert passed(honest) == LABELS[:2] and not honest.promoted
+
+    # the caller plants passing results for the two failed quarters before the run: under invented
+    # names, and as copies of this candidate's passing quarters with the period rewritten
+    out = tmp_path / "planted"
+    out.mkdir()
+    for number, label in ((2, LABELS[2]), (3, LABELS[3])):
+        forged = out / f"promotion_{label}_{'0' * 16}"
+        shutil.copytree(honest.quarters[number - 2].directory, forged)
+        verdict = json.loads((forged / "verdict.json").read_text())
+        verdict["period"] = label
+        (forged / "verdict.json").write_text(json.dumps(verdict, indent=2, sort_keys=True) + "\n")
+    record = json.loads((honest.directory / "decision.json").read_text())
+    record["decision"], record["quarters_passed"] = "PROMOTED", 4
+    (out / "promotion_2024_0000000000000000").mkdir()
+    (out / "promotion_2024_0000000000000000/decision.json").write_text(json.dumps(record))
+    planted = decide(quarter_world, "ggww", out)
+    assert passed(planted) == LABELS[:2] and not planted.promoted
+    assert (planted.directory / "decision.json").read_bytes() == (
+        honest.directory / "decision.json"
+    ).read_bytes()
+
+    # planted under the very name this run will publish: refused, never adopted
+    out = tmp_path / "squatted"
+    target = out / honest.quarters[2].directory.name
+    shutil.copytree(honest.quarters[0].directory, target)
+    with pytest.raises(tool.Refused, match="is not the result this run produced"):
+        decide(quarter_world, "ggww", out)
+
+    # and the command line has no way to hand in a result directory
+    with pytest.raises(SystemExit):
+        tool.main(["promote", "--year", "2024", str(honest.quarters[0].directory)])
+    capsys.readouterr()
+    # given where a forecast store is expected, a result directory is not a forecast
+    with pytest.raises(tool.Refused, match="cannot open|is refused|has no"):
+        decide(quarter_world, [honest.quarters[0].directory], tmp_path / "as-store")
+
+
+def test_promote_refuses_requests_it_cannot_decide(
+    quarter_world: dict, base_world: dict, locked: None, tmp_path: Path
+) -> None:
+    root, data = quarter_world["root"], quarter_world["data"]
+    good = year_stores(root, "gggg")
+    out = tmp_path / "out"
+    with pytest.raises(tool.Refused, match="no candidate forecast was given"):
+        decide(quarter_world, [], out)
+    with pytest.raises(tool.Refused, match="listed twice"):
+        decide(quarter_world, [*good, good[0]], out)
+    with pytest.raises(tool.Refused, match="no such forecast store"):
+        decide(quarter_world, [*good, tmp_path / "nowhere.zarr"], out)
+    # a store must lie inside one quarter of the year asked for
+    whole = data / "candidates/whole_2024-Q1.zarr"
+    shifted(whole, tmp_path / "spans.zarr", "2024-03-25T00:00")
+    with pytest.raises(tool.Refused, match="holds init times of 2024-Q1, 2024-Q2: one quarter per store"):
+        decide(quarter_world, [tmp_path / "spans.zarr"], out)
+    shifted(whole, tmp_path / "earlier.zarr", "2023-01-01T00:00")
+    with pytest.raises(tool.Refused, match="holds init times of 2023-Q1, not of 2024"):
+        decide(quarter_world, [*good, tmp_path / "earlier.zarr"], out)
+    with pytest.raises(tool.Refused, match="no pinned references for 2023-Q1"):
+        tool.promote(good, data, 2023, out, root)
+    # a tree that pins no quarters cannot promote anything
+    with pytest.raises(tool.Refused, match="no pinned references for 2024-Q1, 2024-Q2, 2024-Q3, 2024-Q4"):
+        tool.promote(good, data, 2024, out, base_world["root"])
+    assert not out.exists()
+
+
+def test_promote_command_line_and_who_may_say_promoted(
+    quarter_world: dict,
+    locked: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    tmp_path: Path,
+) -> None:
+    root, data = quarter_world["root"], quarter_world["data"]
+    monkeypatch.setattr(tool, "ROOT", root)
+    common = ["--year", "2024", "--data-dir", str(data), "--out", str(tmp_path / "year")]
+
+    def stores(kinds: str) -> list[str]:
+        return [str(path) for path in year_stores(root, kinds)]
+
+    assert tool.main(["promote", *common, "--forecast", *stores("gggw")]) == 0
+    out = capsys.readouterr().out
+    assert "PROMOTED: synth version 1. 3 of 4 quarters of 2024 passed (rule: at least 3)" in out
+    assert "NOT PROMOTED" not in out and "2024-Q4: NOT PASSED" in out and "2024-Q1: PASSED" in out
+    assert "  - gate not passed against climatology" in out
+
+    assert tool.main(["promote", *common, "--forecast", *stores("ggw-")]) == 1
+    out = capsys.readouterr().out
+    assert "NOT PROMOTED: synth version 1. 2 of 4 quarters of 2024 passed" in out
+    assert "2024-Q4: NOT PASSED\n  - no candidate store was given for this quarter" in out
+    assert "PROMOTED" not in out.replace("NOT PROMOTED", "")
+
+    assert tool.main(["promote", *common, "--forecast", *stores("g---"), stores("g---")[0]]) == 2
+    assert "REFUSED: a candidate store is listed twice" in capsys.readouterr().out
+    assert tool.main(["promote", *common, "--forecast", str(tmp_path / "nowhere")]) == 2
+    assert "REFUSED: candidate: no such forecast store" in capsys.readouterr().out
+
+    # a single quarter, even a passing one, never says PROMOTED
+    parts = [str(path) for path in good_parts(root, LABELS[0])]
+    args = ["--data-dir", str(data), "--period", LABELS[0], "--out", str(tmp_path / "out")]
+    assert tool.main(["evaluate", "--forecast", *parts, *args]) == 0
+    out = capsys.readouterr().out
+    assert "PASSED for 2024-Q1" in out and "One quarter is not a promotion" in out and "PROMOTED" not in out
+    assert tool.main(["evaluate", "--forecast", str(data / f"candidates/weak_{LABELS[0]}.zarr"), *args]) == 1
+    out = capsys.readouterr().out
+    assert "NOT PASSED for 2024-Q1" in out and "PROMOTED" not in out
+
+
+def test_committed_quarter_references_are_never_a_promotion(capsys: pytest.CaptureFixture) -> None:
+    # reference scorecards are not a candidate's: `verify` says so and never says PROMOTED
+    cards = [str(ROOT / "experiments" / f"{name}_2024-Q1.json") for name in ("gefs", "persistence")]
+    assert tool.main(["verify", *cards, "--period", "2024-Q1"]) == 1
+    out = capsys.readouterr().out
+    assert "INCONSISTENT" in out and "PROMOTED" not in out

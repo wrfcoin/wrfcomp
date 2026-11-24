@@ -61,6 +61,12 @@ LOCKED_FILES = (
         for month in range(1, 13)
         for model in ("climatology", "gefs", "persistence")
     ),
+    # the quarterly reference scorecards (promotion rule 2): three models, the four quarters of 2024
+    *(
+        f"experiments/{model}_2024-Q{quarter}.json"
+        for quarter in range(1, 5)
+        for model in ("climatology", "gefs", "persistence")
+    ),
 )
 # Packages whose versions decide the numbers in a scorecard.
 SCORING_DEPENDENCIES = ("numpy", "pandas", "scipy", "scores", "xarray")

@@ -1,8 +1,10 @@
 # Harness lock
 
 **Locked on 2026-11-23 by the project owner, at harness version 0.1.0**, after the Gate 1 reference run
-(`experiments/`). Two owner decisions are behind it: the scoring harness is frozen at 0.1.0, and a candidate is
-promoted only if it passes the gate against **both** climatology and NOAA GEFS.
+(`experiments/`). Three owner decisions are behind it: the scoring harness is frozen at 0.1.0; a candidate
+passes a period only if it passes the gate against **both** climatology and NOAA GEFS; and a candidate is
+promoted only if it passes in **at least 3 of the 4 calendar quarters** of 2024, each quarter scored as one
+period (promotion rule version 2).
 
 This page says exactly what is enforced, by what, and what is not enforced.
 
@@ -19,7 +21,7 @@ from an easier test instead of a better forecast. Scores from different harness 
 | `configs/` (split boundaries, station list, gate thresholds) | yes | yes |
 | `src/wrfcomp/__init__.py` (the package initializer and its version) | yes | yes |
 | `docs/VERIFICATION_PROTOCOL.md`, `scripts/check_promotion.py` | yes | yes |
-| `experiments/REFERENCES.json` and the 36 Gate 1 reference scorecards (climatology, GEFS, persistence; every month of 2024) | yes | yes |
+| `experiments/REFERENCES.json`, the 36 monthly Gate 1 reference scorecards (climatology, GEFS, persistence; every month of 2024) and the 12 quarterly ones (the same three models, `2024-Q1` to `2024-Q4`) | yes | yes |
 | Versions of `scores`, `numpy`, `xarray`, `scipy`, `pandas` in `uv.lock` | yes (as versions) | yes, through the manifest |
 | The lock itself: `HARNESS_LOCK.json`, `scripts/harness_lock.py`, `tests/test_harness_lock.py`, `tests/test_check_promotion.py`, `docs/HARNESS_LOCK.md`, everything under `.github/` | no | yes |
 
@@ -95,12 +97,24 @@ A comment does not start a new run of this check. After commenting, the owner re
 or adds or removes any label on the pull request, which starts a run. The label
 `owner-approved-harness-change` may still be used as a marker for people; the gate does not look at it.
 
-### 3. `scripts/check_promotion.py evaluate`: the candidate beat both references
+### 3. `scripts/check_promotion.py`: both references, in 3 of 4 quarters
+
+Two commands. `evaluate` scores one period and says PASSED or NOT PASSED. `promote` takes the candidate's
+stores for the whole year, scores the four quarters itself and is the only command that says PROMOTED.
 
 ```sh
+# one quarter; the candidate as one store, or as several stores (its months)
 uv run --locked python -P scripts/check_promotion.py evaluate \
-  --forecast <candidate.zarr> --data-dir "$WRFCOMP_DATA_DIR" --period 2024-01 --out <dir>
+  --forecast <2024-01.zarr> <2024-02.zarr> <2024-03.zarr> \
+  --data-dir "$WRFCOMP_DATA_DIR" --period 2024-Q1 --out <dir>
+
+# the decision: the candidate's twelve monthly stores, scored here
+uv run --locked python -P scripts/check_promotion.py promote --year 2024 \
+  --forecast <2024-01.zarr> <2024-02.zarr> ... <2024-12.zarr> \
+  --data-dir "$WRFCOMP_DATA_DIR" --out <dir>
 ```
+
+#### `evaluate`: one period
 
 Everything the verdict rests on comes from one tree, the checkout the script is in:
 
@@ -129,12 +143,81 @@ It then judges the two scorecards those processes produced:
 - the candidate is not a reference, by model id or by forecast content;
 - both gates are passed.
 
-It prints `PROMOTED` only then, and only in this mode. Promotion is per period: run it for each pinned period
-(the twelve months `2024-01` to `2024-12`; December covers the init times up to 2024-12-17T12Z). No reference directory, reference file or config can be passed in.
+It prints `PASSED for <period>` only then, otherwise `NOT PASSED for <period>` with the reasons. It never prints
+`PROMOTED`. No reference directory, reference file or config can be passed in.
+
+**Pinned periods.** The four quarters `2024-Q1` to `2024-Q4` are the ones promotion is decided on. A quarter
+is ONE period: its reference forecasts are the monthly reference stores joined along init time
+(`scripts/run_gate1.py --period 2024-Q1`, under `gate1/2024-Q1_h00-12/` in the data directory), and its
+reference scorecards are one evaluation over the whole quarter, not an average of months. Q4 ends with the init
+of 2024-12-17T12Z, as December does. The twelve months `2024-01` to `2024-12` stay pinned for diagnosis: **a
+monthly result is diagnostic only** and counts for nothing in a promotion.
+
+**A candidate given as several stores.** For a quarter, `--forecast` takes one store or several (for example
+the three monthly stores). Several stores must be one model id and version, with the same variables,
+coordinates, variable attributes (units), leads, stations and members, and their init times must not overlap
+or interleave; anything else is refused. They are joined along init time in time order, whatever order they
+are given in, written once into the run's private directory, scored from there and removed. Variable
+attributes are carried into the joined store unchanged. The forecast hash in the scorecards is the harness content hash of the joined
+forecast. That hash depends only on values, coordinates, dimensions and dtypes, not on chunking or file layout,
+so the same monthly stores always give the same hash, and the same hash as the quarter stored whole.
+`verdict.json` lists the content hash, first and last init time and number of init times of every input store.
+
+**Every candidate store is checked before any of its values is read or hashed**, from coordinates and
+attributes only: its init and valid times against the sealed split, its layout with the harness forecast
+validator (dimensions, dtypes, units, model id and version), and its init times, which must be in time order.
+The last rule is what makes the hash independent of how the forecast is handed in: the content hash depends
+on the order of the init times, so a store holding the same forecasts in another order is refused rather than
+hashed to something else.
 
 The two scorecards and a `verdict.json` are written in a private directory created for the run and published
-at the end as `<out>/promotion_<period>_<first 16 hex digits of the forecast hash>/`. The file names are
+at the end as `<out>/promotion_<period>_<first 16 hex digits of the sha256 of verdict.json>/`. `verdict.json`
+names the sha256 of both scorecards, so the directory name identifies the whole result: the same run always
+lands in the same directory, and running it again is accepted and changes nothing. A quarter scored from one
+store and from its three monthly stores gives the same scorecards byte for byte and two directories (the list
+of input stores differs). If a directory of that name exists with other contents, it was changed after it was
+written: the run is refused and nothing is overwritten. The file names are
 fixed by the program. The candidate's model id is recorded inside the files and is never part of a path.
+`verdict.json` holds the period, `PASSED` or `NOT PASSED` with the reasons, the candidate (model id, version,
+forecast hash), the input stores, the sha256 of each scorecard file, the harness and protocol version, the
+sha256 of `experiments/REFERENCES.json`, and `promotion_rule_version`.
+
+#### `promote`: at least 3 of 4 quarters
+
+`promote` takes a year, a data directory and the candidate's forecast stores for that year (its twelve monthly
+stores). It does the scoring itself:
+
+- every store is checked as above before anything is read; all stores must be one model id and version; each
+  must lie inside one calendar quarter of the year;
+- the stores are sorted into the four quarters by their init times, and `evaluate` is run for each quarter
+  that has stores, exactly as described above: the candidate against both pinned references, every scoring
+  in a separate process on the locked harness;
+- a quarter with no store has not passed.
+
+It prints one line per quarter with the reasons, then `PROMOTED` if at least 3 of the 4 quarters passed and
+`NOT PROMOTED` otherwise. It refuses outright (exit code 2) when the tree is not the locked harness, when a
+scoring process finds it is not running that harness, when the quarters of that year are not pinned, when no
+store is given or one is given twice, when a store is outside the year or spans two quarters, and when the
+stores are not one candidate.
+
+**No file supplied by the caller is trusted for the verdict.** `promote` takes forecasts, not results. It reads
+no scorecard, verdict or result directory that it did not compute in the same run, and the command line has
+no argument for one. Whatever already lies in the output directory is not evidence: a result directory planted
+there is ignored, or, if it sits under the very name this run would publish and holds something else, the run
+is refused.
+
+The four quarter results are published under `--out` as `evaluate` publishes them, next to
+`promotion_<year>_<id>/decision.json`: the decision, the candidate, each quarter's verdict, reasons, result
+directory and the sha256 of its `verdict.json`, the rule version, harness and protocol version and the sha256
+of `REFERENCES.json`. These files are a record of the run. They are an input to nothing.
+
+**Promotion rule version.** `promotion_rule_version` is 2: at least 3 of 4 quarters, each as one period.
+Version 1 was the rule before this change: a single month decided. It is separate from `protocol_version` on
+purpose. The rule change touches no metric, mask or threshold, so the scorecards and the pinned references are
+exactly as before and `protocol_version` stays 0.1.0. A verdict written under rule version 1 has no
+`promotion_rule_version` field.
+
+#### `verify`
 
 `python -P scripts/check_promotion.py verify A.json B.json --period P` applies the same rules to two scorecards that already
 exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
@@ -177,7 +260,17 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
   that matters is re-run by a second party from read-only inputs; the scorecards are deterministic, so the
   bytes must match.
 - **`verify` proves nothing about origin.** A hand-made pair of scorecards with consistent numbers passes it.
-  Only `evaluate` computes the numbers.
+  Only `evaluate` and `promote` compute the numbers.
+- **A printed `PROMOTED`, a `decision.json` or a result directory is not proof that a run happened.** They are
+  text and files; anyone can write them. The proof is running `promote` again on the candidate's stores under
+  the locked tree. The published files exist so that a rerun can be compared with them.
+- **`promote` does not know that the twelve stores are one forecast system.** It requires one model id and
+  version. A candidate whose author used different settings in different quarters under one version string
+  would not be noticed; that is a matter for review of the candidate, not for this check.
+- **`promote` does not check that the stores are months.** It needs every store to lie inside one quarter. A
+  quarter given in part is scored and does not pass, because it is not the pinned quarter.
+- **Which quarters failed is not weighed.** Any 3 of 4 promote. A candidate that fails the same season every
+  year passes the rule.
 - **`evaluate` on a private machine is as trustworthy as that machine.** It checks the harness code, config,
   references, truth and thresholds against pinned hashes, but it runs where the candidate's author runs it.
   A promotion that matters should be re-run by someone else from the same inputs; the scorecards are
