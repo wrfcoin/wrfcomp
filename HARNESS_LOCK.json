@@ -9,11 +9,11 @@
       "mode": "100644"
     },
     "docs/VERIFICATION_PROTOCOL.md": {
-      "blob": "fb4228ad3663141918a8cfd19e14f74737a4da33",
+      "blob": "7b6a6bcfd0bb45d9d794a73de7a094597361a3e6",
       "mode": "100644"
     },
     "experiments/REFERENCES.json": {
-      "blob": "b8c1770d9a7e33fd108fb3b52090770d11f27fff",
+      "blob": "e495b40c2f3c98ad49b0c2a26c1c0fd28afa5eda",
       "mode": "100644"
     },
     "experiments/climatology_2024-01.json": {
@@ -64,6 +64,22 @@
       "blob": "bf58dbca5c4e347b75a9a805de2b831f18c82196",
       "mode": "100644"
     },
+    "experiments/climatology_2024-Q1.json": {
+      "blob": "99b6322f4ef26eee8f79749e03c9f300c3836174",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-Q2.json": {
+      "blob": "bd23334ba74f055325c64c4bdbdfda804a154041",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-Q3.json": {
+      "blob": "86ae8c7a2db20266defa35b0babf1fa3e7663021",
+      "mode": "100644"
+    },
+    "experiments/climatology_2024-Q4.json": {
+      "blob": "6d31923c16cd7628b73e8d3f40ca15a7fb17967d",
+      "mode": "100644"
+    },
     "experiments/gefs_2024-01.json": {
       "blob": "c0010e0826824b8f1c4f4bfbb7913d5b840c2d35",
       "mode": "100644"
@@ -110,6 +126,22 @@
     },
     "experiments/gefs_2024-12.json": {
       "blob": "06cee83eb99ee085f3956c396416d92c71fa800b",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-Q1.json": {
+      "blob": "ecdb429214e511a2e22cec4629b680187a59ac48",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-Q2.json": {
+      "blob": "32798d0e2ebaf6098123072d28954c68d168f695",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-Q3.json": {
+      "blob": "f1dbb87d06e94bf943a8b95fe1bca1e37b806275",
+      "mode": "100644"
+    },
+    "experiments/gefs_2024-Q4.json": {
+      "blob": "fa8481c27044b9da2bada4d5bf077de1093f1a23",
       "mode": "100644"
     },
     "experiments/persistence_2024-01.json": {
@@ -160,8 +192,24 @@
       "blob": "335903ce22dfc847412fce2f00922c8b6d7852e2",
       "mode": "100644"
     },
+    "experiments/persistence_2024-Q1.json": {
+      "blob": "b399e94598cd7c47b5878715fb5ee1d21e6fdea3",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-Q2.json": {
+      "blob": "fa57dd73d74991f53b926217b0f3babf9e6e03f5",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-Q3.json": {
+      "blob": "391cf069333be086a4b2cbe1f3f5f9a9ceccc4e8",
+      "mode": "100644"
+    },
+    "experiments/persistence_2024-Q4.json": {
+      "blob": "8576ac06279ce157954604c2ebc4f600c2600861",
+      "mode": "100644"
+    },
     "scripts/check_promotion.py": {
-      "blob": "4b0ea64a233d1fcf312fa1efb9fa18862126aa9e",
+      "blob": "a2f3b073da25714b3f8afde75f30ce4c4a2c295b",
       "mode": "100644"
     },
     "src/wrfcomp/__init__.py": {
@@ -248,7 +296,19 @@
       "experiments/persistence_2024-11.json",
       "experiments/climatology_2024-12.json",
       "experiments/gefs_2024-12.json",
-      "experiments/persistence_2024-12.json"
+      "experiments/persistence_2024-12.json",
+      "experiments/climatology_2024-Q1.json",
+      "experiments/gefs_2024-Q1.json",
+      "experiments/persistence_2024-Q1.json",
+      "experiments/climatology_2024-Q2.json",
+      "experiments/gefs_2024-Q2.json",
+      "experiments/persistence_2024-Q2.json",
+      "experiments/climatology_2024-Q3.json",
+      "experiments/gefs_2024-Q3.json",
+      "experiments/persistence_2024-Q3.json",
+      "experiments/climatology_2024-Q4.json",
+      "experiments/gefs_2024-Q4.json",
+      "experiments/persistence_2024-Q4.json"
     ]
   },
   "scoring_dependencies": {
