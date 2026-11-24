@@ -25,9 +25,9 @@ Code: `wrfcomp.assimilation.madis_archive` (reader), `wrfcomp.assimilation.phase
 ## How the registered rule is carried out
 
 These are readings of the registered text, written down so a reviewer can disagree with them. None changes
-a number. They were reviewed on pull request 36 (outside review, 2026-11-24, verdict CHANGES); readings 3,
-4, 5 and 9 below are as corrected after that review, and each correction has a test built on the
-reviewer's synthetic case.
+a number. They were reviewed twice on pull request 36 (outside review, 2026-11-24, verdict CHANGES both
+times); readings 3, 4, 5 and 9 and the section after them are as corrected after those reviews, and each
+correction has a test built on the reviewer's synthetic case.
 
 1. **"The shipped quality control" (rule 3)** is the July trial runner's procedure
    (`scripts/run_qc_trial.py`) with the gates of `wrfcomp.assimilation.qc` and the state of
@@ -56,15 +56,19 @@ reviewer's synthetic case.
 8. **COVERED** counts every issue of the year (704), including the first days when nothing can be defined.
    The builder refuses to run unless the extract, the truth file and the v3 stores are all on exactly the
    704 registered issue times and the 500 stations of `configs/stations_conus.csv`.
-9. **Amendment 1 (arrival time)** is decided in the archive reader, on the archive's own timestamps at
-   full precision, **before** repeated records are merged and before any time is converted
-   (`madis_archive.arrived_by_next_issue`). A record that had not arrived by the first 00Z or 12Z at or
-   after its measurement, or that has no arrival time, never reaches a stored table. A late repeat
-   therefore cannot displace a timely report; of several timely versions the one that arrived last is
-   kept. Stored times are rounded up to the second, so a time just after an issue time stays after it. The
-   same test is repeated on the stored values when tables are saved, loaded, partitioned and read by the
-   QC. Official readings keep the v3 rule. (Corrected: the rule was applied after repeats had been merged,
-   on times truncated to the second and a delay field that saturated.)
+9. **Amendment 1 (arrival time)** is decided in the archive reader, on the archive's own timestamps,
+   **before** repeated records are merged (`madis_archive.arrived_by_next_issue`). A record that had not
+   arrived by the first 00Z or 12Z at or after its measurement, or that has no arrival time, never reaches
+   a stored table. A late repeat therefore cannot displace a timely report. The same test is repeated on
+   the stored times when tables are saved, loaded, partitioned and read by the QC. Official readings keep
+   the v3 rule.
+10. **Timestamps keep their precision.** Measurement and arrival times are stored as whole nanoseconds,
+    converted so that no time crosses a whole second and distinct archive times stay distinct. The
+    15-minute window is therefore exact: a report measured 900.25 s before T is outside it. Two records
+    are versions of one report only if their measurement times are exactly equal. The version kept is the
+    one that arrived last, then the one whose content sorts last; it does not depend on the order of the
+    records in the archive, in a file or across files. (Corrected twice: first the rule ran after repeats
+    were merged; then times were still rounded to the second.)
 
 ## Nothing incomplete or stale can become a forecast
 
@@ -72,20 +76,26 @@ reviewer's synthetic case.
 - Each daily file says which day it holds and which source hours the archive did not have. A missing
   source hour is recorded and carried into the extract. A missing day file is work that has not run:
   partition refuses.
-- The tiles carry a digest of the daily files. The QC outputs carry a digest of the tiles, the truth file,
-  the GEFS cycles and the QC code. Anything with another digest is refused, never reused.
-- Merge needs an output for every tile. A timing run on some tiles has its own folder and cannot be merged.
-- The builder checks the extract (complete, current policy, schedule, stations) and the v3 stores before it
-  writes anything.
+- The tile manifest lists every tile-month file with its sha256. A missing, altered or unlisted file is
+  refused by partition, by the QC run and by merge.
+- A QC run is named by a digest of: the tile contents, the truth file, the **content** of the GEFS inputs
+  as the QC reads them (not their names), and the QC code. Outputs with another digest are refused, never
+  reused. Merge needs an output for every tile; a timing run on some tiles has its own folder.
+- The extract records that digest and the truth file's sha256, and its own sha256 is published in its
+  summary file. The builder refuses the extract unless (a) it is the published file, (b) the truth file on
+  disk is the one the QC used, and (c) the run record recomputed from the tiles, truth, GEFS and code now
+  present is the extract's. Old QC weights cannot be combined with other official readings.
+- The builder also checks the 704 issue times and the 500 stations, in the extract and in the v3 stores,
+  before it writes anything.
 
 ## Measured before the bulk run (2024-01-01)
 
 | | One day | Year estimate (352 days) |
 | --- | ---: | ---: |
 | Transfer, 4 files at once | 550 MiB in 50 s | about 190 GiB, about 5 h |
-| Stored, anonymised, four variables | 7.5 MiB (1,359,906 reports, 10,086 stations) | about 2.7 GiB |
-| Tile working copy | 13 MB | about 4.5 GB |
-| QC, 8 processes | 50 s wall, 397 CPU-seconds, 1,890,062 channel-reports | about 40 CPU-hours |
+| Stored, anonymised, four variables, nanosecond times | 9.7 MiB (1,335,084 reports, 10,084 stations) | about 3.4 GiB |
+| Tile working copy | 15 MB | about 5.3 GB |
+| QC, 8 processes | 49 s wall, 1,856,819 channel-reports | about 30 CPU-hours |
 
 ## Acceptance tests
 
@@ -93,12 +103,15 @@ reviewer's synthetic case.
 tokens; positions rounded in the parser and again on save; sealed times refused; no record content in an
 error or a repr; the fetch script refuses 2023; a late repeat never displaces a timely report; an arrival a
 quarter of a second after T is late; a long but timely delay is kept; nothing measured before the year is
-kept; a table from before the amendment is refused.
+kept; a table from before the amendment is refused; sub-second times never cross a whole second; the
+version kept does not depend on record order.
 
 `tests/test_phase3_qc.py`: driver equals trial runner; the forecast-choice table equals the trial's rule;
 changing or removing every report after T leaves every weight at or before T, and the snapshot at T,
 identical; the 15-minute window and the positive-weight rule; official readings measured before the year
-are removed; partition, merge and a timing run refuse missing, partial and stale products.
+are removed; a report 900.25 s before T is outside the window; partition, run, merge and a timing run
+refuse missing, partial, altered and stale products, including a missing tile-month and a GEFS store with
+the same name and other content.
 
 `tests/test_model_citizen_arms.py`: only the six cells change and the rest is the v3 bytes; cold start
 changes nothing; one shift for all members; dewpoint cap; gains are zero without history, shrunk and
@@ -106,7 +119,8 @@ clipped; fewer than three stations or a single cell never form a value; changing
 after T leaves every forecast issued up to T identical; truth from before 1 January is refused; issues must
 be in order; the registered constants are asserted by value; an official reading measured before the year
 is not a reading; one token at several positions counts once; the build refuses incomplete, stale or
-off-schedule inputs before writing; stores published month by month equal the uninterrupted replay.
+off-schedule inputs before writing, and an extract that is not the published one or not made from the
+truth, tiles, GEFS and code now present; stores published month by month equal the uninterrupted replay.
 
 ## Results
 
