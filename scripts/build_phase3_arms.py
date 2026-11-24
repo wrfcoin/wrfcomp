@@ -78,19 +78,19 @@ def load_extract(path: Path, year: int, issues: np.ndarray, stations: list[str])
     order = np.argsort(ds.row_issue.values, kind="stable")
     issue = ds.row_issue.values[order]
     bounds = np.searchsorted(issue, np.arange(ds.sizes["issue"] + 1))
-    names = ("row_station", "row_var", "row_value", "row_weight", "row_age_s")
+    names = ("row_station", "row_var", "row_value", "row_weight", "row_age_ns")
     columns = {k: ds[k].values[order] for k in names}
 
     def snapshot(i: int) -> dict:
         rows = slice(bounds[i], bounds[i + 1])
         out = {}
         for v, var in enumerate(arms.VARIABLES):
-            value, weight, age = np.full(n, np.nan), np.zeros(n), np.zeros(n)
+            value, weight, age = np.full(n, np.nan), np.zeros(n), np.zeros(n, dtype=np.int64)
             pick = columns["row_var"][rows] == v
             station = columns["row_station"][rows][pick]
             value[station] = columns["row_value"][rows][pick]
             weight[station] = columns["row_weight"][rows][pick]
-            age[station] = columns["row_age_s"][rows][pick]
+            age[station] = columns["row_age_ns"][rows][pick]
             out[var] = (value, weight, age)
         return out
 

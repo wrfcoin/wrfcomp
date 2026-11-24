@@ -266,7 +266,7 @@ def run_tile(name: str) -> dict:
         data[k] = station(k)
         sun[k] = p3._sun(data[k].times, data[k].lat, data[k].lon, trial.CFG)
         source[k] = p3.station_source(data[k], official, forecasts, trial, sun=sun[k])
-    rec = {key: [] for key in ("station", "issue", "var", "value", "weight", "earned", "age_s")}
+    rec = {key: [] for key in ("station", "issue", "var", "value", "weight", "earned", "age_ns")}
     stats = []
     n_reports = 0
     for local, k in enumerate(core):
@@ -292,7 +292,7 @@ def run_tile(name: str) -> dict:
             rec["value"].append(value[ix].astype(np.float32))
             rec["weight"].append(weight[ix].astype(np.float32))
             rec["earned"].append(earned[ix])
-            rec["age_s"].append(age[ix].astype(np.int32))
+            rec["age_ns"].append(age[ix].astype(np.int64))
             row[v] = len(channel.weights)
             row[2 + v] = int(np.count_nonzero(channel.weights > 0))
             row[4] |= bool(channel.copycat.any())
@@ -383,7 +383,7 @@ def write_extract(path: Path, cat: dict, issues: np.ndarray, official_ids, attrs
             "row_value": ("row", np.asarray(cat["value"]).astype(np.float32)),
             "row_weight": ("row", np.asarray(cat["weight"]).astype(np.float32)),
             "row_credential": ("row", np.asarray(cat["earned"]).astype(bool)),
-            "row_age_s": ("row", np.asarray(cat["age_s"]).astype(np.int32)),
+            "row_age_ns": ("row", np.asarray(cat["age_ns"]).astype(np.int64)),
             "issue_time": ("issue", np.asarray(issues).astype("datetime64[s]").astype(np.int64)),
             "official_station_id": ("official", np.asarray(official_ids).astype("S11")),
         },
@@ -417,7 +417,7 @@ def merge(data_dir: Path, year: int) -> dict:
         )
     names = (
         "token", "lat", "lon", "elevation_m", "stats",
-        "station", "issue", "var", "value", "weight", "earned", "age_s",
+        "station", "issue", "var", "value", "weight", "earned", "age_ns",
     )  # fmt: skip
     parts = {k: [] for k in names}
     offset = 0

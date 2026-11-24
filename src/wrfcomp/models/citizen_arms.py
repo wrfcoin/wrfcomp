@@ -231,8 +231,8 @@ class Replay:
     # -- one issue ---------------------------------------------------------------------------
 
     def issue(self, a: xr.Dataset, snapshot: dict):
-        """``a`` is one v3 issue. ``snapshot[var]`` is (value, weight) or (value, weight, age in
-        seconds) per citizen station row at this issue: the latest positive-weight report measured in
+        """``a`` is one v3 issue. ``snapshot[var]`` is (value, weight) or (value, weight, exact age in
+        nanoseconds) per citizen station row at this issue: the latest positive-weight report measured in
         the 15 minutes up to the issue time (NaN and 0 when there is none). Returns (B, C, diagnostics)."""
         if (
             a.sizes["init_time"] != 1
@@ -270,7 +270,7 @@ class Replay:
             own = reading - previous.mean_own_lead[var] if previous is not None else np.full(size, np.nan)
             value, weight, *rest = snapshot[var]
             value, weight = np.asarray(value, float), np.asarray(weight, float)
-            age = np.asarray(rest[0], float) if rest else np.zeros(len(value))
+            age = np.asarray(rest[0]).astype(np.int64) if rest else np.zeros(len(value), dtype=np.int64)
             citizen, difference = self._neighbourhood(var, t, reading, value, weight, age, diag)
             out_b, out_c = members.copy(), members.copy()
             mean_b = np.empty((len(LEAD_HOURS), size))

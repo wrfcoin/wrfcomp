@@ -43,7 +43,9 @@ correction has a test built on the reviewer's synthetic case.
 4. **A station is a token.** If its stored position (0.1 degree, 10 m) changes, its QC history starts
    again at the new position with no trust. But it is still one station: of several rows of one token
    near an airport, only the row with the newest report counts towards the three-station minimum and
-   enters the median. (Corrected: positions were counted as separate stations.)
+   enters the median. "Newest" is judged on the exact report age, carried in nanoseconds from the QC
+   through the extract: 60.1 s before T is newer than 60.9 s. (Corrected: positions were counted as
+   separate stations; then ages were floored to the second.)
 5. **Year isolation is applied to measurement times.** Citizen: a report measured before 2024-01-01T00Z is
    dropped by the parser and again where the QC reads its input. Official: a reading whose label is in
    2024 but whose measurement time is not (the 00Z label of 1 January with a negative offset) is removed

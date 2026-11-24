@@ -261,7 +261,7 @@ def test_issue_snapshot_takes_the_latest_positive_weight_report_of_the_last_15_m
     )
     has, value, weight, _, age = p3.issue_snapshot(result, [issue])
     assert (
-        has[0] and value[0] == 3 and weight[0] == 0.3 and age[0] == 900
+        has[0] and value[0] == 3 and weight[0] == 0.3 and age[0] == 900 * 10**9
     )  # the 4-minute-old report has weight 0
     has, value, *_ = p3.issue_snapshot(result, [issue + M])
     assert has[0] and value[0] == 5  # the report measured one second after T counts later, never at T
@@ -273,6 +273,9 @@ def test_issue_snapshot_takes_the_latest_positive_weight_report_of_the_last_15_m
     assert not p3.issue_snapshot(edge, [issue])[0][0]
     assert p3.issue_snapshot(_channel([-900], [7], [0.5], issue), [issue])[0][0]
     assert not p3.issue_snapshot(_channel([0.25], [7], [0.5], issue), [issue])[0][0]  # measured after T
+    # Review case: the age is exact, so 60.9 s and 60.1 s are different ages (not both "60").
+    ages = [p3.issue_snapshot(_channel([s], [7], [0.5], issue), [issue])[4][0] for s in (-60.9, -60.1)]
+    assert ages == [60_900_000_000, 60_100_000_000] and ages[1] < ages[0]
     only_zero = _channel([-300, -100], [1, 2], [0.0, 0.0], issue)
     assert not p3.issue_snapshot(only_zero, [issue])[0][0]
     newest = _channel([-600, -100], [1, 2], [0.4, 0.2], issue)
@@ -404,7 +407,7 @@ def _fake_run(tmp_path, script, monkeypatch, tiles):
         "value": [280.0],
         "weight": [0.4],
         "earned": [False],
-        "age_s": [60],
+        "age_ns": [60 * 10**9],
     }
     for name in tiles:
         script.write_tile_output(
@@ -431,7 +434,7 @@ def test_merge_refuses_a_partial_run_and_a_run_from_other_inputs(tmp_path, monke
         "value": [280.0],
         "weight": [0.4],
         "earned": [False],
-        "age_s": [60],
+        "age_ns": [60 * 10**9],
     }
     args = (["CW000000000"], [40.0], [-100.0], [500.0], [[9, 9, 4, 4, 0, 0]], rows)
     script.write_tile_output(out / f"{first}.npz", record["digest"], *args)
@@ -498,7 +501,7 @@ def test_a_timing_run_has_its_own_folder_and_merge_never_reads_it(tmp_path, monk
         "value": [280.0],
         "weight": [0.4],
         "earned": [False],
-        "age_s": [60],
+        "age_ns": [60 * 10**9],
     }
     for name in manifest["tiles"]:
         script.write_tile_output(

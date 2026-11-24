@@ -40,7 +40,7 @@ from .trust import StationState, advance_state, suspected_copy, veto_recent_copy
 
 THERMAL = ("t2m", "td2m")
 YEAR_END = {2024: "2024-12-17T12"}  # the last issue of each year that may be built
-EXTRACT_FORMAT = "phase3-extract.v3"
+EXTRACT_FORMAT = "phase3-extract.v4"
 NEIGHBOUR_KM = 50.0  # docs/PHASE3_DESIGN.md, rule 4
 WINDOW_MIN = 15  # rule 3
 _REPO = Path(__file__).resolve().parents[3]
@@ -548,7 +548,10 @@ def issue_snapshot(result: ChannelResult, issues: np.ndarray, window_minutes: in
     whose final QC weight is above zero, or nothing.
 
     A report with weight zero is not a report that counts, so it does not hide an earlier one that
-    does. A report after T is never read. Returns (has_report, value, weight, earned, age_seconds).
+    does. A report after T is never read.
+
+    Returns (has_report, value, weight, earned, age in nanoseconds). The age is exact: it is never
+    rounded, because it decides which of one token's rows is the newest.
     """
     issues = np.asarray(issues, dtype="datetime64[ns]")
     usable = np.flatnonzero(result.weights > 0)
@@ -573,5 +576,5 @@ def issue_snapshot(result: ChannelResult, issues: np.ndarray, window_minutes: in
         np.where(ok, result.values[row], np.nan),
         np.where(ok, result.weights[row], 0.0),
         np.where(ok, result.earned[row], False),
-        np.where(ok, age_ns // 10**9, 0),
+        np.where(ok, age_ns, 0),
     )

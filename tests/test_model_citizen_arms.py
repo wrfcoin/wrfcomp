@@ -316,6 +316,63 @@ def test_one_token_at_several_positions_counts_once():
     assert merged[-1][2].citizen_defined["t2m"] == 1
 
 
+def test_of_one_token_the_newer_report_wins_even_by_a_fraction_of_a_second(tmp_path):
+    """Review case: one token at two positions, reports 60.9 s and 60.1 s before T. The row measured
+    60.1 s before T is the newer one and must be the one used, although the older row weighs more."""
+    stations, truth, issues, snapshots = world()
+    pairs = arms.neighbour_pairs(
+        *CITIZEN.T, truth.latitude.values, truth.longitude.values, truth.elevation_m.values
+    )
+    steady = np.array([0.4, 0.3, 0.5, 0.2, 0.3, 0.4, 0.4, 0.4])  # row 0 (older) outweighs row 1 (newer)
+    ages = np.array([60_900_000_000, 60_100_000_000] + [100 * 10**9] * 6, dtype=np.int64)
+    token = ["a", "a", "c", "d", "e", "f", "g", "h"]
+    assert ages[0] // 10**9 == ages[1] // 10**9 == 60  # whole seconds cannot tell them apart
+
+    def run_with(drop_row, age):
+        replay = arms.Replay(2024, truth, pairs, token=token if drop_row is None else None)
+        out = []
+        for a, snap in zip(issues, snapshots, strict=True):
+            shot = {}
+            for k, (v, _) in snap.items():
+                w = steady if drop_row is None else np.where(np.arange(8) == drop_row, 0.0, steady)
+                shot[k] = (v, w, age)
+            out.append(replay.issue(a, shot)[1])
+        return out
+
+    merged = run_with(None, ages)
+    newer_only = run_with(0, ages)  # the older row has no report at all
+    older_only = run_with(1, ages)
+    assert any(not m.t2m.equals(o.t2m) for m, o in zip(merged, older_only, strict=True))
+    for m, n in zip(merged, newer_only, strict=True):
+        xr.testing.assert_identical(m, n)
+    # Swapping which row is newer swaps which row is used.
+    swapped = run_with(None, ages[[1, 0, 2, 3, 4, 5, 6, 7]])
+    for m, o in zip(swapped, older_only, strict=True):
+        xr.testing.assert_identical(m, o)
+    # The exact ages survive the extract file: written by the QC script, read back by the builder.
+    qc, build = _load("run_phase3_qc"), _load("build_phase3_arms")
+    cat = {
+        "token": ["CW00000000A", "CW00000000A", "CW00000000C"],
+        "lat": [40.0, 40.1, 40.2],
+        "lon": [-100.0, -100.0, -100.0],
+        "elevation_m": [500, 500, 500],
+        "stats": np.zeros((3, 6), dtype=np.int64),
+        "station": [0, 1, 2],
+        "issue": [0, 0, 0],
+        "var": [0, 0, 0],
+        "value": [280.0, 281.0, 282.0],
+        "weight": [0.4, 0.3, 0.5],
+        "earned": [False, False, False],
+        "age_ns": [60_900_000_000, 60_100_000_000, 899_999_999_999],
+    }
+    times = np.array(["2024-01-01T00"], dtype="datetime64[ns]")
+    path = tmp_path / "issue_extract_2024.nc"
+    qc.write_extract(path, cat, times, ["00000000001"], {"complete": 1, "year": 2024, "run_digest": "x"})
+    _, snapshot = build.load_extract(path, 2024, times, ["00000000001"])
+    value, weight, age = snapshot(0)["t2m"]
+    assert age.dtype == np.int64 and age.tolist() == [60_900_000_000, 60_100_000_000, 899_999_999_999]
+
+
 # ----------------------------------------------------------------------------- the build script
 
 
@@ -344,14 +401,14 @@ def data_dir(tmp_path_factory):
     for month, parts in months.items():
         store = xr.concat(parts, dim="init_time", coords="minimal", compat="identical", join="exact")
         write(store, root / "candidates" / "gefs-station-corrected-v3" / f"{month}.zarr")
-    rows = {k: [] for k in ("station", "issue", "var", "value", "weight", "earned", "age_s")}
+    rows = {k: [] for k in ("station", "issue", "var", "value", "weight", "earned", "age_ns")}
     for i, snap in enumerate(snapshots):
         for v, var in enumerate(arms.VARIABLES):
             value, weight = snap[var]
             for c in np.flatnonzero(weight > 0):
                 rows["station"].append(c), rows["issue"].append(i), rows["var"].append(v)
                 rows["value"].append(value[c]), rows["weight"].append(weight[c])
-                rows["earned"].append(False), rows["age_s"].append(60)
+                rows["earned"].append(False), rows["age_ns"].append(60 * 10**9)
     cat = {
         "token": [f"CW{i:09d}" for i in range(len(CITIZEN))],
         "lat": CITIZEN[:, 0],
