@@ -1,0 +1,3 @@
+# Keep LF line endings across platforms so hashed reference JSON files match
+# their pinned SHA-256 digests on Windows as well as Linux and macOS.
+* text=auto eol=lf
