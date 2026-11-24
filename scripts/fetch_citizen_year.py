@@ -69,8 +69,13 @@ def hours_of(day: dt.date) -> list[dt.datetime]:
 
 
 def data_dir_bytes(data_dir: Path) -> int:
-    out = subprocess.run(["du", "-sb", str(data_dir)], capture_output=True, text=True, check=True)
-    return int(out.stdout.split()[0])
+    # Other lanes write and remove temporary folders in the data directory while this runs; du then
+    # exits non-zero for a path that vanished but still prints the total.
+    out = subprocess.run(["du", "-sb", str(data_dir)], capture_output=True, text=True, check=False)
+    lines = out.stdout.strip().splitlines()
+    if not lines:
+        raise RuntimeError("cannot measure the data directory; stopping")
+    return int(lines[-1].split()[0])
 
 
 def check_room(data_dir: Path) -> None:
