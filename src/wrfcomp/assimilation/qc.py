@@ -49,8 +49,8 @@ def temporal_gate(var, value, time_ns, state, cfg, *, reference=np.nan):
     if flat and var in ("wind_speed", "wind_gust", "u10", "v10"):
         start = state.constant_since_ns
         flat = (
-            abs(value) > cfg.calm_wind_ms
-            and minutes <= cfg.step_minutes
+            (abs(value) > cfg.calm_wind_ms or abs(reference - value) >= cfg.calm_contradiction_ms)
+            and minutes <= cfg.wind_flat_max_gap_minutes
             and start is not None
             and (time_ns - start) / 60e9 >= cfg.wind_flat_minutes
             and not abs(value - reference) <= cfg.wind_bin_ms / 2
@@ -81,16 +81,49 @@ def spatial_series(values, neighbours, official, independent, sigma, cfg):
     medians = np.full(len(values), np.nan)
     flags = np.full(len(values), int(Flag.FEW_BUDDIES))
     if ok.any():
-        weighted = np.repeat(neighbours[ok], np.where(official, cfg.official_buddy_weight, 1), axis=1)
+        pool = neighbours[ok].copy()
+        n_official = present[ok][:, official].sum(axis=1)
+        n_citizen = present[ok].sum(axis=1) - n_official
+        # Anchor the distribution (including its MAD) when citizens would overwhelm officials.
+        anchor = (n_official >= 2) | ((n_official > 0) & (n_citizen > cfg.official_buddy_weight * n_official))
+        single = anchor & (n_official == 1)
+        # One official can anchor the centre, but cannot estimate neighbourhood dispersion.
+        # Retain the citizen MAD about the citizen centre, not scatter about the airport.
+        if single.any():
+            citizens = pool[single][:, ~official]
+            citizen_mad = np.nanmedian(abs(citizens - np.nanmedian(citizens, axis=1)[:, None]), axis=1)
+        pool[np.ix_(anchor, ~official)] = np.nan
+        weighted = np.repeat(pool, np.where(official, cfg.official_buddy_weight, 1), axis=1)
         median = np.nanmedian(weighted, axis=1)
         mad = np.nanmedian(abs(weighted - median[:, None]), axis=1)
         scale = np.maximum(cfg.mad_scale * mad, cfg.scale_floor_fraction * sigma)
+        if single.any():
+            # Bound citizen influence on the scale while retaining the official decision centre.
+            scale[single] = np.clip(cfg.mad_scale * citizen_mad, sigma, cfg.huber_cut * sigma)
         medians[ok] = median
         flags[ok] = np.where(abs(values[ok] - median) > cfg.spatial_z * scale, int(Flag.SPATIAL), 0)
     return flags, medians
 
 
-def background_gate(z, buddy_z, cfg, *, independent=None):
+def citizen_trust_median(neighbours, official, independent, cfg):
+    """Keep the rolling comparison citizen-only even when an official spatial anchor is available."""
+    citizens = neighbours[:, ~official]
+    present = np.isfinite(citizens)
+    usable = (present.sum(axis=1) >= cfg.minimum_buddies) & present[:, independent[~official]].any(axis=1)
+    result = np.full(len(neighbours), np.nan)
+    if usable.any():
+        result[usable] = np.nanmedian(citizens[usable], axis=1)
+    return result
+
+
+def _has_separated_pair(lats, lons, cfg):
+    for j in range(len(lats) - 1):
+        if np.any(distances_km(lats[j], lons[j], lats[j + 1 :], lons[j + 1 :]) >= cfg.independence_km):
+            return True
+    return False
+
+
+def background_gate(z, buddy_z, cfg, *, independent=None, positions=None, official=None):
     magnitude = abs(z)
     if not np.isfinite(z):
         return Flag.BACKGROUND, 0.0
@@ -102,6 +135,10 @@ def background_gate(z, buddy_z, cfg, *, independent=None):
             independent is not None and not np.any(votes & independent)
         ):
             return Flag.BACKGROUND, 0.0
+        if positions is not None and not np.any(official[votes]):
+            lat, lon = positions
+            if not _has_separated_pair(lat[votes], lon[votes], cfg):
+                return Flag.BACKGROUND, 0.0
     return Flag.BACKGROUND, cfg.huber_cut / magnitude
 
 
@@ -167,6 +204,41 @@ def distances_km(lat, lon, lats, lons):
     return 2 * 6371.0088 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
 
+def official_step_agrees(previous, current, official_previous, official_current, sigma, cfg):
+    """An hourly witness supports a rapid step only if both endpoint levels and the change agree."""
+    change = current - previous
+    return (
+        (abs(current - official_current) <= sigma)
+        & (abs(previous - official_previous) <= sigma)
+        & (np.sign(change) * (official_current - official_previous) >= cfg.storm_step_fraction * abs(change))
+    )
+
+
+def _corroborated_steps(batch, pending, candidates, changes, official, sigma, cfg):
+    """Resolve raw temperature steps from the same time block before excluding temporal outliers."""
+    confirmed = set()
+    for i in pending:
+        near = candidates[(candidates != i) & (batch.variable[candidates] == batch.variable[i])]
+        km = distances_km(batch.lat[i], batch.lon[i], batch.lat[near], batch.lon[near])
+        agrees = np.sign(changes[i]) * changes[near] >= cfg.storm_step_fraction * abs(changes[i])
+        voters = near[(km <= cfg.radius_km) & agrees]
+        off = voters[official[voters]]
+        shifted = (
+            batch.values[off] + cfg.lapse_k_per_km * (batch.elevation_m[off] - batch.elevation_m[i]) / 1000
+        )
+        if np.any(
+            official_step_agrees(
+                batch.values[i] - changes[i], batch.values[i], shifted - changes[off], shifted, sigma[i], cfg
+            )
+        ):
+            confirmed.add(i)
+            continue
+        witnesses = near[(~official[near]) & (km >= cfg.independence_km) & (km <= cfg.radius_km) & agrees]
+        if _has_separated_pair(batch.lat[witnesses], batch.lon[witnesses], cfg):
+            confirmed.add(i)
+    return confirmed
+
+
 @dataclass(repr=False)
 class QCResult:
     qc_flags: np.ndarray
@@ -189,7 +261,12 @@ def quality_control(
     states=None,
     cfg=QCConfig(),
 ):
-    """Process simultaneous reports together, retaining the original input row order."""
+    """Process simultaneous reports together, retaining the original input row order.
+
+    A reference supplied without a measurement stamp is a synchronous observation. For an
+    as-of match, supply reference_time_ns so that the first match alone enters rolling evidence.
+    The returned buddy_median is the immediate spatial comparator, including official authority.
+    """
     size = len(batch.values)
 
     def column(value, dtype=float):
@@ -213,6 +290,7 @@ def quality_control(
         np.isfinite(reference) & (reference_times > batch.obs_time.astype(np.int64))
     ):
         raise ValueError("reference measurement cannot be later than the observation")
+    changes = np.full(size, np.nan)
     z = np.full(size, np.nan)
     times, groups = np.unique(batch.obs_time, return_inverse=True)
     order = np.argsort(groups, kind="stable")
@@ -238,6 +316,8 @@ def quality_control(
                 ):
                     count, total_error = previous.hourly_innovations[hour]
                     history.setdefault(var, []).append([*previous.official_site, total_error / count])
+        witnesses = []
+        pending = set()
         eligible = {}
         for i, daytime in zip(rows, day, strict=True):
             station, var = batch.station_ids[i], batch.variable[i]
@@ -259,38 +339,74 @@ def quality_control(
             bias = old.bias_day if daytime else old.bias_night
             z[i] = (innovations[i] - ((bias or 0) if bias_available[i] else 0)) / total[i]
             flags[i] |= int(static_gate(var, value, batch.elevation_m[i], peers[station], cfg))
-            flags[i] |= int(temporal_gate(var, value, time_ns, old, cfg, reference=reference[i]))
+            temporal = temporal_gate(var, value, time_ns, old, cfg, reference=reference[i])
+            if (
+                var in ("t2m", "td2m")
+                and not flags[i]
+                and old.last_usable
+                and old.recent
+                and not temporal & Flag.FLATLINE
+                and time_ns - old.last_ns
+                <= (cfg.official_storm_gap_minutes if official[i] else cfg.step_minutes) * 60e9
+            ):
+                changes[i] = value - old.recent[-1]
+                witnesses.append(i)
+                if temporal == Flag.TEMPORAL:
+                    pending.add(i)
+            flags[i] |= int(temporal)
             if not (int(flags[i]) & (Flag.STATIC | Flag.TEMPORAL | Flag.COPYCAT)) and not old.copycat:
                 eligible.setdefault(var, []).append(i)
+        confirmed = (
+            _corroborated_steps(
+                batch, pending, np.asarray(witnesses, dtype=int), changes, official, total, cfg
+            )
+            if pending
+            else set()
+        )
+        for i in confirmed:
+            flags[i] = int(flags[i]) & ~int(Flag.TEMPORAL)
+            eligible.setdefault(batch.variable[i], []).append(i)
         for i, daytime in zip(rows, day, strict=True):
             station, var = batch.station_ids[i], batch.variable[i]
             indices = np.asarray(eligible.get(var, []), dtype=int)
             distances = distances_km(batch.lat[i], batch.lon[i], batch.lat[indices], batch.lon[indices])
-            near = indices[(indices != i) & (distances <= cfg.radius_km)]
+            nearby = (indices != i) & (distances <= cfg.radius_km)
+            near = indices[nearby]
             adjusted = batch.values[near].astype(float)
             if var in ("t2m", "td2m"):
                 adjusted += cfg.lapse_k_per_km * (batch.elevation_m[near] - batch.elevation_m[i]) / 1000
             if var == "station_pressure":
                 adjusted *= np.exp((batch.elevation_m[near] - batch.elevation_m[i]) / cfg.scale_height_m)
-            independent = official[near] | (grid[near] != grid[i])
+            separated = distances[nearby]
+            independent = official[near] | ((grid[near] != grid[i]) & (separated >= cfg.independence_km))
             flag, medians[i] = spatial_gate(
                 batch.values[i], adjusted, total[i], cfg, official=official[near], independent=independent
             )
             flags[i] |= int(flag)
-            flag, huber[i] = background_gate(z[i], z[near], cfg, independent=independent)
+            flag, huber[i] = background_gate(
+                z[i],
+                z[near],
+                cfg,
+                independent=independent,
+                positions=(batch.lat[near], batch.lon[near]),
+                official=official[near],
+            )
+            if i in confirmed and huber[i] == 0 and np.isfinite(z[i]):
+                huber[i] = cfg.huber_cut / abs(z[i])
             flags[i] |= int(flag)
             key = (station, var)
             new = update_state(
                 states.get(key, StationState()),
                 time_ns=time_ns,
                 value=float(batch.values[i]),
-                buddy=medians[i],
+                buddy=citizen_trust_median(adjusted[None, :], official[near], independent, cfg)[0],
                 reference=reference[i],
                 innovation=float(innovations[i]),
                 day=bool(daytime),
                 solar_sensitive=var in ("t2m", "td2m"),
                 huber=huber[i],
                 sigma_bg=bg[i],
+                wind_drift=var in ("wind_speed", "u10", "v10", "wind_gust"),
                 verify_temperature=var == "t2m",
                 learn_bias=bool(bias_available[i]),
                 reference_time_ns=None if reference_times is None else int(reference_times[i]),

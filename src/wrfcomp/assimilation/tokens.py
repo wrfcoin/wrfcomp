@@ -95,7 +95,7 @@ class QCConfig:
     min_pairs: int = 12
     low_correlation: float = 0.5
     copy_correlation: float = 0.998
-    copy_residual_sigma: float = 0.01
+    copy_residual_sigma: float = 0.04
     guard_decay: float = 0.9
     official_prior: float = 1
     new_prior: float = 0.5
@@ -109,3 +109,12 @@ class QCConfig:
     verified_prior: float = 1.0
     wind_bin_ms: float = 0.5
     official_bias_radius_km: float = 150.0
+    independence_km: float = 5.0
+    storm_step_fraction: float = 0.5
+    wind_flat_max_gap_minutes: int = 60
+    calm_contradiction_ms: float = 5.0
+    close_copy_corr: float = 0.999
+    close_copy_rms_k: float = 0.15
+    close_copy_pairs: int = 48
+    close_copy_hours: int = 24
+    official_storm_gap_minutes: int = 75
