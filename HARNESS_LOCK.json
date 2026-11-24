@@ -9,7 +9,7 @@
       "mode": "100644"
     },
     "docs/VERIFICATION_PROTOCOL.md": {
-      "blob": "63db5ac099cd8e0817794b33fe31ff5c5b4495c4",
+      "blob": "fb4228ad3663141918a8cfd19e14f74737a4da33",
       "mode": "100644"
     },
     "experiments/REFERENCES.json": {
@@ -41,7 +41,7 @@
       "mode": "100644"
     },
     "scripts/check_promotion.py": {
-      "blob": "b9149ffb630923d7eb562208e66e6d9461170583",
+      "blob": "4b0ea64a233d1fcf312fa1efb9fa18862126aa9e",
       "mode": "100644"
     },
     "src/wrfcomp/__init__.py": {

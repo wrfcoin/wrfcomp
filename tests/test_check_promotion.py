@@ -9,7 +9,9 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -634,7 +636,7 @@ def test_every_input_must_come_from_the_one_checked_tree(
     monkeypatch.setattr(tool, "_harness_lock_problems", lambda r: [])
     with pytest.raises(tool.Refused, match="the harness in use is not the one under") as refusal:
         tool.evaluate(good, root / "data", PERIOD, tmp_path / "a", root)
-    assert "wrfcomp is loaded from" in str(refusal.value)
+    assert "wrfcomp would be loaded from" in str(refusal.value)
     assert not (tmp_path / "a").exists()
 
 
@@ -642,8 +644,7 @@ def test_origin_and_lock_checks_look_at_the_given_root(base_world: dict, tmp_pat
     # this checkout's harness modules are files of this checkout
     assert tool._modules_outside_root(ROOT) == []
     outside = tool._modules_outside_root(base_world["root"])
-    assert len(outside) == len(tool.HARNESS_MODULES)
-    assert any(line.startswith("wrfcomp.harness.metrics is loaded from") for line in outside)
+    assert len(outside) == 1 and outside[0].startswith("wrfcomp would be loaded from")
     expected = {"wrfcomp", "wrfcomp.harness.metrics", "wrfcomp.harness.evaluate", "wrfcomp.harness.schemas"}
     assert expected <= set(tool.HARNESS_MODULES)
     # the lock check runs that root's own script on that root
@@ -661,6 +662,7 @@ def test_evaluations_run_through_uv_locked_on_the_checked_tree(tmp_path: Path) -
         "--project",
         str(ROOT),
         "python",
+        "-P",  # never look for modules next to the script
         script,
         "score-one",
         str(ROOT),
@@ -708,30 +710,122 @@ def test_scoring_process_refuses_a_harness_that_is_not_under_the_root(
 ) -> None:
     # Regression: the parent used to check its own imports and then start the installed
     # `wrfcomp-eval` command. Here the child process finds another `wrfcomp` first on its path: a
-    # stand-in evaluator that would write a card. The child must refuse before running it.
+    # stand-in whose evaluator would write a card. The child must refuse without running any of it.
     shadow = tmp_path / "shadow"
     (shadow / "wrfcomp" / "harness").mkdir(parents=True)
-    marker = tmp_path / "stand-in-ran"
+    imported, ran = tmp_path / "stand-in-imported", tmp_path / "stand-in-ran"
     for name in ("align", "config", "hashing", "metrics", "schemas", "truth"):
         (shadow / "wrfcomp" / "harness" / f"{name}.py").write_text("")
-    (shadow / "wrfcomp" / "__init__.py").write_text('__version__ = "0.1.0"\n')
+    (shadow / "wrfcomp" / "__init__.py").write_text(
+        f'from pathlib import Path\n\nPath({str(imported)!r}).write_text("imported")\n__version__ = "0.1.0"\n'
+    )
     (shadow / "wrfcomp" / "harness" / "__init__.py").write_text("")
     (shadow / "wrfcomp" / "harness" / "evaluate.py").write_text(
         f"from pathlib import Path\n\n\ndef app(args=None, standalone_mode=True):\n"
-        f"    Path({str(marker)!r}).write_text('ran')\n    return 0\n"
+        f"    Path({str(ran)!r}).write_text('ran')\n    return 0\n"
     )
     monkeypatch.setenv("PYTHONPATH", str(shadow))
     assert tool._run_eval(ROOT, ["--forecast", "x.zarr"]) == tool.EXIT_CHILD_REFUSED
-    assert not marker.exists()
+    assert not ran.exists()
+    assert not imported.exists()  # located with find_spec, refused, never imported
     err = capfd.readouterr().err
     assert "the scoring process is not running the harness under" in err
-    assert f"wrfcomp.harness.evaluate is loaded from {shadow}" in err
+    assert f"wrfcomp would be loaded from {shadow}" in err
     monkeypatch.delenv("PYTHONPATH")
 
-    # the child checks against the root it is given, and `evaluate` turns its refusal into a refusal
+    # the child checks against the root it is given, and it insists on -P for itself
     assert tool.score_one(tmp_path, ["--help"]) == tool.EXIT_CHILD_REFUSED
     assert tool.main(["score-one", str(tmp_path), "--help"]) == tool.EXIT_CHILD_REFUSED
-    capfd.readouterr()
+    err = capfd.readouterr().err
+    if sys.flags.safe_path:  # pytest itself was started with -P: the origin check answers instead
+        assert "wrfcomp would be loaded from" in err
+    else:
+        assert "started without Python's -P option" in err
+
+
+SHADOW_SCORES = """from pathlib import Path
+
+Path({marker!r}).write_text("the planted scores package was imported")
+"""
+
+
+def checkout_with_planted_scores(tmp_path: Path) -> tuple[Path, Path]:
+    """A copy of the source tree and the promotion script, plus `scripts/scores/` planted next to it.
+
+    This is the pull request the review described: nothing locked is touched, but a package named
+    like the scoring library sits in the script's own directory.
+    """
+    root = tmp_path / "checkout"
+    shutil.copytree(ROOT / "src", root / "src", ignore=shutil.ignore_patterns("__pycache__"))
+    (root / "scripts").mkdir()
+    shutil.copy(ROOT / "scripts" / "check_promotion.py", root / "scripts" / "check_promotion.py")
+    marker = tmp_path / "planted-scores-imported"
+    planted = root / "scripts" / "scores"
+    (planted / "probability").mkdir(parents=True)
+    (planted / "stats" / "statistical_tests").mkdir(parents=True)
+    for package in (
+        planted,
+        planted / "probability",
+        planted / "stats",
+        planted / "stats" / "statistical_tests",
+    ):
+        (package / "__init__.py").write_text(SHADOW_SCORES.format(marker=str(marker)))
+    return root, marker
+
+
+def run_child(root: Path, *flags: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    """The scoring child, started the way `_eval_command` starts it but with this interpreter."""
+    script = str(root / "scripts" / "check_promotion.py")
+    inherited = {k: v for k, v in os.environ.items() if k != "PYTHONSAFEPATH"}
+    environment = {**inherited, "PYTHONPATH": str(root / "src"), **(env or {})}
+    command = [sys.executable, *flags, script, "score-one", str(root), "--help"]
+    return subprocess.run(command, capture_output=True, text=True, env=environment, check=False)
+
+
+def test_scores_planted_next_to_the_script_is_never_imported(tmp_path: Path) -> None:
+    root, marker = checkout_with_planted_scores(tmp_path)
+
+    # Without -P Python would put scripts/ first on its path: the script refuses before any import.
+    refused = run_child(root)
+    assert refused.returncode != 0 and refused.returncode != tool.EXIT_CHILD_REFUSED
+    assert "REFUSED: run this script with Python's -P option" in refused.stderr
+    assert not marker.exists()
+
+    # With -P the planted package is not on the path: the child scores with the real library.
+    safe = run_child(root, "-P")
+    assert safe.returncode == 0, safe.stderr
+    assert "Score a forecast against truth" in safe.stdout  # the harness entry point ran
+    assert not marker.exists()
+    # the interpreter's own switch for the same thing is accepted too
+    assert run_child(root, env={"PYTHONSAFEPATH": "1"}).returncode == 0
+    assert not marker.exists()
+
+    # Belt and braces: even on a safe path, a scoring package found inside the checkout is refused.
+    # (-P keeps the script's directory off the path; PYTHONPATH can still put it back.)
+    forced = run_child(root, "-P", env={"PYTHONPATH": f"{root / 'scripts'}{os.pathsep}{root / 'src'}"})
+    assert forced.returncode == tool.EXIT_CHILD_REFUSED
+    assert f"scores would be loaded from {root / 'scripts' / 'scores'}" in forced.stderr
+    assert not marker.exists()  # located with find_spec, refused, never imported
+
+
+def test_scoring_packages_must_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert tool._modules_outside_root(ROOT) == []
+    assert set(tool.SCORING_PACKAGES) == {"scores", "numpy", "xarray", "scipy", "pandas"}
+    real = tool._spec_origin
+    for name in tool.SCORING_PACKAGES:
+        planted = ROOT / "scripts" / name / "__init__.py"
+        monkeypatch.setattr(
+            tool, "_spec_origin", lambda n, name=name, planted=planted: planted if n == name else real(n)
+        )
+        problems = tool._modules_outside_root(ROOT)
+        assert problems == [
+            f"{name} would be loaded from {planted}, not from the environment {Path(sys.prefix).resolve()}"
+        ]
+    monkeypatch.setattr(tool, "_spec_origin", lambda n: None if n == "scores" else real(n))
+    assert tool._modules_outside_root(ROOT)[0].startswith("scores would be loaded from None")
+    monkeypatch.setattr(tool, "_spec_origin", real)
+    assert tool._spec_origin("sys") is None and tool._spec_origin("no_such_package_anywhere") is None
+    assert tool._spec_origin("wrfcomp") == (ROOT / "src" / "wrfcomp" / "__init__.py").resolve()
 
 
 # --------------------------------------------------------------------------- the real repository

@@ -1,7 +1,10 @@
 """Harness lock: a manifest of the locked Git tree, the harness version and the scoring dependencies.
 
-    python3 scripts/harness_lock.py check
-    python3 scripts/harness_lock.py update <harness_version>
+    python3 -P scripts/harness_lock.py check
+    python3 -P scripts/harness_lock.py update <harness_version>
+
+Always with `-P`: without it Python would look for modules next to this script first, and the
+script refuses to run.
 
 `check` compares the committed tree (`git ls-tree -r HEAD`) with `HARNESS_LOCK.json` and fails if
 
@@ -9,7 +12,8 @@
 * a locked entry is anything but a regular, non-executable file (mode 100644): a symlink, an
   executable, a submodule;
 * the working tree differs from the commit inside the locked scope (edited, deleted or untracked
-  files, also ignored ones except Python bytecode caches);
+  files, also ignored ones; the one exception is an untracked or ignored `.pyc` file directly inside
+  a `__pycache__` directory);
 * the manifest's harness version differs from the package version, or its scope from the scope
   written in this script;
 * `uv.lock` resolves a scoring dependency (`scores`, `numpy`, `xarray`, `scipy`, `pandas`) to a
@@ -20,12 +24,22 @@ owner has approved (docs/HARNESS_LOCK.md). Standard library and `git` only, so i
 dependencies are installed.
 """
 
-from __future__ import annotations
+import sys
+
+# Before any other import. Running a script by path puts its directory (scripts/, which is not a
+# locked directory) first on sys.path, ahead of the standard library and of every installed
+# package. A file planted there (scripts/tomllib.py, scripts/scores/) would then be imported in
+# place of the real module. `python -P` leaves the script directory off the path; without it this
+# script does not run. `sys` is built in and cannot be shadowed.
+if __name__ == "__main__" and not getattr(sys.flags, "safe_path", False):
+    sys.exit(
+        f"REFUSED: run this script with Python's -P option (python -P {sys.argv[0]} ...), so that files "
+        "next to it cannot shadow the standard library or the scoring packages. See docs/HARNESS_LOCK.md."
+    )
 
 import json
 import re
 import subprocess
-import sys
 import tomllib
 from pathlib import Path
 
@@ -51,7 +65,7 @@ LOCKED_FILES = (
 # Packages whose versions decide the numbers in a scorecard.
 SCORING_DEPENDENCIES = ("numpy", "pandas", "scipy", "scores", "xarray")
 VERSION_FILE = "src/wrfcomp/__init__.py"
-IGNORED_PARTS = ("__pycache__",)
+BYTECODE_DIR = "__pycache__"
 
 
 class LockError(RuntimeError):
@@ -94,7 +108,7 @@ def working_tree_changes(root: Path = ROOT) -> list[str]:
         "--porcelain=v1",
         "-z",
         "--untracked-files=all",
-        "--ignored=matching",
+        "--ignored=traditional",  # with --untracked-files=all: every ignored file, one by one
         "--",
         *scope_paths(),
     )
@@ -109,7 +123,10 @@ def working_tree_changes(root: Path = ROOT) -> list[str]:
         code, path = record[:2], record[3:]
         if code[0] in "RC":  # a rename or copy carries its source path as the next record
             index += 1
-        if any(part in IGNORED_PARTS for part in Path(path).parts):
+        # The only thing left alone: bytecode that Python wrote, that Git does not track. Anything
+        # staged or tracked, and anything that is not a .pyc file, is reported wherever it sits.
+        is_bytecode_cache = Path(path).parent.name == BYTECODE_DIR and Path(path).suffix == ".pyc"
+        if code in ("??", "!!") and is_bytecode_cache:
             continue
         if code == "??":
             problems.append(f"untracked file in the locked scope: {path}")
@@ -241,7 +258,7 @@ def main(argv: list[str]) -> int:
     except LockError as exc:
         print(f"Harness lock cannot be checked: {exc}")
         return 1
-    print("usage: harness_lock.py check | update <harness_version>")
+    print("usage: python3 -P scripts/harness_lock.py check | update <harness_version>")
     return 2
 
 

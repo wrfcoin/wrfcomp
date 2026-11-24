@@ -129,6 +129,7 @@ def repo(tmp_path: Path) -> Path:
         "src/wrfcomp/harness/__init__.py": "",
         "src/wrfcomp/harness/metrics.py": "a = 1\n",
         "src/wrfcomp/other.py": "free = True\n",
+        "scripts/harness_lock.py": (ROOT / "scripts" / "harness_lock.py").read_text(),
         "configs/splits.yaml": "x: 1\n",
         "uv.lock": UV_LOCK,
         ".gitignore": "__pycache__/\n*.tmp\n",
@@ -269,7 +270,72 @@ def _scoring_dependency_missing(repo: Path) -> None:
     (repo / "uv.lock").write_text(UV_LOCK.replace('name = "scipy"', 'name = "scipy-fork"'))
 
 
+CACHE = "src/wrfcomp/harness/__pycache__"
+
+
+def _moved_into_cache(repo: Path) -> None:
+    # the review's case: the file leaves the tree, staged, into a directory the old check skipped
+    (repo / CACHE).mkdir()
+    git(repo, "mv", "-f", "src/wrfcomp/harness/metrics.py", f"{CACHE}/metrics.py")
+
+
+def _force_added_in_cache(repo: Path) -> None:
+    (repo / CACHE).mkdir()
+    (repo / CACHE / "evil.py").write_text("b = 2\n")
+    git(repo, "add", "-f", f"{CACHE}/evil.py")
+
+
+def _committed_in_cache(repo: Path) -> None:
+    _force_added_in_cache(repo)
+    git(repo, "commit", "-q", "-m", "tracked file in a cache directory")
+
+
+def _source_in_cache(repo: Path) -> None:
+    (repo / CACHE).mkdir()
+    (repo / CACHE / "evil.py").write_text("b = 2\n")  # ignored by .gitignore, but not bytecode
+
+
+def _nested_in_cache(repo: Path) -> None:
+    (repo / CACHE / "deeper").mkdir(parents=True)
+    (repo / CACHE / "deeper" / "metrics.cpython-313.pyc").write_bytes(b"\0")
+
+
+def _bytecode_outside_cache(repo: Path) -> None:
+    (repo / "src/wrfcomp/harness/metrics.pyc").write_bytes(b"\0")
+
+
+def _staged_bytecode(repo: Path) -> None:
+    (repo / CACHE).mkdir()
+    (repo / CACHE / "metrics.cpython-313.pyc").write_bytes(b"\0")
+    git(repo, "add", "-f", f"{CACHE}/metrics.cpython-313.pyc")
+
+
 VIOLATIONS = {
+    "moved into a bytecode directory": (
+        _moved_into_cache,
+        [f"uncommitted change in the locked scope: {CACHE}/metrics.py (git status R)"],
+    ),
+    "force-added in a bytecode directory": (
+        _force_added_in_cache,
+        [f"uncommitted change in the locked scope: {CACHE}/evil.py (git status A)"],
+    ),
+    "committed in a bytecode directory": (_committed_in_cache, [f"added: {CACHE}/evil.py"]),
+    "source file in a bytecode directory": (
+        _source_in_cache,
+        [f"ignored file in the locked scope: {CACHE}/evil.py"],
+    ),
+    "bytecode nested below a bytecode directory": (
+        _nested_in_cache,
+        [f"ignored file in the locked scope: {CACHE}/deeper/metrics.cpython-313.pyc"],
+    ),
+    "bytecode outside a bytecode directory": (
+        _bytecode_outside_cache,
+        ["untracked file in the locked scope: src/wrfcomp/harness/metrics.pyc"],
+    ),
+    "staged bytecode": (
+        _staged_bytecode,
+        [f"uncommitted change in the locked scope: {CACHE}/metrics.cpython-313.pyc (git status A)"],
+    ),
     "edited and committed": (_edit_committed, ["changed: configs/splits.yaml"]),
     "edited, not committed": (
         _edit_uncommitted,
@@ -326,6 +392,62 @@ def test_every_violation_is_reported(repo: Path, case: str) -> None:
     problems = tool.check(repo)
     for fragment in expected:
         assert any(line.startswith(fragment) for line in problems), (fragment, problems)
+
+
+def run_script(repo: Path, *flags: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    inherited = {k: v for k, v in GIT_ENV.items() if k != "PYTHONSAFEPATH"}
+    environment = {**inherited, **(env or {})}
+    command = [sys.executable, *flags, "scripts/harness_lock.py", "check"]
+    return subprocess.run(command, cwd=repo, capture_output=True, text=True, env=environment, check=False)
+
+
+def test_tomllib_planted_next_to_the_script_cannot_hide_a_dependency_change(
+    repo: Path, tmp_path: Path
+) -> None:
+    # The review's case: a pull request changes a scoring dependency in uv.lock and adds
+    # scripts/tomllib.py, which answers with the pinned versions. Neither file is locked.
+    marker = tmp_path / "planted-tomllib-imported"
+    pinned = json.loads((repo / "HARNESS_LOCK.json").read_text())["scoring_dependencies"]
+    packages = [{"name": name, "version": v} for name, versions in pinned.items() for v in versions]
+    (repo / "scripts" / "tomllib.py").write_text(
+        "from pathlib import Path\n\n"
+        f"Path({str(marker)!r}).write_text('imported')\n"
+        "TOMLDecodeError = ValueError\n\n\n"
+        f"def loads(text):\n    return {{'package': {packages!r}}}\n"
+    )
+    (repo / "uv.lock").write_text(UV_LOCK.replace('version = "2.7.0"', 'version = "9.9.9"'))
+
+    # Run by path without -P, Python would import the planted file: the script refuses to start.
+    refused = run_script(repo)
+    assert refused.returncode != 0 and "Harness lock OK." not in refused.stdout
+    assert "REFUSED: run this script with Python's -P option" in refused.stderr
+    assert not marker.exists()
+
+    # With -P (as CI runs it) the real tomllib reads the real uv.lock and the change is reported.
+    for flags, env in ((("-P",), None), ((), {"PYTHONSAFEPATH": "1"})):
+        checked = run_script(repo, *flags, env=env)
+        assert checked.returncode == 1, checked.stderr
+        assert "dependency: uv.lock resolves scores to 9.9.9, locked at 2.7.0" in checked.stdout
+        assert "Harness lock violated." in checked.stdout
+    assert not marker.exists()
+
+    # and with the dependency change taken back, the same command passes: the planted file is inert
+    (repo / "uv.lock").write_text(UV_LOCK)
+    assert "Harness lock OK." in run_script(repo, "-P").stdout
+    assert not marker.exists()
+
+
+def test_the_approval_gate_script_also_insists_on_a_safe_path() -> None:
+    script = str(ROOT / ".github" / "harness_lock_gate.py")
+    environment = {k: v for k, v in os.environ.items() if k not in ("PYTHONSAFEPATH", "GH_TOKEN")}
+    plain = subprocess.run(
+        [sys.executable, script], capture_output=True, text=True, env=environment, check=False
+    )
+    assert plain.returncode != 0 and "REFUSED: run this script with Python's -P option" in plain.stderr
+    safe = subprocess.run(
+        [sys.executable, "-P", script], capture_output=True, text=True, env=environment, check=False
+    )
+    assert safe.returncode == 1 and "NOT APPROVED: the gate could not read the pull request" in safe.stdout
 
 
 def test_a_symlink_to_identical_bytes_is_still_a_violation(repo: Path) -> None:
@@ -805,6 +927,7 @@ def test_approval_workflow_runs_from_the_base_branch_reads_only_and_never_checks
     assert "contents/.github/harness_lock_gate.py?ref=${WORKFLOW_SHA}" in fetch["run"]
     assert fetch["env"]["WORKFLOW_SHA"] == "${{ github.sha }}"  # the base commit the workflow came from
     assert run["env"]["EVENT_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+    assert run["run"] == 'python3 -P "$RUNNER_TEMP/harness_lock_gate.py"'  # never without -P
     assert run["env"]["POLICY_SHA"] == "${{ github.sha }}"  # the same commit the policy was fetched from
     assert set(run["env"]) == {"GH_TOKEN", "PR_NUMBER", "EVENT_HEAD_SHA", "POLICY_SHA"}
 
@@ -815,6 +938,6 @@ def test_ci_workflow_keeps_only_the_hash_check_lint_and_tests() -> None:
     assert workflow["permissions"] == {"contents": "read"}
     assert list(workflow["jobs"]) == ["test"]
     runs = [step.get("run", "") for step in workflow["jobs"]["test"]["steps"]]
-    assert "python3 scripts/harness_lock.py check" in runs
+    assert "python3 -P scripts/harness_lock.py check" in runs  # never without -P
     assert "uv run ruff check" in runs and "uv run pytest -q" in runs
     assert gate.APPROVAL_WORD not in text and "pull_request_target" not in text

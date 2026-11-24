@@ -3,9 +3,12 @@
 Owner decision 2026-11-23: a candidate is promoted only if it passes the harness gate against
 climatology AND against NOAA GEFS, on the same forecast, truth, thresholds and period.
 
-    uv run --locked python scripts/check_promotion.py evaluate \\
+    uv run --locked python -P scripts/check_promotion.py evaluate \\
         --forecast F.zarr --data-dir D --period 2024-01 --out DIR
-    uv run --locked python scripts/check_promotion.py verify A.json B.json --period 2024-01
+    uv run --locked python -P scripts/check_promotion.py verify A.json B.json --period 2024-01
+
+Always with `-P`: without it Python would look for modules next to this script first, and the
+script refuses to run.
 
 `evaluate` is the only mode that can print PROMOTED. Everything it relies on comes from one tree,
 the checkout this script is in:
@@ -45,7 +48,18 @@ Exit codes: 0 PROMOTED (evaluate) or CONSISTENT (verify); 1 NOT PROMOTED or INCO
 Locked: see docs/HARNESS_LOCK.md, which also lists what this check does not establish.
 """
 
-from __future__ import annotations
+import sys
+
+# Before any other import. Running a script by path puts its directory (scripts/, which is not a
+# locked directory) first on sys.path, ahead of the standard library and of every installed
+# package. A file planted there (scripts/tomllib.py, scripts/scores/) would then be imported in
+# place of the real module. `python -P` leaves the script directory off the path; without it this
+# script does not run. `sys` is built in and cannot be shadowed.
+if __name__ == "__main__" and not getattr(sys.flags, "safe_path", False):
+    sys.exit(
+        f"REFUSED: run this script with Python's -P option (python -P {sys.argv[0]} ...), so that files "
+        "next to it cannot shadow the standard library or the scoring packages. See docs/HARNESS_LOCK.md."
+    )
 
 import argparse
 import hashlib
@@ -56,7 +70,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,6 +125,8 @@ HARNESS_MODULES = (
     "wrfcomp.harness.schemas",
     "wrfcomp.harness.truth",
 )
+# The packages the numbers come from (the same five scripts/harness_lock.py pins in uv.lock).
+SCORING_PACKAGES = ("numpy", "pandas", "scipy", "scores", "xarray")
 VERIFY_NOTICE = (
     "verify only compares two existing scorecards with the pinned references. It proves nothing about "
     "where the scorecards came from and is not a promotion. Use `evaluate` for a verdict."
@@ -356,20 +371,48 @@ def _harness_lock_problems(root: Path) -> list[str]:
         return [str(exc)]
 
 
-def _modules_outside_root(root: Path) -> list[str]:
-    """Harness modules that this process did NOT load from `root`'s source tree.
+def _spec_origin(name: str) -> Path | None:
+    """Where `name` would be imported from, found WITHOUT importing it (top-level names only)."""
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        return None
+    if spec is None:
+        return None
+    if spec.origin and spec.origin not in ("built-in", "frozen", "namespace"):
+        return Path(spec.origin).resolve()
+    locations = list(spec.submodule_search_locations or [])  # a namespace package: a bare directory
+    return Path(locations[0]).resolve() if locations else None
 
-    The tree check looks at files under `root`; the numbers come from whatever Python imports. Both
-    must be the same files, so every harness module has to resolve inside `root/src/wrfcomp`.
+
+def _modules_outside_root(root: Path) -> list[str]:
+    """Everything wrong with where this process takes its scoring code from. Empty = all in order.
+
+    The tree check looks at files under `root`; the numbers come from whatever Python imports. So:
+      * `wrfcomp` and every harness module must be files under `root/src/wrfcomp`;
+      * the scoring packages (scores, numpy, xarray, scipy, pandas) must come from the Python
+        environment (under `sys.prefix`), not from a directory of the checkout such as `scripts/`.
+    Top-level packages are located with `find_spec` first, which runs none of their code: a foreign
+    `wrfcomp` or `scores` is refused before it is ever imported.
     """
     package = (root / "src" / "wrfcomp").resolve()
-    outside = []
-    for name in HARNESS_MODULES:
+    environment = Path(sys.prefix).resolve()
+    problems = []
+    origin = _spec_origin("wrfcomp")
+    if origin is None or not origin.is_relative_to(package):
+        return [f"wrfcomp would be loaded from {origin}, not from {package}"]
+    for name in SCORING_PACKAGES:
+        origin = _spec_origin(name)
+        if origin is None or not origin.is_relative_to(environment):
+            problems.append(f"{name} would be loaded from {origin}, not from the environment {environment}")
+    if problems:
+        return problems
+    for name in HARNESS_MODULES:  # safe to import now: the package directory is the checked one
         module = importlib.import_module(name)
         origin = Path(getattr(module, "__file__", None) or "/nonexistent").resolve()
         if not origin.is_relative_to(package):
-            outside.append(f"{name} is loaded from {origin}")
-    return outside
+            problems.append(f"{name} is loaded from {origin}")
+    return problems
 
 
 def _open_forecast(path: Path, what: str):
@@ -389,9 +432,10 @@ def _open_forecast(path: Path, what: str):
 def _eval_command(root: Path, args: list[str]) -> list[str]:
     """The scoring process for one evaluation.
 
-    It is this locked script, run by the interpreter of `root`'s locked environment, in its
-    `score-one` mode: the child itself checks that the harness it imports is the one under `root`
-    and then calls the harness entry point `wrfcomp.harness.evaluate.app` directly. The installed
+    It is this locked script, run with `-P` by the interpreter of `root`'s locked environment, in
+    its `score-one` mode: the child itself checks that the harness it imports is the one under
+    `root` and that the scoring packages come from the environment, and then calls the harness
+    entry point `wrfcomp.harness.evaluate.app` directly. The installed
     `wrfcomp-eval` console command is not used: what that name runs is decided in pyproject.toml,
     which is outside the lock.
     """
@@ -399,18 +443,9 @@ def _eval_command(root: Path, args: list[str]) -> list[str]:
     if uv is None:
         raise Refused("uv is not installed; evaluations run through `uv run --locked`")
     script = root / "scripts" / "check_promotion.py"
-    return [
-        uv,
-        "run",
-        "--locked",
-        "--project",
-        str(root),
-        "python",
-        str(script),
-        CHILD_MODE,
-        str(root),
-        *args,
-    ]
+    # -P: the child must not look for modules in scripts/ either (and refuses to start without it)
+    python = ["python", "-P", str(script), CHILD_MODE, str(root), *args]
+    return [uv, "run", "--locked", "--project", str(root), *python]
 
 
 def _run_eval(root: Path, args: list[str]) -> int:
@@ -422,16 +457,20 @@ def score_one(root: Path, args: list[str]) -> int:
     """Body of the scoring process: verify where the harness comes from, then run its entry point.
 
     Returns the exit code of `wrfcomp.harness.evaluate.app` (0 scored, 2 bad input, 3 NaN or
-    coverage rule), or EXIT_CHILD_REFUSED without scoring anything if any harness module of THIS
-    process is not a file under `root`.
+    coverage rule), or EXIT_CHILD_REFUSED without scoring anything if this process was started
+    without `-P`, if any harness module of THIS process is not a file under `root`, or if a scoring
+    package would not come from the environment.
     """
     import click
 
     root = root.resolve()
-    try:
-        outside = _modules_outside_root(root)
-    except Exception as exc:  # a harness that cannot even be imported is not the locked one
-        outside = [f"the harness cannot be imported: {type(exc).__name__}: {exc}"]
+    if not getattr(sys.flags, "safe_path", False):
+        outside = ["the scoring process was started without Python's -P option"]
+    else:
+        try:
+            outside = _modules_outside_root(root)
+        except Exception as exc:  # a harness that cannot even be imported is not the locked one
+            outside = [f"the harness cannot be imported: {type(exc).__name__}: {exc}"]
     if outside:
         print(f"REFUSED: the scoring process is not running the harness under {root}:", file=sys.stderr)
         for line in outside:

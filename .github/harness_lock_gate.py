@@ -37,12 +37,22 @@ What this cannot do: tell the owner from an agent acting through the owner's Git
 docs/HARNESS_LOCK.md. Standard library only. This workflow needs no write permission.
 """
 
-from __future__ import annotations
+import sys
+
+# Before any other import. Running a script by path puts its directory (scripts/, which is not a
+# locked directory) first on sys.path, ahead of the standard library and of every installed
+# package. A file planted there (scripts/tomllib.py, scripts/scores/) would then be imported in
+# place of the real module. `python -P` leaves the script directory off the path; without it this
+# script does not run. `sys` is built in and cannot be shadowed.
+if __name__ == "__main__" and not getattr(sys.flags, "safe_path", False):
+    sys.exit(
+        f"REFUSED: run this script with Python's -P option (python -P {sys.argv[0]} ...), so that files "
+        "next to it cannot shadow the standard library or the scoring packages. See docs/HARNESS_LOCK.md."
+    )
 
 import json
 import os
 import re
-import sys
 import urllib.error
 import urllib.request
 

@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Harness lock, tree and dependency pins
-        run: python3 scripts/harness_lock.py check
+        run: python3 -P scripts/harness_lock.py check
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true

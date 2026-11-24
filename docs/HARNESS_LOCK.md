@@ -28,15 +28,25 @@ is open as before.
 
 ## The three checks
 
+**Every locked script is run with Python's `-P` option**, in CI, in the scoring processes and by hand:
+`python3 -P scripts/harness_lock.py ...`, `python -P scripts/check_promotion.py ...`. Run by path without it,
+Python puts the script's own directory first on its module path, ahead of the standard library and of every
+installed package, and `scripts/` is not a locked directory: a file such as `scripts/tomllib.py` or a
+directory `scripts/scores/` added by an ordinary pull request would be imported in place of the real module.
+The three scripts (`harness_lock.py`, `check_promotion.py`, `.github/harness_lock_gate.py`) check this
+themselves, before importing anything but `sys`, and refuse to run without `-P` (or `PYTHONSAFEPATH=1`).
+
 ### 1. `test` (`.github/workflows/ci.yml`): the tree is the locked tree
 
-Runs `python3 scripts/harness_lock.py check`, then ruff and the test suite. The check reads the committed Git
+Runs `python3 -P scripts/harness_lock.py check`, then ruff and the test suite. The check reads the committed Git
 tree (`git ls-tree -r HEAD`) and fails if
 
 - a locked path was changed, added, removed or renamed (the manifest records every path with its Git blob id
   and mode; a rename shows as one path removed and one added);
 - a locked entry is not a regular, non-executable file: a symlink, an executable or a submodule;
-- there is an untracked, ignored or uncommitted file inside the locked scope (Python bytecode caches excepted);
+- there is an untracked, ignored or uncommitted file inside the locked scope. The single exception is an
+  untracked or ignored `.pyc` file directly inside a `__pycache__` directory. Anything staged or tracked there,
+  and any other kind of file there, is reported;
 - the manifest's harness version differs from `src/wrfcomp/__init__.py`, or its scope from the scope written
   in `scripts/harness_lock.py`;
 - `uv.lock` resolves `scores`, `numpy`, `xarray`, `scipy` or `pandas` to a version other than the recorded one.
@@ -88,18 +98,21 @@ or adds or removes any label on the pull request, which starts a run. The label
 ### 3. `scripts/check_promotion.py evaluate`: the candidate beat both references
 
 ```sh
-uv run --locked python scripts/check_promotion.py evaluate \
+uv run --locked python -P scripts/check_promotion.py evaluate \
   --forecast <candidate.zarr> --data-dir "$WRFCOMP_DATA_DIR" --period 2024-01 --out <dir>
 ```
 
 Everything the verdict rests on comes from one tree, the checkout the script is in:
 
 - that tree must pass check 1, and the harness modules the running Python has imported must be files of that
-  tree (a harness installed from somewhere else is refused);
+  tree (a harness installed from somewhere else is refused). The five scoring packages (`scores`, `numpy`,
+  `xarray`, `scipy`, `pandas`) must resolve inside the Python environment, not inside the checkout. These
+  packages are located before they are imported, so a foreign one is refused without running any of its code;
 - the reference inventory and the config are read from that tree;
 - each of the two evaluations runs in its own process, started with `uv run --locked` on that tree (so the
-  dependency versions are the ones in its `uv.lock`). That process is the locked script itself: it checks
-  that the harness modules *it* has imported are files of the tree, refuses otherwise, and then calls the
+  dependency versions are the ones in its `uv.lock`) and with `-P`. That process is the locked script itself:
+  it makes the same checks on *its own* imports (harness from the tree, scoring packages from the
+  environment), refuses otherwise, and then calls the
   harness entry point `wrfcomp.harness.evaluate.app` directly. The installed `wrfcomp-eval` console command
   is not used, because what that name runs is set in `pyproject.toml`, which is not locked;
 - the two reference forecasts of the period are taken from the places named in `experiments/REFERENCES.json`
@@ -123,7 +136,7 @@ The two scorecards and a `verdict.json` are written in a private directory creat
 at the end as `<out>/promotion_<period>_<first 16 hex digits of the forecast hash>/`. The file names are
 fixed by the program. The candidate's model id is recorded inside the files and is never part of a path.
 
-`check_promotion.py verify A.json B.json --period P` applies the same rules to two scorecards that already
+`python -P scripts/check_promotion.py verify A.json B.json --period P` applies the same rules to two scorecards that already
 exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
 
 ## What is NOT enforced
@@ -149,6 +162,10 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
 - **`pyproject.toml` is not locked.** The promotion check does not go through the console command it
   defines, but anyone who runs `wrfcomp-eval` by name from a shell runs whatever `pyproject.toml` points
   it at.
+- **`-P` protects against files next to a script, not against the environment.** `PYTHONPATH`, a `.pth` file
+  or a `sitecustomize` module in the environment can still put other code on the path. The promotion check
+  refuses a harness or scoring package that resolves to the wrong place, but it does not police every other
+  module a scoring run imports.
 - **No isolated, artifact-pinned runtime.** `evaluate` checks that the harness modules it imports are files
   of the locked tree and runs the evaluations with `uv run --locked`, which pins dependency *versions*. It
   does not verify the installed packages byte for byte, and it does not run in a clean container built from
@@ -176,7 +193,7 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
 1. Open a pull request with the change and say why in plain words.
 2. Bump the version (`__version__` in `src/wrfcomp/__init__.py`, and `protocol_version` in
    `configs/splits.yaml` for rule changes). Commit, then run
-   `python3 scripts/harness_lock.py update <new version>` and commit the new manifest. `update` reads the
+   `python3 -P scripts/harness_lock.py update <new version>` and commit the new manifest. `update` reads the
    committed tree, so the change must be committed first.
 3. A reviewer from a different model provider reviews it.
 4. The owner comments `APPROVE-HARNESS-CHANGE <head sha>` on the final commit and re-runs the

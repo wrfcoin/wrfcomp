@@ -123,7 +123,7 @@ autocorrelation and does not change the result on a long series (details in `wrf
 **Two reference baselines (owner decision 2026-11-23):** a candidate is promoted only if it passes the whole gate
 above against **both** reference baselines, climatology and NOAA GEFS, for the same forecast, truth, thresholds
 and period (raw GEFS is the harder reference in winter, climatology in summer). The verdict comes from
-`scripts/check_promotion.py evaluate --forecast <candidate.zarr> --data-dir <data dir> --period <YYYY-MM> --out <dir>`,
+`python -P scripts/check_promotion.py evaluate --forecast <candidate.zarr> --data-dir <data dir> --period <YYYY-MM> --out <dir>`,
 which runs `wrfcomp-eval` twice itself and judges the two scorecards it produced. The reference forecasts, their
 truth, thresholds, period, init count and leads are pinned per period in `experiments/REFERENCES.json`; a reference
 store whose content hash is not the pinned one is refused, so a weakened stand-in baseline cannot be used, and a

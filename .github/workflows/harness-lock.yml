@@ -47,4 +47,4 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           POLICY_SHA: ${{ github.sha }}
-        run: python3 "$RUNNER_TEMP/harness_lock_gate.py"
+        run: python3 -P "$RUNNER_TEMP/harness_lock_gate.py"
