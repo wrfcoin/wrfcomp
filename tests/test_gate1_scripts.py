@@ -944,3 +944,24 @@ def test_confirmation_periods_of_2023_with_the_real_config() -> None:
     with pytest.raises(run_gate1.Refused, match="before the validation split"):
         run_gate1.parse_period("2023-Q1", [0, 12], cfg)
     assert run_gate1.parse_period("2024-Q4", [0, 12], cfg).init_times.size == 156
+
+
+def test_slice_truth_copies_a_time_range_unchanged(
+    confirmation_world: dict[str, Path], tmp_path: Path
+) -> None:
+    slice_truth = load_script("slice_truth")
+    source = confirmation_world["data"] / "truth" / "isd_conus_train.nc"
+    out = tmp_path / "cut.nc"
+    args = ["--source", str(source), "--out", str(out), "--config", str(confirmation_world["config"])]
+    assert slice_truth.main([*args, "--start", "2023-01-31T18Z", "--end", "2023-03-02T12"]) == 0
+    with xr.open_dataset(source) as whole, xr.open_dataset(out) as cut:
+        want = whole.sel(valid_time=slice("2023-01-31T18", "2023-03-02T12")).load()
+        xr.testing.assert_identical(cut.load(), want)
+        assert cut["t2m_offset_min"].dtype == np.int16 and cut["t2m"].dtype == np.float32
+    before = out.read_bytes()
+    assert slice_truth.main([*args, "--start", "2023-01-31T18", "--end", "2023-03-02T12"]) == 2  # exists
+    assert out.read_bytes() == before
+    other = ["--source", str(source), "--out", str(tmp_path / "x.nc")]
+    assert slice_truth.main([*other, "--start", "2030-01-01", "--end", "2030-02-01"]) == 2  # nothing there
+    assert slice_truth.main([*other, "--start", "2023-03-01", "--end", "2023-02-01"]) == 2
+    assert not (tmp_path / "x.nc").exists()
