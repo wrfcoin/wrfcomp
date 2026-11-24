@@ -65,7 +65,16 @@ def test_station_pressure_and_missing_buddies_are_not_background_failures():
         }
     )
     forecasts = (np.array([time - 3 * trial.HOUR]), np.array([time]), {"t2m": np.array([[290.0, 290.0]])})
-    series = {"t2m": [(times, wide.t2m.values, np.zeros(7))] * 2}
+    series = {
+        "t2m": [
+            (
+                np.r_[times[[0, -1]] - 24 * trial.HOUR, times],
+                np.r_[290.0, 290.0, wide.t2m.values],
+                np.zeros(9),
+            )
+        ]
+        * 2
+    }
     totals, modes, samples = defaultdict(Counter), defaultdict(set), defaultdict(list)
     trial.aggregate_station(wide, (0, 0, 0), official, forecasts, series, totals, modes, samples, 0)
     assert totals["station_pressure"]["total"] == 7
@@ -85,3 +94,40 @@ def test_indoor_screen_requires_independent_official_times_and_a_swing():
     assert trial.indoor_screen(times, stable, times, official) == (True, True)
     assert trial.indoor_screen(times, official, times, official) == (True, False)
     assert trial.indoor_screen(times, stable, times[::3], official[::3]) == (False, False)
+
+
+def test_trial_citizen_join_uses_distinct_stations_and_available_reports(tmp_path):
+    from wrfcomp.assimilation.citizen_obs import save_citizen_batch
+    from wrfcomp.assimilation.tokens import ObservationBatch
+
+    rng = np.random.default_rng(92)
+    start = trial.START
+    hours = np.array([start - 3 * trial.HOUR])
+    forecasts = (hours, np.array([start]), {"wind_speed": np.array([[3.0, 3.0]])})
+    official = xr.Dataset(
+        coords={
+            "station_id": [0, 1],
+            "latitude": ("station_id", [5.0, 6.0]),
+            "longitude": ("station_id", [0.0, 0.0]),
+            "elevation_m": ("station_id", [0, 0]),
+        }
+    )
+    series = {"wind_speed": [(np.array([start]), np.array([3.0]), np.array([0.0]))] * 2}
+    stations = np.array([0, 1, 2, 3, 0, 1, 2, 3])
+    times = start + np.array([0, 1, 1, 1, 10, 10, 10, 10]) * trial.MINUTE
+    for mixed in (False, True):
+        raw = ObservationBatch(
+            [f"{i:011}" for i in stations],
+            np.zeros(8),
+            np.where((stations == 3) & mixed, 0.1, 0),
+            np.zeros(8),
+            times,
+            np.zeros(8),
+            ["wind_speed"] * 8,
+            rng.normal(3, 0.1, 8),
+        )
+        path = tmp_path / "synthetic.nc"
+        save_citizen_batch(raw, path)
+        counts = trial.trial_region(path, official, forecasts, series)["counts"]["wind_speed"]
+        assert counts["spatial_applied"] == (7 if mixed else 0)
+        assert counts["FEW_BUDDIES"] == (1 if mixed else 8)

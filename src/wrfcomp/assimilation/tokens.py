@@ -107,3 +107,5 @@ class QCConfig:
     verified_reports: int = 84
     verified_bias_sigma: float = 1.0
     verified_prior: float = 1.0
+    wind_bin_ms: float = 0.5
+    official_bias_radius_km: float = 150.0
