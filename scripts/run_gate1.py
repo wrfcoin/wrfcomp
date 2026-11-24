@@ -5,8 +5,8 @@
 
 For every period (a calendar month, `YYYY-MM`) it
 
-  a. builds the climatology and persistence forecasts for every init time of the month at the given
-     hours, through `wrfcomp.baselines`, into `<data dir>/gate1/<period>_h<hours>/<model>.zarr`
+  a. builds the climatology and persistence forecasts for every scorable init time of the month at the
+     given hours, through `wrfcomp.baselines`, into `<data dir>/gate1/<period>_h<hours>/<model>.zarr`
      (skipped when the store is already there and covers the period);
   b. assembles the per-cycle GEFS point stores `<data dir>/baselines/gefs/<YYYYMMDDHH>.zarr` into
      one forecast store next to them (same skip rule);
@@ -16,9 +16,12 @@ For every period (a calendar month, `YYYY-MM`) it
 
 Rules
   * No network. A missing GEFS cycle, truth file or thresholds file is reported, never fetched.
-  * Nothing dated in the sealed split is opened. A period must lie inside the validation split and
-    its last valid time must be before the sealed start; truth that contains sealed times is refused
-    on its coordinates, before any value is read. GEFS cycles are opened by name for the period only.
+  * Nothing dated in the sealed split is opened. A period must start inside the validation split.
+    Its last init is the last one that is inside the validation split and whose longest scored lead
+    stays before the sealed start (`scorable_init_times`); later init times of the month are left out
+    for every model alike, and the run says so. Truth that contains sealed times is refused on its
+    coordinates, before any value is read. GEFS cycles are opened by name for the scored init times
+    only.
   * Deterministic. The same inputs give the same scorecard bytes. An existing scorecard that would
     change is NOT overwritten (the run reports it and exits 1) unless `--overwrite` is given.
   * Resumable. Forecast stores that exist are reused, so delete `<data dir>/gate1/` after the truth,
@@ -27,12 +30,17 @@ Rules
 
 Exit codes: 0 every requested scorecard is in place; 1 at least one model failed or a scorecard
 would change; 2 the request or an input was refused.
+
+A second command prints the monthly tables of a year from the scorecards alone (no data needed):
+
+    uv run python scripts/run_gate1.py summary --scorecards experiments/ --year 2024
 """
 
 from __future__ import annotations
 
 import argparse
 import calendar
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -68,7 +76,8 @@ class ModelFailed(RuntimeError):
 @dataclass(frozen=True)
 class Period:
     label: str  # "2024-01"
-    init_times: np.ndarray  # datetime64[ns], every init of the month at the requested hours
+    init_times: np.ndarray  # datetime64[ns], every scorable init of the month at the requested hours
+    n_dropped: int = 0  # init times at the end of the month left out by `scorable_init_times`
 
     @property
     def cycles(self) -> list[str]:
@@ -76,6 +85,24 @@ class Period:
 
 
 # --------------------------------------------------------------------------- request checks
+
+
+def scorable_init_times(inits: np.ndarray, cfg: HarnessConfig) -> np.ndarray:
+    """The init times of a period that may be scored.
+
+    Rule: the last init of a period is the last one that is inside the validation split and whose
+    longest scored lead stays before the sealed split. Both limits come from `configs/splits.yaml`.
+    The longest scored lead is the longest of `evaluation.lead_hours`, for every model alike (also
+    for one that has no such lead), so all models of a period share the same init times. An init
+    time is dropped whole; it is never scored at its shorter leads only.
+
+    With the present config the validation split ends on 2024-12-17T18Z (14 days of embargo before
+    the sealed split), so that limit is the one that cuts December; the sealed-lead limit alone would
+    allow 2024-12-29T12Z.
+    """
+    longest = np.timedelta64(max(cfg.evaluation.lead_hours), "h")
+    keep = (inits <= cfg.splits.validation.end) & (inits + longest < cfg.splits.sealed_test.start)
+    return inits[keep]
 
 
 def parse_period(label: str, init_hours: list[int], cfg: HarnessConfig) -> Period:
@@ -88,17 +115,20 @@ def parse_period(label: str, init_hours: list[int], cfg: HarnessConfig) -> Perio
     start = np.datetime64(f"{year:04d}-{month:02d}-01T00", "ns")
     last_day = calendar.monthrange(year, month)[1]
     end = np.datetime64(f"{year:04d}-{month:02d}-{last_day:02d}T23", "ns")
-    inits = evaluation_init_times(start, end, init_hours)
+    month_inits = evaluation_init_times(start, end, init_hours)
     validation = cfg.splits.validation
-    if inits.min() < validation.start or inits.max() > validation.end:
+    if month_inits.min() < validation.start:
         raise Refused(
-            f"period {label}: init times {inits.min()} .. {inits.max()} are not all inside the validation "
-            f"split ({validation.start} .. {validation.end})"
+            f"period {label}: starts at {month_inits.min()}, before the validation split ({validation.start})"
         )
-    last_valid = inits.max() + np.timedelta64(max(cfg.evaluation.lead_hours), "h")
-    if last_valid >= cfg.splits.sealed_test.start:
-        raise Refused(f"period {label}: its last valid time {last_valid} reaches the sealed split")
-    return Period(label=label, init_times=inits)
+    inits = scorable_init_times(month_inits, cfg)
+    if inits.size == 0:
+        raise Refused(
+            f"period {label}: no init time is inside the validation split (ends {validation.end}) with its "
+            f"longest lead ({max(cfg.evaluation.lead_hours)} h) before the sealed split "
+            f"({cfg.splits.sealed_test.start})"
+        )
+    return Period(label=label, init_times=inits, n_dropped=int(month_inits.size - inits.size))
 
 
 def check_data_dir(data_dir: Path, allow_tmp: bool) -> Path:
@@ -347,6 +377,12 @@ def run(args: argparse.Namespace) -> int:
     archive: xr.Dataset | None = None
     results: list[tuple[str, str, str, str]] = []  # period, model, status, detail
     for period in periods:
+        if period.n_dropped:
+            print(
+                f"[{period.label}] stops at {pd.Timestamp(period.init_times.max()):%Y-%m-%dT%HZ}: the last "
+                f"{period.n_dropped} init time(s) of the month are left out for every model (after the end "
+                "of the validation split, or with a longest lead that reaches the sealed split)"
+            )
         work = data_dir / "gate1" / f"{period.label}_h{hour_tag}"
         stores = {model: work / f"{model}.zarr" for model in MODELS}
         ready: dict[str, bool] = {}
@@ -400,7 +436,123 @@ def run(args: argparse.Namespace) -> int:
     return EXIT_FAILED if any(status == "FAILED" for _, _, status, _ in results) else 0
 
 
+# --------------------------------------------------------------------------- summary tables
+
+SUMMARY_GATES = ("skill", "tail", "spread_skill", "dm", "min_members")
+
+
+def _fmt(value: float | None, pattern: str) -> str:
+    return "n/a" if value is None else format(value, pattern)
+
+
+def _verdict(card: dict, variable: str) -> str:
+    gates = card["gates"][variable]
+    failed = [name for name in SUMMARY_GATES if not gates[name]]
+    return "pass" if not failed else "fails " + ", ".join(failed)
+
+
+def summary_tables(scorecards: Path, year: int) -> str:
+    """Markdown: one table per primary variable, one row per month, from the scorecard files only.
+
+    Every number is the `"all"` entry (all leads of that model) of `metrics[variable]`. Skill is
+    `crpss_vs_baseline` (fair members) and `crpss_vs_baseline_ecdf`, both against climatology, in
+    percent. A month without a scorecard gives a row of `n/a`.
+    """
+    cards: dict[tuple[str, str], dict] = {}
+    months = [f"{year:04d}-{m:02d}" for m in range(1, 13)]
+    for month in months:
+        for model in MODELS:
+            path = scorecards / f"{model}_{month}.json"
+            if path.is_file():
+                cards[(model, month)] = json.loads(path.read_text())
+    if not cards:
+        raise Refused(f"no scorecards for {year} in {scorecards}")
+    variables = [
+        v
+        for v in load_config().evaluation.variables.primary
+        if any(v in c["metrics"] for c in cards.values())
+    ]
+    lines: list[str] = []
+    for variable in variables:
+        lines += [
+            f"### `{variable}`",
+            "",
+            "| Month | Init times | GEFS skill fair % | GEFS skill ecdf % | GEFS spread-skill | GEFS gate "
+            "| Persistence skill fair % | Persistence skill ecdf % | Persistence spread-skill "
+            "| Persistence gate | Climatology spread-skill |",
+            "| :--- | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: | :--- | ---: |",
+        ]
+        for month in months:
+            row = [month]
+            first = next((cards[(m, month)] for m in MODELS if (m, month) in cards), None)
+            row.append("n/a" if first is None else str(first["n_init_times"]))
+            for model in ("gefs", "persistence"):
+                card = cards.get((model, month))
+                if card is None or variable not in card["metrics"]:
+                    row += ["n/a"] * 4
+                    continue
+                entry = card["metrics"][variable]["all"]
+                fair, ecdf = entry.get("crpss_vs_baseline"), entry.get("crpss_vs_baseline_ecdf")
+                row.append(_fmt(None if fair is None else 100 * fair, "+.1f"))
+                row.append(_fmt(None if ecdf is None else 100 * ecdf, "+.1f"))
+                row.append(_fmt(entry.get("spread_skill_ratio"), ".2f"))
+                row.append(_verdict(card, variable))
+            clim = cards.get(("climatology", month))
+            ratio = (
+                None
+                if clim is None or variable not in clim["metrics"]
+                else clim["metrics"][variable]["all"].get("spread_skill_ratio")
+            )
+            row.append(_fmt(ratio, ".2f"))
+            lines.append("| " + " | ".join(row) + " |")
+        lines.append("")
+    lines += [
+        "### Single leads at which GEFS scores below climatology",
+        "",
+        "| Month | Variable | Lead h | GEFS skill fair % | GEFS skill ecdf % |",
+        "| :--- | :--- | ---: | ---: | ---: |",
+    ]
+    found = False
+    for month in months:
+        card = cards.get(("gefs", month))
+        for variable in variables if card is not None else []:
+            per_lead = card["metrics"].get(variable, {})
+            for lead in sorted((k for k in per_lead if k != "all"), key=int):
+                fair, ecdf = (
+                    per_lead[lead].get("crpss_vs_baseline"),
+                    per_lead[lead].get("crpss_vs_baseline_ecdf"),
+                )
+                if fair is not None and fair < 0:
+                    found = True
+                    ecdf_text = _fmt(None if ecdf is None else 100 * ecdf, "+.1f")
+                    lines.append(f"| {month} | `{variable}` | {lead} | {100 * fair:+.1f} | {ecdf_text} |")
+    if not found:
+        lines.append("| none | | | | |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def summary_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="run_gate1.py summary", description="Monthly tables of a year, from the scorecard files only."
+    )
+    parser.add_argument(
+        "--scorecards", type=Path, required=True, help="directory with the scorecard JSON files"
+    )
+    parser.add_argument("--year", type=int, required=True)
+    args = parser.parse_args(argv)
+    try:
+        print(summary_tables(args.scorecards, args.year))
+    except Refused as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "summary":
+        return summary_main(argv[1:])
     parser = argparse.ArgumentParser(
         description="Score climatology, persistence and GEFS for whole months (Gate 1).",
         epilog="See docs/GATE1.md.",
