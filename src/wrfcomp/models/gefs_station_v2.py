@@ -6,8 +6,9 @@ import numpy as np
 import xarray as xr
 
 from wrfcomp.baselines.io import UNITS, validate
-from wrfcomp.models.gefs_station import END, MAX_OFFSET, MODEL_ID, START
+from wrfcomp.models.gefs_station import END, MAX_OFFSET, MODEL_ID
 
+MIN_PAIRS = 10
 WINDOW = np.timedelta64(60, "D")
 HOUR = np.timedelta64(1, "h")
 MINUTE = np.timedelta64(1, "m")
@@ -20,8 +21,17 @@ class History:
     mean: xr.Dataset
 
 
-def base_ensemble(raw, truth):
+def year_bounds(year):
+    start = np.datetime64(f"{year:04d}-01-01", "D")
+    end = np.datetime64(f"{year + 1:04d}-01-01", "D")
+    if end > END:
+        raise ValueError("sealed forecast year")
+    return start, end
+
+
+def base_ensemble(raw, truth, *, year=2024):
     """Build all six leads at the original issue time, also for historical cases."""
+    start, end = year_bounds(year)
     validate(raw)
     t = raw.init_time.values[0]
     if (
@@ -29,15 +39,15 @@ def base_ensemble(raw, truth):
         or raw.sizes["init_time"] != 1
         or raw.sizes["ens_member"] != 31
         or not np.array_equal(raw.lead_time.values, LEADS[1:])
-        or not START <= t < END
-        or t + LEADS[-1] >= END
+        or not start <= t < end
+        or t + LEADS[-1] >= end
     ):
-        raise ValueError("expected one unsealed 2024 GEFS cycle with 31 members and five leads")
+        raise ValueError("expected one in-year GEFS cycle with 31 members and five leads")
     if not raw.indexes["station_id"].equals(truth.indexes["station_id"]):
         raise ValueError("truth and forecast station grids differ")
     base = raw[list(UNITS)].astype("float64").reindex(lead_time=LEADS.astype("timedelta64[ns]"))
     labels = t - np.arange(4) * HOUR
-    slots = truth.reindex(valid_time=labels[labels >= START])
+    slots = truth.reindex(valid_time=labels[labels >= start])
     for k in UNITS:
         if not np.isfinite(raw[k].values).all():
             raise ValueError(f"incomplete GEFS variable {k}")
@@ -53,7 +63,7 @@ def base_ensemble(raw, truth):
                 & np.isfinite(obs)
                 & (np.abs(offset.astype("float64")) <= 15)
                 & (age >= 0)
-                & (age <= (t - START) / HOUR)
+                & (age <= (t - start) / HOUR)
             )
             o = obs[take, None].astype("float64")
             a = age[take, None]
@@ -67,7 +77,7 @@ def fit_members(members, x, y, eligible, member_ids):
     """Arrays are point x member or point x history (newest issue first)."""
     x0 = members.mean(axis=1, keepdims=True)
     out = x0 + 4 * (members - x0)
-    fitted = eligible.sum(axis=1) >= 10
+    fitted = eligible.sum(axis=1) >= MIN_PAIRS
     if not fitted.any():
         return out, int((~fitted).sum())
 
@@ -111,13 +121,21 @@ def fit_members(members, x, y, eligible, member_ids):
 
 
 def forecast(base, past, truth):
+    out, warm, _ = forecast_with_branches(base, past, truth, year=2024)
+    return out, warm
+
+
+def forecast_with_branches(base, past, truth, *, year):
     """Calibrate an issue using causal raw-base means from previous issues."""
+    start, end = year_bounds(year)
     t = base.init_time.values[0]
+    if not start <= t < end or t + LEADS[-1] >= end:
+        raise ValueError("forecast outside requested year")
     history = sorted(
         (
             item
             for item in past
-            if item.init < t
+            if start <= item.init < t
             and (t - item.init) % (24 * HOUR) == 0 * HOUR
             and item.init + LEADS[-1] + MAX_OFFSET > t - WINDOW
         ),
@@ -133,6 +151,7 @@ def forecast(base, past, truth):
     out = base.copy(deep=True)
     out.attrs.update(model_id=MODEL_ID, model_version="2")
     warm = dict.fromkeys(UNITS, 0)
+    pressure_warm = np.empty((len(LEADS), base.sizes["station_id"]), dtype=bool)
     for j, lead in enumerate(LEADS):
         valid = issues + lead
         picks = np.flatnonzero((valid <= t) & (valid + MAX_OFFSET > t - WINDOW))
@@ -153,10 +172,12 @@ def forecast(base, past, truth):
                 & (abs(offset) <= 15)
                 & (age >= 0)
                 & (age < WINDOW / MINUTE)
-                & (age <= (t - START) / MINUTE)
+                & (age <= (t - start) / MINUTE)
             )
+            if k == "msl":
+                pressure_warm[j] = eligible.sum(axis=1) < MIN_PAIRS
             result, n_warm = fit_members(members, x, y, eligible, base.ens_member.values)
             out[k].values[0, j] = result
             warm[k] += n_warm
     np.minimum(out.td2m.values, out.t2m.values, out=out.td2m.values)
-    return out.astype("float32"), warm
+    return out.astype("float32"), warm, pressure_warm
