@@ -584,6 +584,22 @@ def test_runner_scores_a_period_that_stops_early_alike_for_all_models(
     assert run_gate1.main(["summary", "--scorecards", str(out), "--year", "2023"]) == 2
 
 
+def test_committed_summary_matches_the_committed_scorecards() -> None:
+    """`experiments/SUMMARY_2024.md` must hold exactly what the summary command prints from the files."""
+    experiments = Path(__file__).resolve().parents[1] / "experiments"
+    text = (experiments / "SUMMARY_2024.md").read_text()
+    block = text.split("<!-- tables:start -->\n")[1].split("<!-- tables:end -->")[0]
+    assert block.strip() == run_gate1.summary_tables(experiments, 2024).strip()
+    # 36 scorecards, every one valid, none sealed, and the three models of a month share their coverage.
+    for month in range(1, 13):
+        cards = [json.loads((experiments / f"{m}_2024-{month:02d}.json").read_text()) for m in MODELS]
+        for card in cards:
+            Scorecard.model_validate(card)
+            assert card["sealed_data_used"] is False and card["period_end"] < "2024-12-18"
+        assert len({(c["period_start"], c["period_end"], c["n_init_times"]) for c in cards}) == 1
+    assert json.loads((experiments / "gefs_2024-12.json").read_text())["period_end"] == "2024-12-17T12:00:00"
+
+
 def test_runner_refuses_sealed_and_short_truth(base_world: dict[str, Path], tmp_path: Path, capsys) -> None:
     out = tmp_path / "experiments"
     # truth that reaches into the sealed split is refused on its coordinates
