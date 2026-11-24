@@ -4,43 +4,91 @@
 (PoFS) reward and slashing formulas drafted in `docs/TOKENOMICS.md`. It performs no network I/O, touches no
 wallet or chain, and modifies no numbers in `docs/TOKENOMICS.md`.
 
-## What It Computes
+## Compute settlement after the 2026-11-24 owner ruling
 
-- **Parameters (`ShadowLedgerParams`):** Frozen dataclass holding the `docs/TOKENOMICS.md` defaults (`55/35/10`
-  emission split, `w_delta = 0.90`, `twcrps_weight = 0.30`, `max_slash_cap = 0.10`, `stake_exponent = 0.75`,
-  `protocol_fault_slash = 0.05`, `h3_cell_cap = 1`), with `alpha_slash` required and without a default.
-- **Compute Pool (`settle_compute_pool`, Section 4):** For each valid staked miner, computes composite loss
-  `L_i = (1 - twcrps_weight) * CRPS_fair(i) + twcrps_weight * twCRPS_p95(i)`, individual skill
-  `CRPSS_i = 1 - L_i / L_base`, leave-one-out marginal contribution
-  `Delta_CRPS_i = (L(M_{-i}) - L(M_all)) / L_base`, composite score
-  `S_i = (1 - w_delta) * CRPSS_i + w_delta * Delta_CRPS_i`, concave stake-weighted rewards for `S_i > 0`,
-  capped slashes `min(max_slash_cap, alpha_slash * |S_i|) * K_i` for `S_i < 0`, and flat `0.05 * K_i`
-  slashes (with exclusion from `M_all`) for protocol faults. Accepts either raw forecast arrays (forming
-  the exact stake-weighted mixture meta-ensemble) or precomputed pointwise loss arrays. Non-finite tail
-  thresholds (`NaN`, `±inf`, or values overflowing `float64`) are refused with `ValueError`.
-- **Scorecard Loader (`load_scorecard`, `miners_from_scorecards`, `settle_from_scorecards`):** Validates
-  `wrfcomp-eval` JSON scorecards via `wrfcomp.harness.schemas.Scorecard`, checks matching truth/threshold
-  hashes and evaluation period, aligns onto common variables and common scored leads, and feeds the compute
-  pool in pointwise-loss mode (using dimensionless `L_i(v) / L_base(v)` ratios across multiple variables so
-  Pascals, Kelvins, and m/s carry equal weight).
-- **Data Provider Pool (`settle_data_pool`, Section 5):** Computes per-station weight
-  `W_s = QoD_s * PoL_s * CellCap_s * HW_s * Impact_s` with `CellCap_s = min(1, C_max / N_cell)` using
-  caller-supplied cell IDs (no `h3` dependency), and distributes `P_data` pro-rata.
-- **Epoch Conservation & Determinism (`settle_epoch`):** Sorts participants by ID prior to floating-point
-  reductions so identical inputs produce bitwise-identical outputs regardless of input ordering, and reports
-  explicit `unpaid_remainder` whenever no participant earns a positive weight so all pool totals conserve.
+All amounts below are paper units. The recorder supplies an epoch start, an independently identified
+NOAA GEFS forecast digest, the stake roster and a separate mapping from wallet to its first accepted
+commitment (digest, UTC receipt time). The recorder is a trusted input to the simulation. Settlement
+does not authenticate timestamps, hold keys or implement drand. A batch commitment covers the whole
+forecast and must arrive strictly before the **first** initialization. A receipt at that instant is late.
 
----
+The single-field array adapter hashes the domain tag, two little-endian uint64 dimensions and C-order
+little-endian float64 member values using SHA-256. The scorecard adapter uses the locked evaluator's
+forecast content hash. Supply evaluator-produced scorecards from the same epoch and the trusted GEFS
+reference. Arbitrary self-reported metrics cannot establish forecast provenance. A standalone loss
+vector or a scalar baseline provides no paired skill, calibration or commitment evidence.
 
-## Worked Example: Real Gate 1 Scorecards (January & July 2024)
+Admission requires a matching reveal, timely receipt and minimum stake. For a full epoch each primary
+variable must pass the configured GEFS comparison on matching leads and coverage: fair and ECDF skill
+strictly above the minimum, tail loss at most GEFS tail loss, significant one-sided DM, minimum members,
+and calibrated spread. A single-field array experiment supplies one observation per dated issue at a
+single lead, the actual GEFS array and a tail threshold. It computes the paired losses, finite-member
+spread ratio and locked DM test directly. A scalar loss cannot replace that GEFS input. A partial
+scorecard variable selection can report diagnostics but cannot authorize payment.
 
-Using the committed Gate 1 scorecards in `experiments/` (`climatology`, `persistence`, `noaa-gefs` for
-`2024-01` and `2024-07`), we treat all three models as equal-stake compute miners (`K = 100` each) against
-`climatology` as the locked baseline `L_base`, under `docs/TOKENOMICS.md` defaults (`P_comp = 550` of a
-`1,000` epoch emission, `w_delta = 0.90`, `twcrps_weight = 0.30`, `max_slash_cap = 0.10`, `K^0.75`, and
-illustrative `alpha_slash = 0.50`). Because GEFS is 3-hourly (`leads_scored = [3, 6, 12, 24, 48]`) while
-climatology and persistence include `1h`, all three are aligned on their common leads `[3, 6, 12, 24, 48]`
-using exact `n_pairs`-weighted composite loss per variable.
+Sort valid timely reveals by receipt time, then wallet ID for an exact tie. The first representative of
+each forecast is retained. Raw ensembles also compare ordered member values per observation using RMS
+distance (this handles member permutation). Scorecards support exact forecast-content deduplication
+only; they contain no arrays for a distance test. Subsequent clones earn zero. Eligible representatives
+each contribute one equally weighted forecast to the meta-ensemble. The excluded miner's own diagnostic
+downside may be computed by adding it to this fixed pool; its presence never changes an eligible
+miner's marginal score. The scorecard approximation uses the mean of normalized losses across models;
+it cannot measure physical ensemble diversity.
+
+Eligible wallets with positive composite score share the compute pool in proportion to stake times
+score at the default exponent. For a fixed forecast and total stake K, at most one of m copies can earn.
+If its stake is k ≤ K and meets the floor, the set of distinct forecasts and their scores is unchanged.
+Its share is w/(w+B), with competing weight B fixed and w proportional to k raised to the exponent.
+This is nondecreasing in k. If the representative misses the floor its reward is zero. This establishes
+the splitting bound at every m, including the tested range 1–100. It compares the same forecast and
+competing submissions. New forecasting information is a different comparison.
+
+A committed forecast withheld, corrupted or mismatched loses the maximum fraction of stake. An honest
+negative score loses at most that fraction. Missing historical receipt evidence produces no reward and
+does not establish a slashable commitment. Below-floor stakes, late matching reveals and duplicate
+reveals earn zero. Reward returns to `unpaid_remainder` when no wallet earns. Slashes are accounted for
+separately from emissions. The station and validator pool rules are unchanged.
+
+### Shadow defaults
+
+The owner may change these research defaults. Ledger settings are centralized in
+`ShadowLedgerParams`; protocol gates come directly from the locked configuration.
+
+| Setting | Default | Reason |
+| --- | ---: | --- |
+| Minimum wallet stake | 10 paper units | One tenth of the illustrative 100-unit stake; dust wallets cannot participate. |
+| Stake exponent | 1 | Linear stake weight gives each unit equal payout leverage. Exponents below 1 are rejected. |
+| Raw clone RMS tolerance | 0.002 field units | Covers tiny member perturbations at the red-team 0.001 noise scale. The raw adapter handles one field in its native units. |
+| Maximum slash | 10% | Same ceiling for the worst honest loss and a failed reveal. |
+| Negative-score multiplier | Caller-supplied | The replay uses 0.50; this rate has no owner-set default. |
+| Compute/data/validator shares | 55% / 35% / 10% | Existing shadow emission split. |
+| Marginal score weight / tail loss weight | 0.90 / 0.30 | Existing uniqueness emphasis and proper-loss blend. Eligibility always uses the locked harness loss weights. |
+| Default cell capacity | 1 | Existing rural station cap. |
+| Protocol gate | Skill > 0.05, DM p < 0.05, spread-skill 0.85–1.15 inclusive, ≥20 members, no worse tail | Uses the shared evaluator gate and its configured parameters. |
+
+### Gate 1 reference-only replay
+
+All 48 committed reference cards (12 months and four quarters, three models per period) were replayed
+using `settle_from_scorecards(cards, baseline_key="noaa-gefs", pool_amount=550,
+params=ShadowLedgerParams(alpha_slash=0.5), stakes=100)`. Each period is a separate illustration;
+quarters overlap the monthly replays. There are no recorder receipts in these historical artifacts.
+Climatology and persistence do not have passing scorecards against GEFS in this inventory. GEFS is
+the benchmark and has zero individual skill against itself.
+
+| Every replay period | Reward | Slash |
+| --- | ---: | ---: |
+| NOAA GEFS | 0 | 0 |
+| Climatology | 0 | 0 |
+| Persistence | 0 | 0 |
+| Unpaid compute pool | 550 | |
+
+Diagnostic GEFS-normalized persistence skill was −0.81864 in January and −0.21314 in July. The
+historical tables below use a different denominator and settlement policy.
+
+## Historical pre-S3 comparison (superseded)
+
+The following tables and observations describe the original experiment against climatology. They are
+retained to show why the owner changed the rules; they are not outputs of current settlement.
 
 ### Combined 5-Variable Settlement (Equal-Weight Baseline-Normalized Across `msl`, `t2m`, `td2m`, `u10`, `v10`)
 
@@ -93,7 +141,9 @@ using exact `n_pairs`-weighted composite loss per variable.
 
 ---
 
-## Open Problems Found in `docs/TOKENOMICS.md`
+## Historical design questions identified in `docs/TOKENOMICS.md`
+
+The S3 rulings above resolve the payout eligibility, commit/reveal and stake-splitting questions.
 
 1. **`alpha_slash` has no default or range.**
    Section 4.3 defines `Slash_i = min(max_slash_cap, alpha_slash * |S_i|) * K_i`, but `alpha_slash` is omitted

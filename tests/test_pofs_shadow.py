@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from pofs_fixtures import recorded_epoch
 
 from wrfcomp.pofs_shadow import (
     MinerEntry,
@@ -39,8 +40,8 @@ def test_params_frozen_defaults_and_required_alpha_slash() -> None:
     assert params.w_delta == 0.90
     assert params.twcrps_weight == 0.30
     assert params.max_slash_cap == 0.10
-    assert params.stake_exponent == 0.75
-    assert params.protocol_fault_slash == 0.05
+    assert params.stake_exponent == 1.0
+    assert params.k_min == 10.0
     assert params.h3_cell_cap == 1
     assert params.alpha_slash == 0.5
 
@@ -76,9 +77,8 @@ def test_fair_and_weighted_crps_match_brute_force() -> None:
     np.testing.assert_allclose(mix_fast, mix_brute, rtol=1e-12, atol=1e-12)
 
 
-def test_baseline_copy_earns_near_zero_at_090_and_third_of_innovator_at_zero() -> None:
-    """A public/baseline relay with 1/3 the innovator's CRPSS earns 1/3 at w_delta=0
-    and ~0 at w_delta=0.90; an exact copy of the locked baseline earns 0 at both."""
+def test_unverified_scalar_skill_cannot_earn_at_any_delta_weight() -> None:
+    """Without commitment and GEFS evidence neither delta weight authorizes payment."""
     rng = np.random.default_rng(42)
     n_obs = 800
     obs = rng.normal(0.0, 1.0, size=n_obs)
@@ -107,14 +107,14 @@ def test_baseline_copy_earns_near_zero_at_090_and_third_of_innovator_at_zero() -
         miners, pool_amount=1000.0, params=params_zero, baseline_loss=l_base, obs=obs
     )
     by_id_zero = {p.miner_id: p for p in res_zero.payouts}
-    assert by_id_zero["public_copy"].reward == pytest.approx(by_id_zero["innovator"].reward / 3.0, rel=1e-9)
+    assert by_id_zero["public_copy"].reward == by_id_zero["innovator"].reward == 0.0
 
     res_strict = settle_compute_pool(
         miners, pool_amount=1000.0, params=params_strict, baseline_loss=l_base, obs=obs
     )
     by_id_strict = {p.miner_id: p for p in res_strict.payouts}
     assert by_id_strict["public_copy"].reward == pytest.approx(0.0, abs=1e-9)
-    assert by_id_strict["innovator"].reward == pytest.approx(1000.0, rel=1e-9)
+    assert by_id_strict["innovator"].reward == 0.0
 
     # Exact copy of the locked baseline itself (L_copy == L_base => CRPSS == 0) earns 0 at w_delta=0.90.
     exact_miners = [
@@ -137,14 +137,14 @@ def test_ten_identical_clones_earn_no_more_than_one_alone() -> None:
     obs = rng.normal(0.0, 2.0, size=n_obs)
 
     # Two independent skilled models beating baseline; clone model B ten times.
-    baseline_fc = obs[:, np.newaxis] + rng.normal(0.0, 2.0, size=(n_obs, 12))
-    model_a = obs[:, np.newaxis] + rng.normal(0.0, 1.1, size=(n_obs, 12))
-    model_b = obs[:, np.newaxis] + rng.normal(0.0, 1.1, size=(n_obs, 12))
+    baseline_fc = obs[:, np.newaxis] + rng.normal(0, 2.0, (n_obs, 1)) + rng.normal(0.0, 2.0, size=(n_obs, 31))
+    model_a = obs[:, np.newaxis] + rng.normal(0, 1.1, (n_obs, 1)) + rng.normal(0.0, 1.1, size=(n_obs, 31))
+    model_b = obs[:, np.newaxis] + rng.normal(0, 1.1, (n_obs, 1)) + rng.normal(0.0, 1.1, size=(n_obs, 31))
 
     params = ShadowLedgerParams(alpha_slash=0.5, w_delta=0.90)
 
     # Single instance of model B alongside model A.
-    solo = settle_compute_pool(
+    solo = recorded_epoch(
         [
             MinerEntry("miner_a", stake=100.0, forecast=model_a),
             MinerEntry("clone_0", stake=100.0, forecast=model_b),
@@ -161,7 +161,7 @@ def test_ten_identical_clones_earn_no_more_than_one_alone() -> None:
     split_miners = [MinerEntry("miner_a", stake=100.0, forecast=model_a)] + [
         MinerEntry(f"clone_{i}", stake=10.0, forecast=model_b) for i in range(10)
     ]
-    res_split = settle_compute_pool(
+    res_split = recorded_epoch(
         split_miners, pool_amount=1000.0, params=params, baseline_forecast=baseline_fc, obs=obs
     )
     split_clones_total = sum(p.reward for p in res_split.payouts if p.miner_id.startswith("clone_"))
@@ -169,7 +169,7 @@ def test_ten_identical_clones_earn_no_more_than_one_alone() -> None:
 
     # Case 2: 10 full-stake clones under pure marginal contribution (w_delta=1.0).
     params_pure = ShadowLedgerParams(alpha_slash=0.5, w_delta=1.0)
-    solo_pure = settle_compute_pool(
+    solo_pure = recorded_epoch(
         [
             MinerEntry("miner_a", stake=100.0, forecast=model_a),
             MinerEntry("clone_0", stake=100.0, forecast=model_b),
@@ -183,7 +183,7 @@ def test_ten_identical_clones_earn_no_more_than_one_alone() -> None:
     dup_miners = [MinerEntry("miner_a", stake=100.0, forecast=model_a)] + [
         MinerEntry(f"clone_{i}", stake=100.0, forecast=model_b) for i in range(10)
     ]
-    res_dup = settle_compute_pool(
+    res_dup = recorded_epoch(
         dup_miners, pool_amount=1000.0, params=params_pure, baseline_forecast=baseline_fc, obs=obs
     )
     dup_clones_total = sum(p.reward for p in res_dup.payouts if p.miner_id.startswith("clone_"))
@@ -194,15 +194,15 @@ def test_worse_than_baseline_miner_is_slashed_and_cap_holds() -> None:
     rng = np.random.default_rng(9)
     n_obs = 200
     obs = rng.normal(0.0, 1.0, size=n_obs)
-    baseline_fc = obs[:, np.newaxis] + rng.normal(0.0, 1.0, size=(n_obs, 8))
-    good_fc = obs[:, np.newaxis] + rng.normal(0.0, 0.6, size=(n_obs, 8))
-    mild_bad_fc = obs[:, np.newaxis] + rng.normal(0.0, 1.25, size=(n_obs, 8))
-    terrible_fc = obs[:, np.newaxis] + rng.normal(10.0, 5.0, size=(n_obs, 8))
+    baseline_fc = obs[:, np.newaxis] + rng.normal(0, 2.0, (n_obs, 1)) + rng.normal(0.0, 1.0, size=(n_obs, 31))
+    good_fc = obs[:, np.newaxis] + rng.normal(0, 0.6, (n_obs, 1)) + rng.normal(0.0, 0.6, size=(n_obs, 31))
+    mild_bad_fc = baseline_fc + 1.0
+    terrible_fc = obs[:, np.newaxis] + rng.normal(10.0, 5.0, size=(n_obs, 31))
 
     params = ShadowLedgerParams(alpha_slash=0.25, max_slash_cap=0.10)
 
     # Mildly worse-than-baseline miner: slashed proportionally below the 10% cap.
-    res_mild = settle_compute_pool(
+    res_mild = recorded_epoch(
         [
             MinerEntry("good", stake=100.0, forecast=good_fc),
             MinerEntry("mild_bad", stake=100.0, forecast=mild_bad_fc),
@@ -222,7 +222,7 @@ def test_worse_than_baseline_miner_is_slashed_and_cap_holds() -> None:
     assert 0.0 < by_mild["mild_bad"].slash < 10.0
 
     # Severely worse-than-baseline miner: hits the 10% max_slash_cap cleanly.
-    res_cap = settle_compute_pool(
+    res_cap = recorded_epoch(
         [
             MinerEntry("good", stake=100.0, forecast=good_fc),
             MinerEntry("terrible", stake=200.0, forecast=terrible_fc),
@@ -242,14 +242,14 @@ def test_protocol_fault_gets_flat_slash_and_is_excluded_from_meta_ensemble() -> 
     rng = np.random.default_rng(17)
     n_obs = 150
     obs = rng.normal(0.0, 1.0, size=n_obs)
-    baseline_fc = obs[:, np.newaxis] + rng.normal(0.0, 1.5, size=(n_obs, 8))
-    m1_fc = obs[:, np.newaxis] + rng.normal(0.0, 0.8, size=(n_obs, 8))
-    m2_fc = obs[:, np.newaxis] + rng.normal(0.0, 0.9, size=(n_obs, 8))
+    baseline_fc = obs[:, np.newaxis] + rng.normal(0, 2.0, (n_obs, 1)) + rng.normal(0.0, 1.5, size=(n_obs, 31))
+    m1_fc = obs[:, np.newaxis] + rng.normal(0, 0.8, (n_obs, 1)) + rng.normal(0.0, 0.8, size=(n_obs, 31))
+    m2_fc = obs[:, np.newaxis] + rng.normal(0, 0.9, (n_obs, 1)) + rng.normal(0.0, 0.9, size=(n_obs, 31))
     corrupt_fc = np.full((n_obs, 8), np.nan)  # invalid payload
 
-    params = ShadowLedgerParams(alpha_slash=1.0, protocol_fault_slash=0.05)
+    params = ShadowLedgerParams(alpha_slash=1.0, max_slash_cap=0.10)
 
-    clean = settle_compute_pool(
+    clean = recorded_epoch(
         [
             MinerEntry("m1", stake=100.0, forecast=m1_fc),
             MinerEntry("m2", stake=100.0, forecast=m2_fc),
@@ -259,7 +259,7 @@ def test_protocol_fault_gets_flat_slash_and_is_excluded_from_meta_ensemble() -> 
         baseline_forecast=baseline_fc,
         obs=obs,
     )
-    with_fault = settle_compute_pool(
+    with_fault = recorded_epoch(
         [
             MinerEntry("m1", stake=100.0, forecast=m1_fc),
             MinerEntry("m2", stake=100.0, forecast=m2_fc),
@@ -277,7 +277,7 @@ def test_protocol_fault_gets_flat_slash_and_is_excluded_from_meta_ensemble() -> 
     assert by_fault["m1"] == by_clean["m1"]
     assert by_fault["m2"] == by_clean["m2"]
     assert by_fault["faulty"].reward == 0.0
-    assert by_fault["faulty"].slash == pytest.approx(0.05 * 200.0)
+    assert by_fault["faulty"].slash == pytest.approx(params.max_slash_cap * 200.0)
     assert by_fault["faulty"].composite_score is None
     assert by_fault["faulty"].delta_crps is None
 
@@ -357,11 +357,11 @@ def test_tail_threshold_weighting_and_single_miner_behavior() -> None:
     rng = np.random.default_rng(31)
     obs = rng.normal(0.0, 2.0, size=100)
     tau = np.quantile(obs, 0.95)
-    base_fc = obs[:, np.newaxis] + rng.normal(0.0, 1.5, size=(100, 8))
-    good_fc = obs[:, np.newaxis] + rng.normal(0.0, 0.8, size=(100, 8))
+    base_fc = obs[:, np.newaxis] + rng.normal(0, 2.0, (100, 1)) + rng.normal(0.0, 1.5, size=(100, 31))
+    good_fc = obs[:, np.newaxis] + rng.normal(0, 0.8, (100, 1)) + rng.normal(0.0, 0.8, size=(100, 31))
     params = ShadowLedgerParams(alpha_slash=0.5, twcrps_weight=0.30)
 
-    res = settle_compute_pool(
+    res = recorded_epoch(
         [MinerEntry("solo", stake=100.0, forecast=good_fc)],
         pool_amount=550.0,
         params=params,
@@ -431,53 +431,35 @@ def test_gate1_scorecards_worked_example_january_and_july() -> None:
     assert jan_base == 1.0
     assert len(jan_miners) == 3
 
-    jan_res = settle_from_scorecards(
-        jan_cards, baseline_key="climatology", pool_amount=550.0, params=params, stakes=100.0
-    )
-    jan_by_id = {p.miner_id: p for p in jan_res.payouts}
-    # GEFS is severely under-dispersed (failed Gate 1), yet wins 100% of the compute pool in January.
-    assert jan_cards["noaa-gefs"].passed_gate is False
-    assert jan_by_id["noaa-gefs"].reward == pytest.approx(550.0)
-    assert jan_by_id["noaa-gefs"].slash == 0.0
-    # Persistence beats climatology on average (+17.3% CRPSS) yet gets slashed due to negative Delta_CRPS.
-    assert jan_by_id["persistence"].crpss is not None and jan_by_id["persistence"].crpss > 0.15
-    assert jan_by_id["persistence"].reward == 0.0
-    assert jan_by_id["persistence"].slash > 0.0
-    assert jan_by_id["climatology"].reward == 0.0
-    assert jan_by_id["climatology"].slash > 0.0
-    assert jan_res.total_paid + jan_res.unpaid_remainder == pytest.approx(550.0)
-
-    jul_cards = {
-        "climatology": load_scorecard(EXPERIMENTS_DIR / "climatology_2024-07.json"),
-        "persistence": load_scorecard(EXPERIMENTS_DIR / "persistence_2024-07.json"),
-        "noaa-gefs": load_scorecard(EXPERIMENTS_DIR / "gefs_2024-07.json"),
-    }
-    jul_res = settle_from_scorecards(
-        jul_cards, baseline_key="climatology", pool_amount=550.0, params=params, stakes=100.0
-    )
-    jul_by_id = {p.miner_id: p for p in jul_res.payouts}
-    # In July combined 5-variable settlement, uncalibrated GEFS again wins 100% and persistence is slashed.
-    assert jul_cards["noaa-gefs"].passed_gate is False
-    assert jul_by_id["noaa-gefs"].reward == pytest.approx(550.0)
-    assert jul_by_id["persistence"].crpss is not None and jul_by_id["persistence"].crpss < 0.0
-    assert jul_by_id["persistence"].reward == 0.0
-    assert jul_by_id["persistence"].slash > 0.0
-
-    # Per-variable July u10 demonstrates Open Problem #10 on real data: both climatology (CRPSS=0)
-    # and GEFS (CRPSS<0) get paid because they dilute an even worse persistence forecast in M_all.
-    jul_u10 = settle_from_scorecards(
-        jul_cards,
-        baseline_key="climatology",
-        pool_amount=550.0,
-        params=params,
-        stakes=100.0,
-        variables=["u10"],
-    )
-    u10_by_id = {p.miner_id: p for p in jul_u10.payouts}
-    assert u10_by_id["noaa-gefs"].crpss is not None and u10_by_id["noaa-gefs"].crpss < 0.0
-    assert u10_by_id["noaa-gefs"].reward > 0.0
-    assert u10_by_id["climatology"].reward > 0.0
-    assert u10_by_id["persistence"].slash > 0.0
+    for month in ("01", "07"):
+        cards = {
+            name: load_scorecard(EXPERIMENTS_DIR / f"{file}_2024-{month}.json")
+            for name, file in (
+                ("climatology", "climatology"),
+                ("persistence", "persistence"),
+                ("noaa-gefs", "gefs"),
+            )
+        }
+        assert cards["noaa-gefs"].passed_gate is False
+        for variables in (None, ["u10"]):
+            res = settle_from_scorecards(
+                cards,
+                baseline_key="noaa-gefs",
+                pool_amount=550.0,
+                params=params,
+                stakes=100.0,
+                variables=variables,
+            )
+            for payout in res.payouts:
+                assert payout.reward == 0.0
+                assert payout.slash == 0.0
+            gefs = next(p for p in res.payouts if p.miner_id == "noaa-gefs")
+            assert gefs.crpss == 0.0
+            if variables is None:
+                persistence = next(p for p in res.payouts if p.miner_id == "persistence")
+                assert persistence.crpss == pytest.approx({"01": -0.81864, "07": -0.21314}[month], abs=1e-5)
+            assert res.unpaid_remainder == 550.0
+            assert res.total_paid + res.unpaid_remainder == pytest.approx(550.0)
 
 
 def test_miners_from_scorecards_refuses_mismatched_periods() -> None:
@@ -485,3 +467,122 @@ def test_miners_from_scorecards_refuses_mismatched_periods() -> None:
     jul_gefs = load_scorecard(EXPERIMENTS_DIR / "gefs_2024-07.json")
     with pytest.raises(ValueError, match="does not share truth, thresholds, period"):
         miners_from_scorecards({"climatology": jan_clim, "noaa-gefs": jul_gefs}, baseline_key="climatology")
+
+
+def test_commit_cutoff_digest_minimum_and_unrevealed_receipt():
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence, forecast_digest
+
+    rng = np.random.default_rng(34)
+    n = 320
+    t = np.datetime64("2024-01-01", "ns")
+    times = t + np.arange(n) * np.timedelta64(6, "h")
+    obs = rng.normal(size=n)
+    fc = obs[:, None] + rng.normal(size=(n, 1)) + rng.normal(size=(n, 31))
+    gefs = obs[:, None] + rng.normal(0, 2, (n, 1)) + rng.normal(0, 2, (n, 31))
+    params = ShadowLedgerParams(alpha_slash=0.5)
+    earlier = Commitment(forecast_digest(fc), t - np.timedelta64(1, "ns"))
+
+    def settle(entry, receipt):
+        e = EpochEvidence(t, forecast_digest(gefs), {"w": receipt} if receipt else {})
+        return settle_compute_pool(
+            [entry],
+            pool_amount=550,
+            params=params,
+            obs=obs,
+            baseline_forecast=gefs,
+            evidence=e,
+            issue_times=times,
+            lead_hours=6,
+            tail_threshold=1.65,
+        ).payouts[0]
+
+    at_floor = MinerEntry("w", params.k_min, forecast=fc)
+    assert settle(at_floor, earlier).reward == 550
+    assert settle(dataclasses.replace(at_floor, stake=np.nextafter(params.k_min, 0)), earlier).reward == 0
+    assert settle(at_floor, None).status == "uncommitted"
+    for delta in (0, 1):
+        result = settle(at_floor, Commitment(earlier.digest, t + np.timedelta64(delta, "ns")))
+        assert result.status == "late" and result.reward == 0
+    for payload in (None, fc + 1, np.full_like(fc, np.nan)):
+        result = settle(dataclasses.replace(at_floor, forecast=payload), earlier)
+        assert result.reward == 0 and result.slash == params.k_min * params.max_slash_cap
+
+
+def test_scorecard_gate_checks_gefs_and_every_variable_and_missing_wallet():
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence
+
+    # Synthetic evaluator evidence based on the shape/coverage of a real reference.
+    # No synthetic metrics are used in the committed-reference replay.
+    ref = load_scorecard(EXPERIMENTS_DIR / "gefs_2024-01.json")
+    candidate = ref.model_dump()
+    candidate["model_id"] = "fixture"
+    candidate["forecast_sha256"] = "a" * 64
+    candidate["baseline_id"] = "noaa-gefs"
+    candidate["baseline_sha256"] = ref.forecast_sha256
+    candidate["passed_gate"] = True
+    for var, leads in candidate["metrics"].items():
+        candidate["gates"][var] = dict.fromkeys(candidate["gates"][var], True)
+        row = leads["all"]
+        for name, val in dict(
+            crpss_vs_baseline=0.25,
+            crpss_vs_baseline_ecdf=0.24,
+            spread_skill_ratio=1.0,
+            dm_pvalue=0.01,
+            twcrps_p95=0.1,
+            baseline_twcrps_p95=0.2,
+        ).items():
+            row[name] = val
+        for h in candidate["leads_scored"]:
+            leads[str(h)]["loss"] *= 0.75
+    t = np.datetime64(ref.period_start)
+    receipt = Commitment(candidate["forecast_sha256"], t - np.timedelta64(1, "m"))
+    evidence = EpochEvidence(t, ref.forecast_sha256, {"miner": receipt, "withheld": receipt})
+
+    def settle():
+        return {
+            p.miner_id: p
+            for p in settle_from_scorecards(
+                {"gefs": ref, "miner": type(ref).model_validate(candidate)},
+                baseline_key="gefs",
+                pool_amount=550,
+                params=ShadowLedgerParams(alpha_slash=0.5),
+                stakes=100,
+                evidence=evidence,
+            ).payouts
+        }
+
+    assert settle()["miner"].reward == 550
+    assert settle()["withheld"].slash == 10
+    for stat, value in (
+        ("dm_pvalue", 0.05),
+        ("spread_skill_ratio", 1.16),
+        ("spread_skill_ratio", 0.84),
+        ("crpss_vs_baseline", 0.05),
+    ):
+        row = candidate["metrics"]["v10"]["all"]
+        old = row[stat]
+        row[stat] = value
+        assert settle()["miner"].reward == 0
+        row[stat] = old
+    candidate["baseline_sha256"] = "0" * 64
+    assert settle()["miner"].reward == 0
+
+
+def test_excluded_forecasts_do_not_change_the_valid_marginal():
+    rng = np.random.default_rng(812)
+    obs = rng.normal(size=500)
+    gefs = obs[:, None] + rng.normal(0, 2, (500, 1)) + rng.normal(0, 2, (500, 31))
+    first = MinerEntry(
+        "innovator", 100, forecast=obs[:, None] + rng.normal(size=(500, 1)) + rng.normal(size=(500, 31))
+    )
+    kwargs = dict(
+        pool_amount=550, params=ShadowLedgerParams(alpha_slash=0.5), baseline_forecast=gefs, obs=obs
+    )
+    solo = recorded_epoch([first], **kwargs)
+    with_losers = recorded_epoch(
+        [first, MinerEntry("relay", 1000, forecast=gefs), MinerEntry("bad", 1000, forecast=gefs + 5)],
+        **kwargs,
+    )
+    assert solo.payouts[0].reward > 0
+    assert with_losers.meta_ensemble_loss == solo.meta_ensemble_loss
+    assert next(p for p in with_losers.payouts if p.miner_id == "innovator") == solo.payouts[0]
