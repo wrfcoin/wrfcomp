@@ -1,7 +1,11 @@
 # 2023 confirmation period: proposal (lane V1, step 1)
 
-**Status: proposal and measurements only.** Nothing here is built, pinned or scored. No locked file is
-changed by this pull request. The manager's go is needed before step 2.
+**Status: proposal, measurements, and the code for it (section 6).** No 2023 reference or threshold is
+built, pinned or scored. No locked file is changed by this pull request. Data builds wait for the owner's
+disk decision.
+
+Manager rulings, 2026-11-24: the Q4 end of 2023-12-15T12Z is accepted; the existing `promote` printing
+`PROMOTED` for 2023 is read as confirmed, with no change to the locked script.
 
 Owner ruling 2026-11-24: a candidate that passes on 2024 must also pass on an untouched 2023 period before
 anyone relies on it. Nothing from 2025 onward is touched.
@@ -163,3 +167,50 @@ show how the references behave in 2023. Build and pin them only after v3 is froz
   those two numbers no placement on `/` works; see section 4.
 - "Persistence and GEFS as today" is right for GEFS. Persistence and climatology as today would use a
   rolling cutoff in 2023 (section 2), so they need the explicit cutoff.
+
+## 6. Code (step 2, code only)
+
+All of it is unlocked code. The default behaviour of every changed function and command is unchanged.
+
+- `wrfcomp.baselines`: `climatology.forecast` and `persistence.forecast` take `train_end`. It fixes the
+  cutoff, can only be at or before the default one, and is written to the store's `train_end_utc`
+  attribute. Without it nothing changes, attributes included.
+- `scripts/build_thresholds.py --train-end <UTC>`: uses truth at or before that time only. It must be
+  earlier than the train split end. The file's `train_end_utc` attribute is the real cutoff. Input after
+  the train split end is still refused.
+- `scripts/run_gate1.py --confirmation-train-end <UTC>`: scores a period inside the train split.
+  - The period must start at least 14 days (the train split's embargo) after the cutoff and lie before
+    validation. The last init is the last one whose 48 h lead verifies at or before the train split end.
+  - `--truth` and `--thresholds` must be named, and the thresholds file must carry exactly this cutoff.
+    The ordinary thresholds file is refused.
+  - Train truth after the cutoff is dropped before loading. The scored truth may be the train truth
+    file itself, so no separate 2023 truth file is needed.
+  - A climatology or persistence store built with another cutoff, or with none, is not reused.
+
+**No change to 2024 (measured).** With the changed code, rebuilt in memory from the real inputs and
+compared by harness content hash with `experiments/REFERENCES.json`:
+
+| Rebuilt | Content hash | Pinned |
+| --- | --- | --- |
+| Climatology 2024-01 (62 init times) | `ff1823d8f20d…9a636f53` | match |
+| Persistence 2024-01 (62 init times) | `4b877417821d…5bbfa6db` | match |
+| Tail thresholds (whole train split) | `7ee7e1e5428d…336587864c` | match |
+
+Nothing was written to disk for this check.
+
+**The commands for 2023, once the disk decision is made (not run):**
+
+```sh
+uv run python scripts/build_thresholds.py --train-truth "$D/truth/isd_conus_train.nc" \
+  --train-end 2022-12-17T18 --out "$D/thresholds/tail_p95_to_2022-12-17.nc"
+uv run python scripts/run_gate1.py --data-dir "$D" --init-hours 0 12 --out experiments/ \
+  --confirmation-train-end 2022-12-17T18 --truth "$D/truth/isd_conus_train.nc" \
+  --thresholds "$D/thresholds/tail_p95_to_2022-12-17.nc" \
+  --period 2023-01 ... --period 2023-12 --period 2023-Q1 ... --period 2023-Q4
+```
+
+Tests: `tests/test_baselines_models.py` (the rolling-cutoff trap and its fix, for both models),
+`tests/test_gate1_scripts.py` (thresholds cut and attribute, a confirmation month end to end with a
+check that train data after the cutoff cannot move the references, the refusals, and the 2023 schedule
+with the real config: 180, 182, 184 and 152 init times).
+

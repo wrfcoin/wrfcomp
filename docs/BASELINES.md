@@ -22,6 +22,10 @@ cutoff is the earlier of the configured training end and the earliest initializa
 the request. A report's measurement time is its hourly label plus its variable-specific
 `X_offset_min`, which must lie within ±15 minutes.
 
+For a request before the training end, that default cutoff follows the request. A confirmation period
+inside the training years passes a fixed cutoff instead (`train_end` in `forecast`, recorded in the
+store's `train_end_utc` attribute); see `docs/CONFIRMATION_2023.md`.
+
 Both models use the same member rule. For `M` members, member `i` uses the empirical
 quantile at `(i + 0.5) / M`, for `i = 0, …, M − 1`. This selects the smallest sampled
 value whose cumulative frequency reaches that probability (NumPy's `inverted_cdf`).

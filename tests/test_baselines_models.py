@@ -76,3 +76,80 @@ def test_no_training_wind_or_recent_anchor_leaves_members_missing(truth):
 def test_ai_stub():
     with pytest.raises(RuntimeError, match="ai extra and an NVIDIA GPU"):
         earth2_baselines.load()
+
+
+# --------------------------------------------------------------------------- explicit train_end
+
+
+@pytest.fixture
+def long_truth():
+    """Hourly synthetic truth from 2022-01-01 to 2023-02-10, one station, seeded."""
+    rng = np.random.default_rng(11)
+    time = np.arange("2022-01-01", "2023-02-10", dtype="datetime64[h]").astype("datetime64[ns]")
+    ds = xr.Dataset(
+        coords={
+            "valid_time": time,
+            "station_id": ["00123456789"],
+            "latitude": ("station_id", [40.0]),
+            "longitude": ("station_id", [-105.0]),
+            "elevation_m": ("station_id", [1500.0]),
+        }
+    )
+    for name in UNITS:
+        ds[name] = (("valid_time", "station_id"), rng.normal(0, 1, (len(time), 1)).astype("f4"))
+        ds[name + "_offset_min"] = xr.zeros_like(ds[name], dtype=np.int16)
+    return ds
+
+
+CUTOFF = np.datetime64("2022-12-17T18", "ns")
+INIT_2023 = np.datetime64("2023-02-05T00", "ns")
+
+
+def _poison(truth, start, end):
+    bad = truth.copy(deep=True)
+    for name in UNITS:
+        bad[name].loc[dict(valid_time=slice(start, end))] = 1e9
+    return bad
+
+
+@pytest.mark.parametrize("model", [climatology, persistence])
+def test_default_cutoff_follows_the_request_and_train_end_fixes_it(long_truth, model):
+    """The trap: before the train end the default cutoff is the earliest init, so data between a
+    fixed cutoff and the init is learned from. `train_end` stops that and nothing else."""
+    # After the cutoff, but early enough that persistence's starting value at init is untouched.
+    poisoned = _poison(long_truth, CUTOFF + np.timedelta64(1, "h"), INIT_2023 - np.timedelta64(4, "h"))
+    default = model.forecast(long_truth, [INIT_2023], [3, 24])
+    assert np.isfinite(default.t2m).all()
+    assert "train_end_utc" not in default.attrs
+    assert not default.t2m.equals(model.forecast(poisoned, [INIT_2023], [3, 24]).t2m)
+
+    fixed = model.forecast(long_truth, [INIT_2023], [3, 24], train_end=CUTOFF)
+    assert np.isfinite(fixed.t2m).all()
+    assert fixed.attrs["train_end_utc"] == str(CUTOFF)
+    xr.testing.assert_identical(fixed, model.forecast(poisoned, [INIT_2023], [3, 24], train_end=CUTOFF))
+    assert not fixed.t2m.equals(default.t2m)
+    validate(fixed)
+
+
+@pytest.mark.parametrize("model", [climatology, persistence])
+def test_train_end_equal_to_the_default_cutoff_changes_no_value(long_truth, model):
+    default = model.forecast(long_truth, [INIT_2023], [3, 24])
+    same = model.forecast(long_truth, [INIT_2023], [3, 24], train_end=INIT_2023)
+    for name in UNITS:
+        np.testing.assert_array_equal(default[name].values, same[name].values)
+
+
+@pytest.mark.parametrize("model", [climatology, persistence])
+def test_train_end_can_only_be_earlier(long_truth, truth, model):
+    with pytest.raises(ValueError, match="train_end"):  # after the earliest init of the request
+        model.forecast(long_truth, [INIT_2023], [3], train_end=INIT_2023 + np.timedelta64(1, "h"))
+    with pytest.raises(ValueError, match="train_end"):  # after the configured train split end
+        model.forecast(truth, [np.datetime64("2024-01-01T00", "ns")], [3], train_end="2023-12-17T19")
+    with pytest.raises(ValueError, match="train_end"):
+        model.forecast(long_truth, [INIT_2023], [3], train_end="NaT")
+
+
+def test_persistence_with_train_end_still_starts_from_the_latest_observation(long_truth):
+    long_truth.t2m.loc[dict(valid_time=INIT_2023)] = 700.0
+    out = persistence.forecast(long_truth, [INIT_2023], [3], train_end=CUTOFF)
+    assert abs(float(out.t2m.mean()) - 700.0) < 5.0
