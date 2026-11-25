@@ -42,7 +42,9 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import re
+import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -169,15 +171,29 @@ def fetch(
         if not isinstance(batch, list):
             raise ValueError("unexpected METAR API response")
         reports.extend(batch)
-    directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{stamp}.json"
-    if path.exists():
-        raise FileExistsError(path)
     body = {"source": API, "fetched_at": stamp, "hours": hours, "reports": reports}
-    tmp = path.with_suffix(".part")
-    tmp.write_text(json.dumps(body, sort_keys=True) + "\n")
-    tmp.rename(path)
+    publish_file(path, json.dumps(body, sort_keys=True) + "\n")
     return path, received
+
+
+def publish_file(path: Path, text: str) -> None:
+    """Write ``path`` once: an exclusive temporary file in the same folder, then an atomic link that
+    fails if ``path`` exists (no replace, also against a concurrent writer). The folder must not be a
+    link. Raises ``FileExistsError`` if ``path`` exists."""
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    if directory.is_symlink():
+        raise ValueError(f"refusing to write into a linked folder: {directory}")
+    fd, staging = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".staging")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.link(staging, path)
+    finally:
+        os.unlink(staging)
 
 
 def fetch_time(path: Path) -> np.datetime64:
@@ -235,11 +251,15 @@ def hourly_truth(
 
 
 def truth_as_of(reports: pd.DataFrame, stations: xr.Dataset, start: np.datetime64, t) -> xr.Dataset:
-    """The hourly truth an issue at ``t`` may see: only reports measured at or before ``t`` (exact
-    time, seconds included) compete for the hourly slots, labels ``start..t``."""
-    t = np.datetime64(t, "ns")
+    """The hourly truth an issue at ``t`` may see: only reports measured in ``[start, t]`` (exact
+    times, seconds included) compete for the hourly slots, labels ``start..t``. ``start`` is
+    1 January 00Z of the issue's year: the frozen model keeps nothing across a year."""
+    t, start = np.datetime64(t, "ns"), np.datetime64(start, "ns")
     if len(reports):
-        reports = reports[reports.obs_time.values.astype("datetime64[ns]") <= t]
+        measured = reports.obs_time.values.astype("datetime64[ns]")
+        # Exact times, before any rounding: nothing after t, nothing before the year (or window) start,
+        # so a 31 December 23:59:45 report can never become a 1 January 00Z reading at offset 0.
+        reports = reports[(measured >= start) & (measured <= t)]
     truth = hourly_truth(reports, stations, start, t)
     assert_causal(truth, t)
     return truth

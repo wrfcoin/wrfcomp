@@ -51,8 +51,9 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
 
 ## Causality
 
-- For an issue at T, every report measured after T (to the exact second) is dropped **before** the
-  hourly slots are chosen (`metar.truth_as_of`). A report after T can therefore never take the slot
+- For an issue at T, every report measured after T, or before 1 January 00Z of T's year (exact
+  times, to the second), is dropped **before** the hourly slots are chosen (`metar.truth_as_of`).
+  A 31 December 23:59:45 report can therefore never become a 1 January 00Z reading at offset 0. A report after T can therefore never take the slot
   of an earlier one, nor be counted as measured at T because its offset rounds to 0 minutes. The
   result is checked again (`metar.assert_causal`), and the frozen model checks the same once more.
 - A store for T is not built until a METAR fetch made at least 15 minutes after T exists, so the
@@ -61,16 +62,26 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
 
 ## What each issue saw is frozen
 
-- When an issue is first built, its `inputs.json` pins the METAR fetch files present at that moment
-  (name and sha256) and its GEFS cycle's hash. Fetch files and GEFS cycles are written once.
-- Every later replay gives that issue exactly its pinned fetches. A fetch appended later (a
-  correction, say) never changes an earlier issue, its store, or the predictors it left in the
-  learned state. A later issue pins the later fetch, so a new verification reading enters the error
-  history from the first issue whose build could see it.
-- A pinned fetch or cycle that is missing or changed is refused. Issue files (`inputs.json`,
-  `v4.zarr`, `v4.sha256`, `build.json`) are written once; a rebuild must reproduce them exactly.
-- Building an issue first builds, in order, every earlier kept issue of the year that has not been
-  built, so every issue in the learned state has its own pinned inputs.
+- **Fetch window.** An issue at T may see only METAR fetches made at or before its cutoff: the
+  earlier of its build start and T + 24 h. The daily run builds the 00Z issue at about T + 4.5 h and
+  the previous 12Z issue at about T + 16.5 h, both inside the window. If no fetch made 15 minutes or
+  more after T exists by then (a delayed first build), the issue is a **retrospective backfill**: it
+  sees the fetches up to the first one made 15 minutes or more after T and nothing later, and its
+  manifest says `"retrospective_backfill": true`.
+- **Manifest.** When an issue is first built, `inputs.json` records the build start, the fetch
+  cutoff, the pinned METAR fetches (name and sha256), its GEFS cycle's hash, and the ordered GEFS
+  history it is replayed over (every earlier cycle with its hash, gaps listed as `missing_cycles`).
+- **Published issues are immutable.** An issue with an `inputs.json` is never changed. A new issue
+  extends the history of the latest published issue with the kept cycles after it, in order. A cycle
+  that arrives after a later issue was published is ignored and listed as `ignored_late_cycles`. A
+  pinned cycle or fetch that is missing or changed is refused. Each replay must reproduce every
+  published store exactly, or the build stops and nothing new is published.
+- **Writing.** One build at a time (`live/locks/build.lock`) and one writer per issue
+  (`live/locks/<issue>.lock`); a second writer is refused, not queued, and the locks are released
+  when the process ends. Every file is staged under an exclusive temporary name in its own folder and
+  linked into place atomically without replacing anything; a store folder is staged and renamed into
+  place. Leftover staging files from an interrupted run are ignored, and the run resumes from the
+  pins already written.
 
 ## Learned state (v2 regression, v3 pressure gain, v4 own-reading gain)
 
@@ -124,7 +135,8 @@ policy (identical numbers).
   - a data directory that is, or is inside, an evaluation folder (`truth`, `candidates`, `baselines`,
     `phase3`, `gate1` and the others the pipeline uses);
   - a `live` folder that is a symlink or holds an evaluation folder;
-  - any symlink on the way to a file the builder writes (checked before every write).
+  - any symlink on the way to a file the builder writes (checked before every write), and any
+    symlink inside the GEFS point cache (checked before and after each fetch).
 
 ## Output
 

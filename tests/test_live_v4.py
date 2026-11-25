@@ -7,6 +7,7 @@ import os
 import shutil
 import threading
 from datetime import UTC, datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -602,11 +603,11 @@ def _stamp(t):
     return f"{pd.Timestamp(t):%Y%m%dT%H%M%SZ}"
 
 
-def make_live_world(data, monkeypatch, *, extra_reports=()):
+def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", days=20):
     """Twenty days of kept 2026 cycles and one METAR fetch (hourly reports at :53), 4 stations."""
-    start = np.datetime64("2026-03-01", "ns")
-    labels, sig = signal(start, days=20, seed=3)
-    raws = raw_world(start, seed=3, days=20)
+    start = np.datetime64(start, "ns")
+    labels, sig = signal(start, days=days, seed=3)
+    raws = raw_world(start, seed=3, days=days)
     monkeypatch.setattr(live, "TEMP_DIRS", ())
     monkeypatch.setattr(live, "stations", site)
     monkeypatch.setattr(
@@ -735,3 +736,207 @@ def test_build_issue_records_missing_cycles(live_world):
     shutil.rmtree(live.raw_path(root, gone))
     record = live.build_issue(last, data)
     assert record["missing_cycles"] == [str(np.datetime_as_string(gone, unit="h"))]
+
+
+# -- re-review regressions -----------------------------------------------------------------------
+
+
+def _issue_files(root, t):
+    return {p.name: p.read_bytes() for p in live.issue_dir(root, t).iterdir() if p.is_file()}
+
+
+def test_a_31_december_report_never_reaches_the_1_january_issue(tmp_path, monkeypatch):
+    """A report at 31 Dec 23:59:45 rounds to offset 0 at 1 Jan 00Z; the exact lower cut drops it."""
+    new_year = np.datetime64("2026-01-01T00", "ns")
+    eve = [
+        _raw_report(icao, new_year - 15 * S, {"t2m": 320.0, "td2m": 300.0, "msl": 95000.0}) for icao in ICAO
+    ]
+    frame = metar.reports_frame(
+        [_write_fetch(eve, tmp_path / "unit")], dict(zip(ICAO, site().station_id.values, strict=True))
+    )
+    uncut = metar.hourly_truth(frame, site(), new_year, new_year)
+    assert uncut.t2m_offset_min.values[0, 0] == 0 and np.isfinite(uncut.t2m.values[0, 0])  # the hazard
+    assert np.isnan(metar.truth_as_of(frame, site(), new_year, new_year).t2m.values).all()
+    plain = make_live_world(tmp_path / "a" / "wrfcomp-data", monkeypatch, start="2026-01-01", days=4)
+    with_eve = make_live_world(
+        tmp_path / "b" / "wrfcomp-data", monkeypatch, start="2026-01-01", days=4, extra_reports=eve
+    )
+    a = live.build_issue(plain[2], tmp_path / "a" / "wrfcomp-data")
+    b = live.build_issue(plain[2], tmp_path / "b" / "wrfcomp-data")
+    assert a["content_sha256"] == b["content_sha256"]
+    assert _issue_files(plain[0], new_year)["v4.sha256"] == _issue_files(with_eve[0], new_year)["v4.sha256"]
+
+
+def test_a_delayed_first_build_sees_only_fetches_inside_each_issues_window(live_world):
+    """The original and a later correction both exist before the first build. An issue whose window
+    (24 h, or the build start if earlier) closed before the correction never sees it."""
+    data, root, raws, last = live_world
+    earlier = last - 12 * H
+    original = metar.stored(root / "metar")[0]  # made at last + 4 h
+    correction = [
+        _raw_report(icao, earlier - 7 * M, {"t2m": 290.0, "td2m": 280.0, "msl": 100000.0}) for icao in ICAO
+    ]
+    late = _write_fetch(correction, root / "metar", _stamp(last + 13 * H))  # after earlier + 24 h
+    live.build_issue(last, data)
+    first = json.loads((live.issue_dir(root, raws[0].init_time.values[0]) / "inputs.json").read_text())
+    pinned_earlier = json.loads((live.issue_dir(root, earlier) / "inputs.json").read_text())
+    pinned_last = json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
+    assert [m["file"] for m in pinned_earlier["metar"]] == [original.name]
+    assert not pinned_earlier["retrospective_backfill"]
+    assert pinned_earlier["fetch_cutoff"] == _iso(earlier + 24 * H)
+    assert [m["file"] for m in pinned_last["metar"]] == [original.name, late.name]
+    # The 1 March issue's only final fetch is 20 days later: a flagged backfill, cut at that fetch.
+    assert first["retrospective_backfill"] and [m["file"] for m in first["metar"]] == [original.name]
+    assert first["fetch_cutoff"] == _iso(metar.fetch_time(original))
+
+
+def _iso(t):
+    return str(np.datetime_as_string(np.datetime64(t, "ns"), unit="s"))
+
+
+def test_a_fetch_made_after_the_build_started_is_never_pinned(live_world):
+    data, root, raws, last = live_world
+    future = _write_fetch([], root / "metar", _stamp(last + 6 * H))
+    live.build_issue(last, data, now=last + 5 * H)
+    pinned = json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
+    assert future.name not in [m["file"] for m in pinned["metar"]]
+    assert pinned["build_started"] == _iso(last + 5 * H)
+
+
+def test_a_late_gefs_cycle_never_enters_a_published_history(live_world):
+    data, root, raws, last = live_world
+    earlier = last - 12 * H
+    gap = raws[-4].init_time.values[0]
+    kept = live.raw_path(root, gap)
+    shutil.move(kept, kept.with_name("away.zarr"))
+    live.build_issue(earlier, data)
+    before = {
+        r.init_time.values[0]: _issue_files(root, r.init_time.values[0])
+        for r in raws[:-1]
+        if r.init_time.values[0] != gap
+    }
+    shutil.move(kept.with_name("away.zarr"), kept)  # the cycle arrives late
+    record = live.build_issue(last, data)
+    after = {c: _issue_files(root, c) for c in before}
+    assert after == before
+    pinned = json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
+    assert _hour(gap) not in [h["init"] for h in pinned["history"]]
+    assert pinned["ignored_late_cycles"] == [_hour(gap)] and pinned["missing_cycles"] == [_hour(gap)]
+    assert record["missing_cycles"] == [_hour(gap)]
+    assert not (live.issue_dir(root, gap) / "inputs.json").exists()
+
+
+def _hour(t):
+    return str(np.datetime_as_string(np.datetime64(t, "ns"), unit="h"))
+
+
+def test_a_lost_or_changed_pinned_cycle_is_refused(live_world):
+    data, root, raws, last = live_world
+    live.build_issue(last, data)
+    pinned = raws[5].init_time.values[0]
+    kept = live.raw_path(root, pinned)
+    shutil.move(kept, kept.with_name("away.zarr"))
+    with pytest.raises(LiveRefusedError, match="pinned GEFS cycle .* is missing"):
+        live.build_issue(last, data)
+    shutil.rmtree(kept.with_name("away.zarr"))
+    changed = raws[5].copy(deep=True)
+    changed["t2m"].values[:] += 1
+    POLICY_2026.write(changed, kept)
+    with pytest.raises(LiveRefusedError, match="differs from its pinned hash"):
+        live.build_issue(last, data)
+
+
+def test_a_published_issue_that_does_not_reproduce_is_refused(live_world):
+    data, root, raws, last = live_world
+    earlier = last - 12 * H
+    live.build_issue(earlier, data)
+    store = live.issue_dir(root, earlier) / "v4.zarr"
+    other = xr.open_zarr(store, chunks=None).load()
+    other["t2m"].values[:] += 0.5
+    shutil.rmtree(store)
+    POLICY_2026.write(other, store)
+    with pytest.raises(LiveRefusedError, match="does not reproduce"):
+        live.build_issue(last, data)
+    assert not (live.issue_dir(root, last) / "v4.zarr").exists()
+
+
+def test_publish_file_never_replaces_and_leaves_no_staging(tmp_path):
+    path = tmp_path / "issue" / "inputs.json"
+    metar.publish_file(path, "first\n")
+    with pytest.raises(FileExistsError):
+        metar.publish_file(path, "second\n")
+    assert path.read_text() == "first\n"
+    assert [p.name for p in path.parent.iterdir()] == ["inputs.json"]
+    os.symlink(tmp_path / "issue", tmp_path / "linked")
+    with pytest.raises(ValueError, match="linked folder"):
+        metar.publish_file(tmp_path / "linked" / "x.json", "x\n")
+
+
+def test_an_interrupted_build_resumes_from_its_pins(live_world, monkeypatch):
+    data, root, raws, last = live_world
+    out = live.issue_dir(root, last)
+    out.mkdir(parents=True)
+    (out / ".inputs.json.leftover.staging").write_text("half")  # a crashed writer's staging file
+    calls = {"n": 0}
+    original = LiveYear.write
+
+    def crash_on_last(self, ds, path):
+        if np.datetime64(ds.init_time.values[0], "ns") == last and calls["n"] == 0:
+            calls["n"] += 1
+            raise OSError("power cut")
+        return original(self, ds, path)
+
+    monkeypatch.setattr(LiveYear, "write", crash_on_last)
+    with pytest.raises(OSError, match="power cut"):
+        live.build_issue(last, data)
+    manifest = (out / "inputs.json").read_bytes()
+    assert not (out / "v4.zarr").exists()
+    _write_fetch([], root / "metar", _stamp(last + 5 * H))  # newer fetch: must not change the pin
+    record = live.build_issue(last, data)
+    assert (out / "inputs.json").read_bytes() == manifest
+    assert (out / "v4.sha256").read_text() == f"{record['content_sha256']}  v4.zarr\n"
+
+
+def test_concurrent_builds_keep_one_intact_manifest_inside_the_live_tree(live_world):
+    data, root, raws, last = live_world
+    results, errors = [], []
+
+    def run():
+        try:
+            results.append(live.build_issue(last, data)["content_sha256"])
+        except LiveRefusedError as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=run) for _ in range(3)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(300)
+    assert results and all(r == results[0] for r in results)
+    assert all("another live writer" in e for e in errors)
+    assert live.build_issue(last, data)["content_sha256"] == results[0]
+    for here, dirs, files in os.walk(data):
+        for name in dirs + files:
+            path = Path(here) / name
+            assert not path.is_symlink() and path.resolve().is_relative_to(root.resolve())
+            assert not name.endswith(".staging")
+    json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
+
+
+def test_a_second_writer_is_refused_while_the_lock_is_held(live_world):
+    data, root, raws, last = live_world
+    with live._lock(root, "build"):
+        with pytest.raises(LiveRefusedError, match="another live writer"):
+            live.build_issue(last, data)
+    live.build_issue(last, data)
+
+
+def test_fetch_cycle_refuses_a_link_inside_the_gefs_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(live, "TEMP_DIRS", ())
+    root = live.live_root(tmp_path / "wrfcomp-data")
+    (root / "cache").mkdir(parents=True)
+    (tmp_path / "elsewhere").mkdir()
+    os.symlink(tmp_path / "elsewhere", root / "cache" / "gefs-v1")
+    with pytest.raises(LiveRefusedError, match="linked path"):
+        live.fetch_cycle(root, np.datetime64("2026-12-02T00", "ns"), policy=LiveYear(2026))
+    assert not any((tmp_path / "elsewhere").iterdir())

@@ -33,9 +33,17 @@ import os
 import re
 import subprocess
 import tempfile
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+    import msvcrt
 
 import numpy as np
 import pandas as pd
@@ -211,15 +219,20 @@ def fetch_cycle(
     policy = LiveYear(pd.Timestamp(t).year) if policy is None else policy
     if policy.year != pd.Timestamp(t).year:
         raise LiveRefusedError("the live policy is for another year")
-    dest = safe(root, raw_path(root, t))
-    if dest.exists():
+    with _lock(root, f"gefs-{pd.Timestamp(t):%Y%m%d%H}"):
+        dest = safe(root, raw_path(root, t))
+        if dest.exists():
+            with xr.open_zarr(dest, chunks=None) as kept:
+                return {"path": str(dest), "content_sha256": content_sha256(kept), "bytes": 0}
+        transfer = CheckedTransfer(t) if transfer is None else transfer
+        cache = safe(root, root / "cache")
+        cache.mkdir(parents=True, exist_ok=True)
+        _no_links_below(root, cache)
+        raw = policy.gefs.extract(stations(), t, cache, transfer)
+        _no_links_below(root, cache)
+        policy.write(raw, dest)
         with xr.open_zarr(dest, chunks=None) as kept:
-            return {"path": str(dest), "content_sha256": content_sha256(kept), "bytes": 0}
-    transfer = CheckedTransfer(t) if transfer is None else transfer
-    raw = policy.gefs.extract(stations(), t, safe(root, root / "cache"), transfer)
-    policy.write(raw, dest)
-    with xr.open_zarr(dest, chunks=None) as kept:
-        return {"path": str(dest), "content_sha256": content_sha256(kept), "bytes": transfer.bytes}
+            return {"path": str(dest), "content_sha256": content_sha256(kept), "bytes": transfer.bytes}
 
 
 # -- replay ------------------------------------------------------------------------------------
@@ -293,77 +306,183 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _write_once(root: Path, path: Path, text: str) -> None:
-    path = safe(root, path)
+# -- writing: locks, no-replace publication ------------------------------------------------------
+
+
+@contextmanager
+def _lock(root: Path, name: str):
+    """An exclusive, non-blocking writer lock ``locks/<name>.lock``, released when the process ends.
+    A second writer is refused, not queued."""
+    path = safe(root, root / "locks" / f"{name}.lock")
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.read_text() != text:
-            raise LiveRefusedError(f"{path} exists with other content; issue files are written once")
-        return
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_text(text)
-    tmp.rename(path)
+    safe(root, path)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:  # pragma: no cover - Windows
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise LiveRefusedError(f"another live writer holds {path.name}") from exc
+        yield
+    finally:
+        os.close(fd)
 
 
-def pinned_inputs(root: Path, t: np.datetime64, raw_hash: str) -> dict:
-    """The inputs issue ``t`` sees: read from its ``inputs.json``, or pinned now if it has none."""
-    path = issue_dir(root, t) / "inputs.json"
-    if path.exists():
-        safe(root, path)
-        pinned = json.loads(path.read_text())
-        if pinned["gefs_sha256"] != raw_hash:
-            raise LiveRefusedError(f"the kept GEFS cycle of {pinned['init']} differs from its pinned hash")
-        for item in pinned["metar"]:
-            file = root / "metar" / item["file"]
-            if not file.is_file() or _sha256(safe(root, file)) != item["sha256"]:
-                raise LiveRefusedError(f"pinned METAR fetch {item['file']} is missing or changed")
-        return pinned
-    fetches = metar.stored(root / "metar")
-    if not any(metar.fetch_time(f) >= t + metar.CLOSE_AFTER for f in fetches):
-        when = np.datetime_as_string(t, unit="h")
-        raise LiveRefusedError(f"no METAR fetch 15 minutes or more after {when}; readings not final")
-    pinned = {
-        "init": str(np.datetime_as_string(t, unit="h")),
-        "gefs_sha256": raw_hash,
-        "metar": [{"file": f.name, "sha256": _sha256(safe(root, f))} for f in fetches],
-        "truth_source": metar.API,
+def _publish_once(root: Path, path: Path, text: str) -> bool:
+    """Write ``path`` once (exclusive staging file, atomic no-replace link). Returns False, leaving the
+    file untouched, if it already exists."""
+    path = safe(root, path)
+    try:
+        metar.publish_file(path, text)
+    except FileExistsError:
+        return False
+    return True
+
+
+def _no_links_below(root: Path, directory: Path) -> None:
+    directory = safe(root, directory)
+    for here, dirs, files in os.walk(directory, followlinks=False):
+        for name in dirs + files:
+            if (Path(here) / name).is_symlink():
+                raise LiveRefusedError(f"refusing a linked path inside the live folder: {Path(here) / name}")
+
+
+# -- pinned inputs and the frozen history --------------------------------------------------------
+
+AUTHORIZED_WINDOW = np.timedelta64(24, "h")
+
+
+def _now() -> np.datetime64:
+    return np.datetime64(datetime.now(UTC).replace(tzinfo=None), "ns")
+
+
+def _iso(t) -> str:
+    return str(np.datetime_as_string(np.datetime64(t, "ns"), unit="s"))
+
+
+def _hour(t) -> str:
+    return str(np.datetime_as_string(np.datetime64(t, "ns"), unit="h"))
+
+
+def _manifest_path(root: Path, t) -> Path:
+    return issue_dir(root, t) / "inputs.json"
+
+
+def published_issues(root: Path, year: int) -> dict:
+    """Every issue of ``year`` that has a pinned manifest, by issue time. Those issues are immutable."""
+    out = {}
+    for path in sorted(root.glob(f"{year:04d}-??-??T??Z/inputs.json")):
+        manifest = json.loads(safe(root, path).read_text())
+        out[np.datetime64(manifest["init"], "ns")] = manifest
+    return out
+
+
+def pin_fetches(root: Path, t: np.datetime64, started: np.datetime64) -> dict:
+    """The METAR fetches issue ``t`` may see: those made at or before its cutoff, the earlier of the
+    build start and ``t`` + 24 h. If none of them was made 15 minutes or more after ``t`` (a delayed
+    first build), it is a retrospective backfill: the fetches up to the first one made 15 minutes or
+    more after ``t``, and nothing later, flagged as such."""
+    cutoff = min(started, t + AUTHORIZED_WINDOW)
+    stored = [(metar.fetch_time(f), f) for f in metar.stored(root / "metar")]
+    stored = [(when, f) for when, f in stored if when <= started]
+    final = [when for when, _ in stored if when >= t + metar.CLOSE_AFTER]
+    if not final:
+        raise LiveRefusedError(f"no METAR fetch 15 minutes or more after {_hour(t)}; readings not final")
+    backfill = min(final) > cutoff
+    if backfill:
+        cutoff = min(final)
+    chosen = [f for when, f in stored if when <= cutoff]
+    return {
+        "build_started": _iso(started),
+        "fetch_cutoff": _iso(cutoff),
+        "retrospective_backfill": bool(backfill),
+        "metar": [{"file": f.name, "sha256": _sha256(safe(root, f))} for f in chosen],
     }
-    _write_once(root, path, json.dumps(pinned, indent=1) + "\n")
-    return pinned
 
 
-def build_issue(t, data: Path | None = None) -> dict:
-    """Build the live v4 store for issue ``t``, first building (once) every earlier kept issue of the
-    year that has not been built yet. Existing issues are replayed from their pinned inputs and must
-    reproduce their stores exactly."""
+def _check_manifest_inputs(root: Path, manifest: dict, raw_hash: str | None) -> None:
+    if raw_hash is not None and manifest["gefs_sha256"] != raw_hash:
+        raise LiveRefusedError(f"the kept GEFS cycle of {manifest['init']} differs from its pinned hash")
+    for item in manifest["metar"]:
+        file = root / "metar" / item["file"]
+        if not file.is_file() or _sha256(safe(root, file)) != item["sha256"]:
+            raise LiveRefusedError(f"pinned METAR fetch {item['file']} is missing or changed")
+
+
+def build_issue(t, data: Path | None = None, *, now=None) -> dict:
+    """Build the live v4 store for issue ``t``.
+
+    Published issues (those with an ``inputs.json``) are immutable: their manifest pins their METAR
+    fetches and the ordered GEFS history they were replayed over, gaps included. A new issue extends
+    the history of the latest published issue before it with the kept cycles after that issue, in
+    order; a cycle that arrives late (before the latest published issue) is ignored and recorded, and
+    a pinned cycle that is missing or changed is refused. Every published issue on the way must
+    reproduce its published store exactly, or the build is refused."""
     root = live_root(data)
     t = check_issue(t)
     year = pd.Timestamp(t).year
+    started = _now() if now is None else np.datetime64(now, "ns")
     policy = LiveYear(year)
-    paths = kept_cycles(root, t)
-    if not paths or raw_path(root, t) != paths[-1]:
-        raise LiveRefusedError("the GEFS cycle of the issue is not kept; fetch it first")
-    first = _stem_time(paths[0])
-    present = {_stem_time(p) for p in paths}
-    missing = [
-        str(np.datetime_as_string(c, unit="h"))
-        for c in np.arange(first, t + HOUR, 12 * HOUR)
-        if c not in present
-    ]
+    with _lock(root, "build"):
+        return _build(root, t, year, started, policy)
+
+
+def _build(root, t, year, started, policy) -> dict:
+    published = {c: m for c, m in published_issues(root, year).items() if c <= t}
+    kept = {_stem_time(p): p for p in kept_cycles(root, t)}
+    if t in published:
+        latest, new = t, []
+    else:
+        latest = max(published) if published else None
+        new = [c for c in sorted(kept) if latest is None or c > latest]
+        if not new or new[-1] != t:
+            raise LiveRefusedError("the GEFS cycle of the issue is not kept; fetch it first")
+    if latest is not None:
+        chain = [np.datetime64(h["init"], "ns") for h in published[latest]["history"]] + [latest]
+    else:
+        chain = []
+    ignored = [_hour(c) for c in sorted(kept) if latest is not None and c < latest and c not in chain]
+    raws, hashes = {}, {}
+    for c in chain + new:
+        if c not in kept:
+            raise LiveRefusedError(f"the pinned GEFS cycle {_hour(c)} is missing")
+        with xr.open_zarr(safe(root, kept[c]), chunks=None) as source:
+            raw = source.load()
+        if not np.array_equal(raw.init_time.values, [c]):
+            raise LiveRefusedError(f"kept cycle {kept[c].name} holds another initialization")
+        raws[c], hashes[c] = raw, content_sha256(raw)
+    for c in chain:
+        _check_manifest_inputs(root, published[c], hashes[c])
+        expected = [h["gefs_sha256"] for h in published[c]["history"]]
+        if expected != [hashes[np.datetime64(h["init"], "ns")] for h in published[c]["history"]]:
+            raise LiveRefusedError(f"the GEFS history pinned by {_hour(c)} has changed")
+    manifests = dict(published)
+    order = chain + new
+    for k, c in enumerate(new):
+        history = order[: len(chain) + k]
+        grid = np.arange(history[0], c, 12 * HOUR) if history else np.array([], "datetime64[ns]")
+        manifest = {
+            "init": _hour(c),
+            "gefs_sha256": hashes[c],
+            "history": [{"init": _hour(h), "gefs_sha256": hashes[h]} for h in history],
+            "missing_cycles": [_hour(g) for g in grid if g not in set(history)],
+            "ignored_late_cycles": ignored,
+            **pin_fetches(root, c, started),
+            "truth_source": metar.API,
+        }
+        with _lock(root, _hour(c)):
+            if not _publish_once(root, _manifest_path(root, c), json.dumps(manifest, indent=1) + "\n"):
+                raise LiveRefusedError(f"issue {_hour(c)} was published by another writer meanwhile")
+        manifests[c] = manifest
+
     site, icaos = stations(), icao_map()
     start = np.datetime64(f"{year:04d}-01-01T00", "ns")
-    raws, pins, frames = [], {}, {}
-    for path in paths:
-        with xr.open_zarr(safe(root, path), chunks=None) as source:
-            raw = source.load()
-        c = _stem_time(path)
-        if not np.array_equal(raw.init_time.values, [c]):
-            raise LiveRefusedError(f"kept cycle {path.name} holds another initialization")
-        raws.append(raw)
-        pins[c] = pinned_inputs(root, c, content_sha256(raw))
+    frames = {}
 
     def truth_for(c):
-        names = [item["file"] for item in pins[c]["metar"]]
+        names = [item["file"] for item in manifests[c]["metar"]]
         for name in names:
             if name not in frames:
                 frames[name] = metar.reports_frame([root / "metar" / name], icaos)
@@ -379,47 +498,55 @@ def build_issue(t, data: Path | None = None) -> dict:
         )
         return metar.truth_as_of(reports, site, start, c)
 
-    result = None
-    issues = []
-    for c, _, b, diag in replay(raws, truth_for, year, policy):
+    result, issues = None, []
+    for c, _, b, diag in replay([raws[c] for c in order], truth_for, year, policy):
         issues.append({"init": diag.init, "phi": diag.phi, "own_defined": diag.own_defined})
-        record = _publish(root, policy, c, b, pins[c], first, missing, issues)
+        with _lock(root, _hour(c)):
+            record = _publish(root, policy, c, b, manifests[c], order[0], issues)
         if c == t:
             result = record
     return result
 
 
-def _publish(root, policy, c, store, pinned, first, missing, issues) -> dict:
+def _publish(root, policy, c, store, manifest, first, issues) -> dict:
     out_dir = issue_dir(root, c)
     dest = safe(root, out_dir / "v4.zarr")
     for var in store.variables.values():
         var.encoding.clear()
     if dest.exists():
         with xr.open_zarr(dest, chunks=None) as previous:
-            xr.testing.assert_identical(store, previous.load())
+            try:
+                xr.testing.assert_identical(store, previous.load())
+            except AssertionError as exc:
+                raise LiveRefusedError(f"published issue {_hour(c)} does not reproduce; refused") from exc
     else:
         policy.write(store, dest)
     with xr.open_zarr(dest, chunks=None) as saved:
         digest = content_sha256(saved)
-    _write_once(root, out_dir / "v4.sha256", f"{digest}  v4.zarr\n")
+    sha_line = f"{digest}  v4.zarr\n"
+    if (
+        not _publish_once(root, out_dir / "v4.sha256", sha_line)
+        and (out_dir / "v4.sha256").read_text() != sha_line
+    ):
+        raise LiveRefusedError(f"issue {_hour(c)} has another published hash")
+    record = {
+        "init": manifest["init"],
+        "model_id": store.attrs["model_id"],
+        "model_version": store.attrs["model_version"],
+        "candidate": "v4 = v3 + the airport's own reading (frozen Phase 3 arm B), live inputs",
+        "content_sha256": digest,
+        "store": dest.name,
+        **code_state(),
+        "frozen_sources_sha256": policy.sources,
+        "live_start": _hour(first),
+        "missing_cycles": manifest["missing_cycles"],
+        "retrospective_backfill": manifest["retrospective_backfill"],
+        "inputs": "inputs.json",
+        "issues": list(issues),
+    }
     build = out_dir / "build.json"
-    if not build.exists():
-        record = {
-            "init": pinned["init"],
-            "model_id": store.attrs["model_id"],
-            "model_version": store.attrs["model_version"],
-            "candidate": "v4 = v3 + the airport's own reading (frozen Phase 3 arm B), live inputs",
-            "content_sha256": digest,
-            "store": dest.name,
-            **code_state(),
-            "frozen_sources_sha256": policy.sources,
-            "live_start": str(np.datetime_as_string(first, unit="h")),
-            "missing_cycles": [m for m in missing if np.datetime64(m) < c],
-            "inputs": "inputs.json",
-            "issues": list(issues),
-        }
-        _write_once(root, build, json.dumps(record, indent=1) + "\n")
-    record = json.loads(safe(root, build).read_text())
-    if record["content_sha256"] != digest:
+    _publish_once(root, build, json.dumps(record, indent=1) + "\n")
+    saved_record = json.loads(safe(root, build).read_text())
+    if saved_record["content_sha256"] != digest:
         raise LiveRefusedError(f"{build} records another store")
-    return record
+    return saved_record
