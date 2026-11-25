@@ -179,7 +179,7 @@ def fetch(
     # The completion time is taken and the file linked into place under the fetch lock, the same lock
     # a build holds while it records its start and lists the fetches: a fetch is either complete and
     # in place before a build starts, or completed after it.
-    with file_lock(directory.parent / "locks" / FETCH_LOCK, blocking=True):
+    with file_lock(_fetch_lock_path(directory), blocking=True):
         completed = clock().astimezone(UTC)
         stamp = completed.strftime(STAMP)
         path = directory / f"{stamp}.json"
@@ -192,6 +192,22 @@ def fetch(
         }
         publish_file(path, json.dumps(body, sort_keys=True) + "\n")
     return path, received
+
+
+def _fetch_lock_path(directory: Path) -> Path:
+    """``<live>/locks/metar.lock`` for fetches stored in ``<live>/metar``: refused unless the fetch
+    folder, the lock folder and the lock file are real (no link) and the lock stays in the live tree."""
+    directory = Path(directory)
+    live = directory.parent
+    lock = live / "locks" / FETCH_LOCK
+    for p in (directory, lock.parent, lock):
+        if p.is_symlink():
+            raise ValueError(f"refusing a linked path inside the live folder: {p}")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    resolved = Path(os.path.normcase(lock.parent.resolve() / lock.name))
+    if not resolved.is_relative_to(Path(os.path.normcase(live.resolve()))):
+        raise ValueError(f"{lock} is outside the live folder")
+    return lock
 
 
 def publish_file(path: Path, text: str) -> None:

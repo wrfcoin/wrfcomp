@@ -1081,3 +1081,61 @@ def test_the_fetch_list_is_taken_once_with_hashes(live_world, monkeypatch):
     with pytest.raises(LiveRefusedError, match="missing or changed"):
         live.build_issue(last, data)
     assert len(calls) == 1 and not live.issue_dir(root, last).exists()
+
+
+def test_safe_never_opens_the_file_it_checks(live_world, monkeypatch):
+    """Windows CI: resolving a file locked by another handle fails, and resolve() returned it
+    unexpanded, so a lock file looked outside the live folder. safe() resolves folders only."""
+    data, root, raws, last = live_world
+    lock = root / "locks" / "build.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.touch()
+    original = Path.resolve
+
+    def unresolvable_files(self, strict=False):
+        if self.is_file():
+            return Path("C:/RUNNER~1/unexpanded") / self.name
+        return original(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", unresolvable_files)
+    assert live.safe(root, lock) == lock
+    with pytest.raises(LiveRefusedError, match="outside the live folder"):
+        live.safe(root, root / ".." / "elsewhere.json")
+
+
+def test_inside_compares_case_insensitively_where_the_platform_does(monkeypatch):
+    monkeypatch.setattr(live.os.path, "normcase", lambda p: str(p).lower().replace("\\", "/"))
+    assert live.inside(
+        Path("C:/Users/RunnerAdmin/wrfcomp-data/live/locks/build.lock"),
+        Path("c:/users/runneradmin/wrfcomp-data/live"),
+    )
+    assert not live.inside(
+        Path("C:/Users/RunnerAdmin/wrfcomp-data/truth/x"), Path("c:/users/runneradmin/wrfcomp-data/live")
+    )
+
+
+@pytest.mark.parametrize("linked", ["locks folder", "lock file"])
+def test_the_metar_writer_refuses_a_linked_lock_path(tmp_path, linked):
+    live_dir = tmp_path / "wrfcomp-data" / "live"
+    (live_dir / "metar").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if linked == "locks folder":
+        os.symlink(outside, live_dir / "locks")
+    else:
+        (live_dir / "locks").mkdir()
+        os.symlink(outside / "metar.lock", live_dir / "locks" / "metar.lock")
+    with pytest.raises(ValueError, match="linked path"):
+        metar.fetch(live_dir / "metar", ICAO, 30, get=lambda url: b"[]")
+    assert not any(outside.iterdir()) and not any((live_dir / "metar").iterdir())
+
+
+def test_a_linked_build_lock_is_refused(live_world):
+    data, root, raws, last = live_world
+    outside = data.parent / "outside"
+    outside.mkdir()
+    (root / "locks").mkdir(exist_ok=True)
+    os.symlink(outside / "build.lock", root / "locks" / "build.lock")
+    with pytest.raises(LiveRefusedError, match="linked"):
+        live.build_issue(last, data)
+    assert not any(outside.iterdir())

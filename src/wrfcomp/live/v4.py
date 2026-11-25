@@ -49,7 +49,7 @@ from wrfcomp.baselines.io import CONFIG
 from wrfcomp.harness.hashing import content_sha256
 from wrfcomp.live import metar
 from wrfcomp.live.dates import LiveRefusedError, LiveYear
-from wrfcomp.live.locks import LockBusyError, file_lock
+from wrfcomp.live.locks import LockBusyError, LockPathError, file_lock
 
 LIVE_DIR = "live"
 ISSUE_HOURS = (0, 12)
@@ -115,9 +115,19 @@ def safe(root: Path, path: Path) -> Path:
         here = here / part
         if here.is_symlink():
             raise LiveRefusedError(f"refusing a linked path inside the live folder: {here}")
-    if not path.resolve().is_relative_to(root.resolve()):
+    # Resolve the folder, not the file: on Windows a file locked by another handle cannot be opened
+    # to resolve it, and resolve() then returns it unexpanded (8.3 short names), which would look
+    # outside the live folder. The file itself was checked for a link above.
+    where = path if path == root else path.parent.resolve() / path.name
+    if not inside(where, root.resolve()):
         raise LiveRefusedError(f"{path} is outside the live folder")
     return path
+
+
+def inside(child: Path, parent: Path) -> bool:
+    """``child`` is ``parent`` or below it, comparing case-insensitively where the platform does
+    (Windows): both are already resolved."""
+    return Path(os.path.normcase(child)).is_relative_to(Path(os.path.normcase(parent)))
 
 
 def issue_dir(root: Path, t) -> Path:
@@ -317,6 +327,8 @@ def _lock(root: Path, name: str, *, blocking: bool = False):
             yield
     except LockBusyError as exc:
         raise LiveRefusedError(f"another live writer holds {path.name}") from exc
+    except LockPathError as exc:
+        raise LiveRefusedError(str(exc)) from exc
 
 
 def _publish_once(root: Path, path: Path, text: str) -> bool:

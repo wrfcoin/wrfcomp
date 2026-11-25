@@ -27,6 +27,10 @@ class LockBusyError(RuntimeError):
     """Another writer holds the lock (non-blocking request)."""
 
 
+class LockPathError(RuntimeError):
+    """The lock file or its folder is a link."""
+
+
 def _os_lock(fd: int, blocking: bool) -> None:
     if fcntl is not None:
         fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
@@ -56,7 +60,9 @@ def file_lock(path: Path, *, blocking: bool = False):
     :class:`LockBusyError` if another thread or process holds it."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    key = os.path.normcase(str(path.resolve()))
+    if path.parent.is_symlink() or path.is_symlink():
+        raise LockPathError(f"refusing a linked lock path: {path}")
+    key = os.path.normcase(str(path.parent.resolve() / path.name))
     with _GUARD:
         local = _THREAD_LOCKS.setdefault(key, threading.Lock())
     if not local.acquire(blocking=blocking):

@@ -93,7 +93,10 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
 - **Writing.** One build at a time (`live/locks/build.lock`) and one writer per issue
   (`live/locks/<issue>.lock`); a second writer is refused, not queued. Each lock is a thread lock
   (threads of one process) plus an OS file lock (`flock` on Linux and macOS, `msvcrt.locking` on
-  Windows; other processes), both released when the holder finishes or the process ends. Every file is staged under an exclusive temporary name and linked into place
+  Windows; other processes), both released when the holder finishes or the process ends. A lock
+  file or lock folder that is a link is refused, for builds and for the METAR writer alike, and every
+  path check resolves folders, never the (possibly locked) file, comparing case-insensitively on
+  Windows. Every file is staged under an exclusive temporary name and linked into place
   without replacing anything.
 
 ## Learned state (v2 regression, v3 pressure gain, v4 own-reading gain)
