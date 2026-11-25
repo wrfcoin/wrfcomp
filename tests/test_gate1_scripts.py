@@ -734,3 +734,336 @@ def test_quarter_assembly_checks_the_sealed_split_before_loading_a_month_store(
             cfg.splits.sealed_test.start,
         )
     assert not (tmp_path / "q4.zarr").exists()
+
+
+# --------------------------------------------------------------------------- confirmation period
+
+
+def test_thresholds_train_end_cuts_the_input_and_records_the_cutoff(
+    base_world: dict[str, Path], tmp_path: Path, no_network: None
+) -> None:
+    config = ["--config", str(base_world["config"])]
+    whole = base_world["data"] / "truth" / "isd_conus_train.nc"  # 2022-12-15 .. 2023-08-15
+    out = tmp_path / "cut.nc"
+    args = ["--train-truth", str(whole), "--out", str(out), *config]
+    assert build_thresholds.main([*args, "--train-end", "2023-03-31T23:00Z"]) == 0
+    with xr.open_dataset(out) as cut, xr.open_dataset(whole) as train:
+        cut.load()
+        assert cut.attrs["train_end_utc"] == "2023-03-31T23:00:00.000000000"
+        validate_thresholds(cut, variables=load_config().evaluation.variables.primary)
+        # nothing after the cutoff is used: April to August have no threshold now
+        assert np.isnan(cut["t2m"].sel(month=[4, 5, 6, 7, 8]).values).all()
+        assert np.isfinite(cut["t2m"].sel(month=[1, 2, 3, 12]).values).all()
+        # the same numbers as building from a store that was cut by hand
+        by_hand_truth = train.sel(valid_time=slice(None, "2023-03-31T23"))
+        by_hand_truth.to_netcdf(tmp_path / "hand.nc", engine="h5netcdf")
+    hand = tmp_path / "hand_out.nc"
+    hand_args = ["--train-truth", str(tmp_path / "hand.nc"), "--out", str(hand), *config]
+    assert build_thresholds.main(hand_args) == 0
+    with xr.open_dataset(out) as cut, xr.open_dataset(hand) as by_hand:
+        for name in cut.data_vars:
+            np.testing.assert_array_equal(cut[name].values, by_hand[name].values)
+        # without the option the attribute is the train split end, whatever the data covers
+        assert by_hand.attrs["train_end_utc"] == "2023-12-17T18:00:00.000000000"
+    # one hour matters: the cutoff is inclusive
+    with xr.open_dataset(whole) as train:
+        march = train["t2m"].sel(valid_time=slice("2023-03-01T00", "2023-03-31T22")).values
+    earlier = tmp_path / "earlier.nc"
+    assert build_thresholds.main([*args[:3], str(earlier), *config, "--train-end", "2023-03-31T22"]) == 0
+    with xr.open_dataset(earlier) as got:
+        expected = np.nanquantile(march.astype(np.float64), 0.95, axis=0).astype(np.float32)
+        np.testing.assert_array_equal(got["t2m"].sel(month=3).values, expected)
+
+
+def test_thresholds_train_end_can_only_be_earlier(base_world: dict[str, Path], tmp_path: Path) -> None:
+    config = ["--config", str(base_world["config"])]
+    whole = str(base_world["data"] / "truth" / "isd_conus_train.nc")
+    out = tmp_path / "x.nc"
+    for bad in ("2023-12-17T18:00", "2023-12-17T19:00", "2024-06-01", "not-a-time", "NaT", "2020-01-01"):
+        args = ["--train-truth", whole, "--out", str(out), *config, "--train-end", bad]
+        assert build_thresholds.main(args) == 2
+        assert not out.exists()
+    # input past the train split is still refused; the option does not cut it away
+    late = str(base_world["data"] / "truth" / "isd_conus_2024.nc")
+    code = build_thresholds.main(
+        ["--train-truth", whole, late, "--out", str(out), *config, "--train-end", "2023-03-31T23"]
+    )
+    assert code == 2
+    assert not out.exists()
+
+
+CONFIRM_CUTOFF = "2023-01-15T18"
+CONFIRM_PERIOD = "2023-02"
+
+
+def build_confirmation_world(root: Path) -> dict[str, Path]:
+    """Train truth that contains the confirmation month, its GEFS cycles, and thresholds cut at the
+    confirmation cutoff. The scored truth is the train truth file itself."""
+    data = root / "data"
+    (data / "truth").mkdir(parents=True)
+    (data / "baselines" / "gefs").mkdir(parents=True)
+    train, clean = make_truth("2022-01-15T00", "2023-03-05T00", seed=21)
+    train.to_netcdf(data / "truth" / "isd_conus_train.nc", engine="h5netcdf")
+    write_gefs_cycles(data / "baselines" / "gefs", train, clean, seed=22, periods=(CONFIRM_PERIOD,))
+    config = write_config(root, list(station_ids(N_STATIONS)))
+    world = {"root": root, "data": data, "config": config}
+    for name, extra in (("tail_p95_confirm.nc", ["--train-end", CONFIRM_CUTOFF]), ("tail_p95.nc", [])):
+        code = build_thresholds.main(
+            [
+                "--train-truth", str(data / "truth" / "isd_conus_train.nc"),
+                "--out", str(data / "thresholds" / name),
+                "--config", str(config),
+                *extra,
+            ]
+        )  # fmt: skip
+        assert code == 0
+    return world
+
+
+def confirmation_args(world: dict[str, Path], thresholds: str = "tail_p95_confirm.nc") -> list[str]:
+    return [
+        "--confirmation-train-end", CONFIRM_CUTOFF,
+        "--truth", str(world["data"] / "truth" / "isd_conus_train.nc"),
+        "--thresholds", str(world["data"] / "thresholds" / thresholds),
+    ]  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def confirmation_world(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    return build_confirmation_world(tmp_path_factory.mktemp("confirm"))
+
+
+def _store_hashes(world: dict[str, Path]) -> dict[str, str]:
+    from wrfcomp.harness.hashing import content_sha256
+
+    out = {}
+    for model in MODELS:
+        with xr.open_zarr(world["data"] / "gate1" / f"{CONFIRM_PERIOD}_h00-12" / f"{model}.zarr") as ds:
+            out[model] = content_sha256(ds)
+    return out
+
+
+def test_confirmation_mode_scores_a_train_split_month_with_cut_references(
+    confirmation_world: dict[str, Path], tmp_path: Path, no_network: None, capsys: pytest.CaptureFixture
+) -> None:
+    world = copy_world(confirmation_world, tmp_path / "w")
+    out = tmp_path / "cards"
+    # without the mode a period before the validation split is refused, as before
+    assert run(world, out, periods=(CONFIRM_PERIOD,)) == 2
+    assert run(world, out, *confirmation_args(world), periods=(CONFIRM_PERIOD,)) == 0
+    assert "confirmation mode" in capsys.readouterr().out
+    cutoff = str(np.datetime64(CONFIRM_CUTOFF, "ns"))
+    work = world["data"] / "gate1" / f"{CONFIRM_PERIOD}_h00-12"
+    for model in MODELS:
+        card = json.loads((out / f"{model}_{CONFIRM_PERIOD}.json").read_text())
+        Scorecard.model_validate(card)
+        assert card["period_start"] == "2023-02-01T00:00:00"
+        assert card["period_end"] == "2023-02-28T12:00:00"
+        assert card["n_init_times"] == 56
+        assert card["sealed_data_used"] is False
+        with xr.open_zarr(work / f"{model}.zarr") as ds:
+            assert ds.attrs.get("train_end_utc") == (None if model == "gefs" else cutoff)
+    clean = _store_hashes(world)
+
+    # The cutoff is obeyed: change every train value between the cutoff and the period (kept clear of
+    # the last hours before the first init, which persistence starts from). The references and their
+    # scorecards must not move.
+    poisoned = copy_world(confirmation_world, tmp_path / "p")
+    path = poisoned["data"] / "truth" / "isd_conus_train.nc"
+    with xr.open_dataset(path) as ds:
+        ds = ds.load()
+    for name in VARIABLES:
+        ds[name].loc[dict(valid_time=slice("2023-01-15T19", "2023-01-31T12"))] += 50.0
+    ds.to_netcdf(path, engine="h5netcdf")
+    out_p = tmp_path / "cards_p"
+    assert run(poisoned, out_p, *confirmation_args(poisoned), periods=(CONFIRM_PERIOD,)) == 0
+    assert _store_hashes(poisoned) == clean
+    for model in MODELS:
+        a = json.loads((out / f"{model}_{CONFIRM_PERIOD}.json").read_text())
+        b = json.loads((out_p / f"{model}_{CONFIRM_PERIOD}.json").read_text())
+        assert a["truth_sha256"] != b["truth_sha256"]  # the file did change
+        assert a["forecast_sha256"] == b["forecast_sha256"]
+        assert a["metrics"] == b["metrics"] and a["n_pairs"] == b["n_pairs"]
+
+    # a store built with another cutoff, or with none, is not reused
+    period = run_gate1.parse_period(
+        CONFIRM_PERIOD, [0, 12], load_config(), np.datetime64(CONFIRM_CUTOFF, "ns")
+    )
+    stations = list(station_ids(N_STATIONS))
+    for other in (None, np.datetime64("2023-01-10T00", "ns")):
+        with pytest.raises(run_gate1.ModelFailed, match="training cutoff"):
+            run_gate1.existing_store_ok(work / "climatology.zarr", period, stations, "climatology", other)
+    assert run_gate1.existing_store_ok(work / "gefs.zarr", period, stations, "gefs", period.init_times[0])
+
+
+def test_confirmation_mode_refusals(
+    confirmation_world: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    world = confirmation_world  # nothing is written to the data dir by a refused run
+    out = tmp_path / "cards"
+    full = confirmation_args(world)
+
+    def refused(*extra: str, periods: tuple[str, ...] = (CONFIRM_PERIOD,)) -> str:
+        capsys.readouterr()
+        assert run(world, out, *extra, periods=periods) == 2
+        return capsys.readouterr().err
+
+    # the defaults are the validation truth and the whole-train thresholds: both must be named
+    assert "needs --truth and --thresholds" in refused("--confirmation-train-end", CONFIRM_CUTOFF)
+    assert "needs --truth and --thresholds" in refused(*full[:4])
+    # thresholds of the whole train split would leak the period into the tail thresholds
+    assert "not up to the confirmation cutoff" in refused(*confirmation_args(world, "tail_p95.nc"))
+    # the cutoff can only be earlier than the train split end
+    for late in ("2023-12-17T18", "2024-03-01"):
+        assert "can only be earlier" in refused("--confirmation-train-end", late, *full[2:])
+    assert "not a time" in refused("--confirmation-train-end", "soon", *full[2:])
+    # embargo: the period must start 14 days after the cutoff
+    assert "days after the confirmation cutoff" in refused(*full, periods=("2023-01",))
+    # a validation period is not a confirmation period
+    assert "reaches the validation split" in refused(*full, periods=("2024-01",))
+    assert not (world["data"] / "gate1").exists()
+    assert not out.exists() or not list(out.iterdir())
+
+
+def test_confirmation_periods_of_2023_with_the_real_config() -> None:
+    """The proposed 2023 confirmation year: cutoff 2022-12-17T18Z, last init 2023-12-15T12Z."""
+    cfg = load_config()
+    cutoff = np.datetime64("2022-12-17T18", "ns")
+    quarters = [run_gate1.parse_period(f"2023-Q{q}", [0, 12], cfg, cutoff) for q in range(1, 5)]
+    assert [p.init_times.size for p in quarters] == [180, 182, 184, 152]
+    assert quarters[0].init_times.min() == np.datetime64("2023-01-01T00", "ns")
+    assert quarters[3].init_times.max() == np.datetime64("2023-12-15T12", "ns")
+    assert quarters[3].n_dropped == 32
+    assert quarters[3].months == ("2023-10", "2023-11", "2023-12")
+    december = run_gate1.parse_period("2023-12", [0, 12], cfg, cutoff)
+    assert december.init_times.size == 30 and december.n_dropped == 32
+    # one day closer to the period and the 14-day embargo is broken
+    with pytest.raises(run_gate1.Refused, match="days after the confirmation cutoff"):
+        run_gate1.parse_period("2023-Q1", [0, 12], cfg, np.datetime64("2022-12-18T06", "ns"))
+    # the ordinary rule is untouched
+    with pytest.raises(run_gate1.Refused, match="before the validation split"):
+        run_gate1.parse_period("2023-Q1", [0, 12], cfg)
+    assert run_gate1.parse_period("2024-Q4", [0, 12], cfg).init_times.size == 156
+
+
+def test_slice_truth_copies_a_time_range_unchanged(
+    confirmation_world: dict[str, Path], tmp_path: Path
+) -> None:
+    slice_truth = load_script("slice_truth")
+    source = confirmation_world["data"] / "truth" / "isd_conus_train.nc"
+    out = tmp_path / "cut.nc"
+    args = ["--source", str(source), "--out", str(out), "--config", str(confirmation_world["config"])]
+    assert slice_truth.main([*args, "--start", "2023-01-31T18Z", "--end", "2023-03-02T12"]) == 0
+    with xr.open_dataset(source) as whole, xr.open_dataset(out) as cut:
+        want = whole.sel(valid_time=slice("2023-01-31T18", "2023-03-02T12")).load()
+        xr.testing.assert_identical(cut.load(), want)
+        assert cut["t2m_offset_min"].dtype == np.int16 and cut["t2m"].dtype == np.float32
+    before = out.read_bytes()
+    assert slice_truth.main([*args, "--start", "2023-01-31T18", "--end", "2023-03-02T12"]) == 2  # exists
+    assert out.read_bytes() == before
+    other = ["--source", str(source), "--out", str(tmp_path / "x.nc")]
+    assert slice_truth.main([*other, "--start", "2030-01-01", "--end", "2030-02-01"]) == 2  # nothing there
+    assert slice_truth.main([*other, "--start", "2023-03-01", "--end", "2023-02-01"]) == 2
+    assert not (tmp_path / "x.nc").exists()
+
+
+def _write_month_stores(root: Path, labels: list[str], model: str, cutoff, attr: str | None) -> list[Path]:
+    """Small finished month stores for `assemble_quarter`, with or without a `train_end_utc`."""
+    cfg = load_config()
+    stations = xr.Dataset(coords={"station_id": station_ids(N_STATIONS).astype(str), **_station_coords()})
+    stores = []
+    for label in labels:
+        month = run_gate1.parse_period(label, [0, 12], cfg, cutoff)
+        ds = run_gate1.baseline_io.layout(
+            stations, month.init_times, [3], GEFS_MEMBERS, run_gate1.MODEL_IDS[model]
+        )
+        for name in UNITS:
+            ds[name].values[:] = 280.0
+        if attr is not None:
+            ds.attrs["train_end_utc"] = attr
+        store = root / label / f"{model}.zarr"
+        run_gate1.baseline_io.write(ds, store)
+        stores.append(store)
+    return stores
+
+
+@pytest.mark.parametrize(
+    ("year", "confirmation", "model", "attr", "accepted"),
+    [
+        # confirmation run: climatology and persistence months must carry exactly this run's cutoff
+        (2023, True, "climatology", "2022-12-17T18:00:00.000000000", True),
+        (2023, True, "persistence", "2022-12-17T18:00:00.000000000", True),
+        (2023, True, "climatology", "2022-12-31T18:00:00.000000000", False),  # a later cutoff
+        (2023, True, "persistence", "2022-12-10T00:00:00.000000000", False),  # another cutoff
+        (2023, True, "climatology", None, False),  # built with the rolling default cutoff
+        (2023, True, "gefs", None, True),  # GEFS learns nothing: never a cutoff
+        (2023, True, "gefs", "2022-12-17T18:00:00.000000000", False),
+        # ordinary run: no month store may carry a cutoff
+        (2024, False, "climatology", None, True),
+        (2024, False, "climatology", "2022-12-17T18:00:00.000000000", False),
+        (2024, False, "gefs", "2022-12-17T18:00:00.000000000", False),
+    ],
+)
+def test_quarter_assembly_checks_the_training_cutoff_of_every_month_store(
+    tmp_path: Path, year: int, confirmation: bool, model: str, attr: str | None, accepted: bool
+) -> None:
+    """Review of #33: a quarter was joined from month stores built with another cutoff, or with none,
+    and scored in the same run. Only a later rerun noticed."""
+    cfg = load_config()
+    cutoff = np.datetime64("2022-12-17T18", "ns") if confirmation else None
+    labels = [f"{year}-01", f"{year}-02", f"{year}-03"]
+    period = run_gate1.parse_period(f"{year}-Q1", [0, 12], cfg, cutoff)
+    months = [run_gate1.parse_period(m, [0, 12], cfg, cutoff) for m in labels]
+    stores = _write_month_stores(tmp_path / "months", labels, model, cutoff, attr)
+    target = tmp_path / "quarter" / f"{model}.zarr"
+    args = (target, period, stores, months, model, cfg.splits.sealed_test.start, cutoff)
+    if accepted:
+        run_gate1.assemble_quarter(*args)
+        with xr.open_zarr(target) as joined:
+            assert joined.sizes["init_time"] == period.init_times.size
+            assert joined.attrs.get("train_end_utc") == attr
+    else:
+        with pytest.raises(run_gate1.ModelFailed, match="training cutoff"):
+            run_gate1.assemble_quarter(*args)
+        assert not target.exists()
+
+
+def test_quarter_assembly_refuses_one_month_with_another_cutoff(tmp_path: Path) -> None:
+    cfg = load_config()
+    cutoff = np.datetime64("2022-12-17T18", "ns")
+    labels = ["2023-01", "2023-02", "2023-03"]
+    period = run_gate1.parse_period("2023-Q1", [0, 12], cfg, cutoff)
+    months = [run_gate1.parse_period(m, [0, 12], cfg, cutoff) for m in labels]
+    good = _write_month_stores(tmp_path / "a", labels[:2], "climatology", cutoff, str(cutoff))
+    bad = _write_month_stores(tmp_path / "a", labels[2:], "climatology", cutoff, None)
+    target = tmp_path / "quarter.zarr"
+    with pytest.raises(run_gate1.ModelFailed, match="2023-03.*training cutoff"):
+        run_gate1.assemble_quarter(
+            target, period, good + bad, months, "climatology", cfg.splits.sealed_test.start, cutoff
+        )
+    assert not target.exists()
+
+
+def test_slice_truth_refuses_a_malformed_source_without_a_traceback(
+    confirmation_world: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    slice_truth = load_script("slice_truth")
+    config = ["--config", str(confirmation_world["config"])]
+    window = ["--start", "2023-02-01", "--end", "2023-02-02"]
+    # no valid_time at all (a thresholds file), and a valid_time that is not a time
+    no_time = confirmation_world["data"] / "thresholds" / "tail_p95.nc"
+    numbers = tmp_path / "numbers.nc"
+    xr.Dataset(
+        {"t2m": (("valid_time", "station_id"), np.zeros((3, 1), dtype="f4"))},
+        coords={"valid_time": np.arange(3), "station_id": ["00000000001"]},
+    ).to_netcdf(numbers, engine="h5netcdf")
+    for source, message in ((no_time, "no valid_time coordinate"), (numbers, "not a time coordinate")):
+        out = tmp_path / f"{source.stem}_out.nc"
+        assert slice_truth.main(["--source", str(source), "--out", str(out), *window, *config]) == 2
+        assert message in capsys.readouterr().err
+        assert not out.exists()
+    good = confirmation_world["data"] / "truth" / "isd_conus_train.nc"
+    out = tmp_path / "x.nc"
+    assert slice_truth.main(["--source", str(good), "--out", str(out), "--start", "soon", "--end", "x"]) == 2
+    assert slice_truth.main(["--source", str(tmp_path / "nope.nc"), "--out", str(out), *window]) == 2
+    assert not out.exists()
