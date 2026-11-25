@@ -199,7 +199,8 @@ def synthetic_env(tmp_path: Path) -> dict[str, Any]:
             },
         }
     ref_path = tmp_path / "REFERENCES.json"
-    ref_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+    text = json.dumps(inventory, indent=2, sort_keys=True) + "\n"
+    ref_path.write_text(text, encoding="utf-8", newline="\n")
     return {
         "data_dir": data_dir,
         "out_dir": tmp_path / "bundle",
