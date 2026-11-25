@@ -310,7 +310,10 @@ def _as_scalar_float(val: Any, what: str) -> float:
     arr = np.asarray(val)
     if arr.size != 1 or arr.dtype.kind not in "iuf":
         raise BundleError(f"{what}: expected numeric scalar")
-    return float(arr.reshape(-1)[0])
+    out = float(arr.reshape(-1)[0])
+    if not math.isfinite(out):
+        raise BundleError(f"{what}: non-finite numeric value {out!r} refused")
+    return out
 
 
 def _as_scalar_int(val: Any, what: str) -> int:
@@ -399,8 +402,9 @@ def _validate_var_attr_value(
         if kind != "thresholds":
             raise BundleError(f"{what}: tail_quantile only approved on thresholds")
         q = _as_scalar_float(val, what)
-        if abs(q - float(cfg.gate.tail_quantile)) > 1e-9:
-            raise BundleError(f"{what}: tail_quantile {q} != {cfg.gate.tail_quantile}")
+        expected_q = float(cfg.gate.tail_quantile)
+        if not (math.isfinite(q) and math.isfinite(expected_q) and q == expected_q):
+            raise BundleError(f"{what}: tail_quantile {q!r} != {expected_q!r}")
         return
 
     if attr_name == "train_end_utc":
@@ -486,8 +490,9 @@ def _validate_netcdf_root_attr_value(
     if kind == "thresholds":
         if attr_name == "tail_quantile":
             q = _as_scalar_float(val, what)
-            if abs(q - float(cfg.gate.tail_quantile)) > 1e-9:
-                raise BundleError(f"{what}: tail_quantile {q} != {cfg.gate.tail_quantile}")
+            expected_q = float(cfg.gate.tail_quantile)
+            if not (math.isfinite(q) and math.isfinite(expected_q) and q == expected_q):
+                raise BundleError(f"{what}: tail_quantile {q!r} != {expected_q!r}")
             return
         if attr_name == "train_end_utc":
             _validate_train_end_value(val, cfg, what)
@@ -1098,11 +1103,13 @@ def _verify_written_archive(
     archive_path: Path,
     expected_members: list[tuple[str, int, str]],
 ) -> None:
-    """Read back the finished archive and verify every member's exact size and byte SHA-256."""
+    """Read back the finished archive and verify plain USTAR regular files and exact byte SHA-256."""
     seen: list[tuple[str, int, str]] = []
     with tarfile.open(archive_path, mode="r:gz") as tf:
         for member in tf:
-            if not member.isfile():
+            if member.pax_headers:
+                raise BundleError(f"Written archive contains PAX headers on member: {member.name!r}")
+            if not member.isfile() or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
                 raise BundleError(f"Written archive contains non-file member: {member.name!r}")
             src = tf.extractfile(member)
             if src is None:
@@ -1242,7 +1249,7 @@ def build_bundle(
             with gzip.GzipFile(
                 filename="", mode="wb", fileobj=raw_fh, compresslevel=compress_level, mtime=0
             ) as gz_fh:
-                with tarfile.open(fileobj=gz_fh, mode="w", format=tarfile.PAX_FORMAT) as tf:
+                with tarfile.open(fileobj=gz_fh, mode="w", format=tarfile.USTAR_FORMAT) as tf:
                     _add_bytes_member(tf, "MANIFEST.json", manifest_bytes)
                     _add_bytes_member(tf, "README.md", readme_bytes)
                     for entry in manifest_entries:

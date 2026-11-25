@@ -352,7 +352,7 @@ def test_extraction_download_manifest_and_chunk_limits(synthetic_env, tmp_path, 
     sha = summary["archive_sha256"]
 
     # Member count limit
-    with pytest.raises(fetcher.FetchError, match="member count"):
+    with pytest.raises(fetcher.FetchError, match="header record count|member count"):
         fetcher.fetch_scoring_data(
             year=2024,
             data_dir=tmp_path / "lim_members",
@@ -508,7 +508,10 @@ def test_physical_payload_pinning_strict_zarr_layout_and_trusted_pin(synthetic_e
     smuggled_bytes = b"smuggled-payload"
     smuggled_path = "gate1/2024-01_h00-12/gefs.zarr/smuggled.bin"
     smuggled_archive = tmp_path / "smuggled.tar.gz"
-    with tarfile.open(good_archive, "r:gz") as src, tarfile.open(smuggled_archive, "w:gz") as dst:
+    with (
+        tarfile.open(good_archive, "r:gz") as src,
+        tarfile.open(smuggled_archive, "w:gz", format=tarfile.USTAR_FORMAT) as dst,
+    ):
         for member in src.getmembers():
             data = src.extractfile(member).read()
             if member.name == "MANIFEST.json":
@@ -543,7 +546,10 @@ def test_physical_payload_pinning_strict_zarr_layout_and_trusted_pin(synthetic_e
 
     # 6. Fetcher verifies MANIFEST.json references_sha256 against REFERENCES.json
     wrong_ref_archive = tmp_path / "wrong_ref_sha.tar.gz"
-    with tarfile.open(good_archive, "r:gz") as src, tarfile.open(wrong_ref_archive, "w:gz") as dst:
+    with (
+        tarfile.open(good_archive, "r:gz") as src,
+        tarfile.open(wrong_ref_archive, "w:gz", format=tarfile.USTAR_FORMAT) as dst,
+    ):
         for member in src.getmembers():
             data = src.extractfile(member).read()
             if member.name == "MANIFEST.json":
@@ -708,7 +714,10 @@ def test_fetch_refuses_tampered_file_spoofed_manifest_and_unsafe_tar(synthetic_e
 
     # 2. Tamper one file inside archive without updating MANIFEST.json
     tampered_file = tmp_path / "tampered_file.tar.gz"
-    with tarfile.open(good_archive, "r:gz") as src, tarfile.open(tampered_file, "w:gz") as dst:
+    with (
+        tarfile.open(good_archive, "r:gz") as src,
+        tarfile.open(tampered_file, "w:gz", format=tarfile.USTAR_FORMAT) as dst,
+    ):
         for member in src.getmembers():
             data = src.extractfile(member).read()
             if member.name == "truth/isd_conus_2024.nc":
@@ -735,7 +744,10 @@ def test_fetch_refuses_tampered_file_spoofed_manifest_and_unsafe_tar(synthetic_e
     with xr.open_dataset(alt_truth) as opened:
         alt_content_sha = content_sha256(opened)
     spoofed = tmp_path / "spoofed_manifest.tar.gz"
-    with tarfile.open(good_archive, "r:gz") as src, tarfile.open(spoofed, "w:gz") as dst:
+    with (
+        tarfile.open(good_archive, "r:gz") as src,
+        tarfile.open(spoofed, "w:gz", format=tarfile.USTAR_FORMAT) as dst,
+    ):
         for member in src.getmembers():
             data = src.extractfile(member).read()
             if member.name == "truth/isd_conus_2024.nc":
@@ -766,7 +778,10 @@ def test_fetch_refuses_tampered_file_spoofed_manifest_and_unsafe_tar(synthetic_e
 
     # 4. Path traversal member refused
     traversal = tmp_path / "traversal.tar.gz"
-    with gzip.open(traversal, "wb") as gz, tarfile.open(fileobj=gz, mode="w") as tf:
+    with (
+        gzip.open(traversal, "wb") as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tf,
+    ):
         info = tarfile.TarInfo("../escape.txt")
         info.size = 3
         tf.addfile(info, io.BytesIO(b"bad"))
@@ -782,7 +797,10 @@ def test_fetch_refuses_tampered_file_spoofed_manifest_and_unsafe_tar(synthetic_e
 
     # 5. Extra unmanifested file in archive refused
     extra = tmp_path / "extra.tar.gz"
-    with tarfile.open(good_archive, "r:gz") as src, tarfile.open(extra, "w:gz") as dst:
+    with (
+        tarfile.open(good_archive, "r:gz") as src,
+        tarfile.open(extra, "w:gz", format=tarfile.USTAR_FORMAT) as dst,
+    ):
         for member in src.getmembers():
             data = src.extractfile(member).read()
             info = tarfile.TarInfo(member.name)
@@ -873,7 +891,7 @@ def test_fetch_resolves_zenodo_record_url_with_mock_transport(synthetic_env, tmp
 
 
 def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp_path):
-    """Independent tar metadata budget stops PAX/header bombs even under the default 10 GiB payload cap."""
+    """Plain USTAR enforcement rejects PAX/GNU headers and enforces stream + metadata budgets."""
     summary = builder.build_bundle(
         year=2024,
         data_dir=synthetic_env["data_dir"],
@@ -884,18 +902,36 @@ def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp
     )
     manifest_sidecar = Path(summary["manifest_sidecar"])
 
-    # 1. Single 100 KiB PAX extended header on a 2-byte member is rejected BEFORE allocation,
-    # even with the default 10 GiB payload budget!
+    # 0. Verify builder emits pure POSIX USTAR regular-file headers only (no PAX/GNU headers)
+    with gzip.open(summary["archive_path"], "rb") as gz:
+        raw_tar = gz.read()
+    pos = 0
+    seen_headers = 0
+    while pos + 512 <= len(raw_tar):
+        hdr = raw_tar[pos : pos + 512]
+        if hdr == b"\x00" * 512:
+            break
+        assert hdr[257:263] == b"ustar\x00"
+        assert hdr[263:265] == b"00"
+        assert hdr[156:157] in (b"0", b"\x00")
+        size = int(hdr[124:136].rstrip(b"\x00 ").decode("ascii"), 8)
+        pos += 512 + ((size + 511) // 512) * 512
+        seen_headers += 1
+    assert seen_headers >= 8
+
+    # 1. PAX extended header bomb (100 KiB comment) is rejected immediately on the 512-byte header
+    # even under the default 10 GiB payload cap.
     bloated = tmp_path / "pax_bomb.tar.gz"
-    with gzip.open(bloated, "wb") as gz, tarfile.open(
-        fileobj=gz, mode="w", format=tarfile.PAX_FORMAT
-    ) as tf:
+    with (
+        gzip.open(bloated, "wb") as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tf,
+    ):
         info = tarfile.TarInfo("README.md")
         info.size = 2
         info.pax_headers = {"comment": "X" * 100_000}
         tf.addfile(info, io.BytesIO(b"ok"))
 
-    with pytest.raises(fetcher.FetchError, match="Single tar metadata/PAX record"):
+    with pytest.raises(fetcher.FetchError, match="Refusing tar PAX/GNU extended header"):
         fetcher.fetch_scoring_data(
             year=2024,
             data_dir=tmp_path / "pax_dest",
@@ -905,34 +941,96 @@ def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp
             expected_manifest=manifest_sidecar,
         )
 
-    # 2. Many smaller PAX records exceeding total metadata budget are rejected even under 10 GiB payload cap.
-    many_pax = tmp_path / "many_pax.tar.gz"
-    with gzip.open(many_pax, "wb") as gz, tarfile.open(
-        fileobj=gz, mode="w", format=tarfile.PAX_FORMAT
-    ) as tf:
-        for idx in range(12):
+    # 2. Framing-changing PAX size override header is also refused immediately (no parser split).
+    pax_size = tmp_path / "pax_size.tar.gz"
+    with (
+        gzip.open(pax_size, "wb") as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tf,
+    ):
+        info = tarfile.TarInfo("README.md")
+        info.size = 4
+        info.pax_headers = {"size": "4"}
+        tf.addfile(info, io.BytesIO(b"test"))
+
+    with pytest.raises(fetcher.FetchError, match="Refusing tar PAX/GNU extended header"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "pax_size_dest",
+            archive=pax_size,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_manifest=manifest_sidecar,
+        )
+
+    # 3. GNU extended header (longname >100 chars -> typeflag 'L') is refused immediately.
+    gnu_long = tmp_path / "gnu_long.tar.gz"
+    with (
+        gzip.open(gnu_long, "wb") as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.GNU_FORMAT) as tf,
+    ):
+        info = tarfile.TarInfo("truth/" + "a" * 120 + ".nc")
+        info.size = 2
+        tf.addfile(info, io.BytesIO(b"ok"))
+
+    with pytest.raises(fetcher.FetchError, match="Refusing tar PAX/GNU extended header"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "gnu_dest",
+            archive=gnu_long,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_manifest=manifest_sidecar,
+        )
+
+    # 4. Non-regular/non-dir USTAR member (symlink) is refused immediately at stream framing.
+    ustar_sym = tmp_path / "ustar_sym.tar.gz"
+    with (
+        gzip.open(ustar_sym, "wb") as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tf,
+    ):
+        info = tarfile.TarInfo("truth/link.nc")
+        info.type = tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"
+        tf.addfile(info)
+
+    with pytest.raises(fetcher.FetchError, match="Refusing non-regular tar member"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "sym_dest",
+            archive=ustar_sym,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_manifest=manifest_sidecar,
+        )
+
+    # 5. Plain USTAR archive exceeding independent tar metadata bytes and header count caps
+    # is rejected even under the default 10 GiB payload cap.
+    many_ustar = tmp_path / "many_ustar.tar.gz"
+    with (
+        gzip.open(many_ustar, "wb") as gz,
+        tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tf,
+    ):
+        for idx in range(20):
             info = tarfile.TarInfo(f"truth/part_{idx}.txt")
             info.size = 2
-            info.pax_headers = {"comment": "Y" * 2000}
             tf.addfile(info, io.BytesIO(b"ok"))
 
     with pytest.raises(fetcher.FetchError, match="tar metadata bytes exceeded independent budget"):
         fetcher.fetch_scoring_data(
             year=2024,
-            data_dir=tmp_path / "many_pax_dest",
-            archive=many_pax,
+            data_dir=tmp_path / "many_meta_dest",
+            archive=many_ustar,
             references_path=synthetic_env["ref_path"],
             config_path=CONFIG_PATH,
             expected_manifest=manifest_sidecar,
-            max_tar_metadata_bytes=16 * 1024,
+            max_tar_metadata_bytes=4096,
         )
 
-    # 3. Raw tar header record count budget enforced independently of payload budget.
     with pytest.raises(fetcher.FetchError, match="header record count exceeded independent budget"):
         fetcher.fetch_scoring_data(
             year=2024,
             data_dir=tmp_path / "many_hdr_dest",
-            archive=many_pax,
+            archive=many_ustar,
             references_path=synthetic_env["ref_path"],
             config_path=CONFIG_PATH,
             expected_manifest=manifest_sidecar,
@@ -1084,6 +1182,83 @@ def test_builder_public_metadata_allowlist_and_nested_netcdf_group(synthetic_env
             min_free_gb=0.0,
         )
     (gefs_path / ".zattrs").write_bytes(orig_zattrs)
+
+    # 10. Non-finite (NaN / +inf / -inf) and wrong finite tail_quantile refused on BOTH
+    # dataset root and variable attributes, on BOTH build and fetch!
+    thresh_path = data_dir / "thresholds" / "tail_p95.nc"
+    orig_thresh_bytes = thresh_path.read_bytes()
+    good_summary = builder.build_bundle(
+        year=2024,
+        data_dir=data_dir,
+        out_dir=synthetic_env["out_dir"],
+        references_path=synthetic_env["ref_path"],
+        config_path=CONFIG_PATH,
+        min_free_gb=0.0,
+    )
+    good_archive = Path(good_summary["archive_path"])
+
+    def _repack_with_threshold_bytes(bad_nc_bytes: bytes, dest_tar: Path) -> str:
+        with (
+            tarfile.open(good_archive, "r:gz") as src,
+            tarfile.open(dest_tar, "w:gz", format=tarfile.USTAR_FORMAT) as dst,
+        ):
+            for member in src.getmembers():
+                data = src.extractfile(member).read()
+                if member.name == "thresholds/tail_p95.nc":
+                    data = bad_nc_bytes
+                elif member.name == "MANIFEST.json":
+                    m = json.loads(data.decode("utf-8"))
+                    for entry in m["entries"]:
+                        if entry["path"] == "thresholds/tail_p95.nc":
+                            entry["size_bytes"] = len(bad_nc_bytes)
+                            entry["files"][0]["size_bytes"] = len(bad_nc_bytes)
+                            entry["files"][0]["sha256"] = hashlib.sha256(bad_nc_bytes).hexdigest()
+                    data = json.dumps(m).encode("utf-8")
+                info = tarfile.TarInfo(member.name)
+                info.size = len(data)
+                dst.addfile(info, io.BytesIO(data))
+        return hashlib.sha256(dest_tar.read_bytes()).hexdigest()
+
+    for idx, (level, bad_val, expected_msg) in enumerate(
+        [
+            ("root", float("nan"), "non-finite numeric value"),
+            ("var", float("nan"), "non-finite numeric value"),
+            ("root", float("inf"), "non-finite numeric value"),
+            ("var", float("-inf"), "non-finite numeric value"),
+            ("root", 0.90, "tail_quantile"),
+            ("var", 0.90, "tail_quantile"),
+        ]
+    ):
+        ds_bad_q = _make_thresholds()
+        if level == "root":
+            ds_bad_q.attrs["tail_quantile"] = bad_val
+        else:
+            ds_bad_q["t2m"].attrs["tail_quantile"] = bad_val
+        ds_bad_q.to_netcdf(thresh_path, engine="h5netcdf")
+
+        with pytest.raises(builder.BundleError, match=expected_msg):
+            builder.build_bundle(
+                year=2024,
+                data_dir=data_dir,
+                out_dir=synthetic_env["out_dir"],
+                references_path=synthetic_env["ref_path"],
+                config_path=CONFIG_PATH,
+                min_free_gb=0.0,
+            )
+
+        bad_tar = tmp_path / f"bad_q_{idx}.tar.gz"
+        bad_sha = _repack_with_threshold_bytes(thresh_path.read_bytes(), bad_tar)
+        with pytest.raises(fetcher.FetchError, match=expected_msg):
+            fetcher.fetch_scoring_data(
+                year=2024,
+                data_dir=tmp_path / f"bad_q_dest_{idx}",
+                archive=bad_tar,
+                references_path=synthetic_env["ref_path"],
+                config_path=CONFIG_PATH,
+                expected_sha256=bad_sha,
+            )
+
+    thresh_path.write_bytes(orig_thresh_bytes)
 
 
 def test_existing_destination_physical_byte_hash_and_inventory_verified(synthetic_env, tmp_path):

@@ -61,9 +61,8 @@ DEFAULT_MAX_ARCHIVE_BYTES = 8 * 1024**3
 DEFAULT_MAX_MEMBERS = 50_000
 DEFAULT_MAX_MEMBER_BYTES = 512 * 1024**2
 DEFAULT_MAX_TOTAL_BYTES = 10 * 1024**3
-DEFAULT_MAX_TAR_HEADERS = 150_000
+DEFAULT_MAX_TAR_HEADERS = 50_000
 DEFAULT_MAX_TAR_METADATA_BYTES = 64 * 1024**2
-DEFAULT_MAX_SINGLE_TAR_METADATA_BYTES = 64 * 1024
 DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024**2
 DEFAULT_MAX_README_BYTES = 1 * 1024**2
 DEFAULT_MAX_METADATA_BYTES = 1 * 1024**2
@@ -170,36 +169,48 @@ PARSER_VERSION_RE = re.compile(r"^[0-9]{1,8}$")
 MODEL_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 ISO_TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$")
 _TAR_ZERO_BLOCK = b"\x00" * 512
-_TAR_METADATA_TYPEFLAGS = frozenset({b"x", b"g", b"L", b"K", b"X"})
-_TAR_REGULAR_TYPEFLAGS = frozenset({b"0", b"\x00", b"5"})
+_TAR_EXTENDED_TYPEFLAGS = frozenset({b"x", b"g", b"X", b"L", b"K", b"S"})
+_TAR_ALLOWED_TYPEFLAGS = frozenset({b"0", b"\x00", b"5"})
+_USTAR_MAGIC = b"ustar\x00"
+_USTAR_VERSION = b"00"
 
 
 class FetchError(RuntimeError):
     """Raised when downloading, verifying, or unpacking a scoring bundle fails."""
 
 
-def _parse_tar_size(field: bytes) -> int:
+def _parse_ustar_octal_size(field: bytes) -> int:
     if not field:
         return 0
     if field[0] & 0x80:
-        # GNU base-256 encoding
-        val = field[0] & 0x7F
-        for b in field[1:]:
-            val = (val << 8) | b
-        return val
-    text = field.rstrip(b"\x00 ").decode("ascii", errors="strict").strip()
+        raise FetchError("Refusing GNU base-256 tar size encoding; plain USTAR format only")
+    try:
+        text = field.rstrip(b"\x00 ").decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError as exc:
+        raise FetchError(f"Non-ASCII tar header size field: {exc}") from exc
     if not text:
         return 0
-    return int(text, 8)
+    try:
+        val = int(text, 8)
+    except ValueError as exc:
+        raise FetchError(f"Malformed USTAR octal size field: {text!r}") from exc
+    if val < 0:
+        raise FetchError("Negative size in tar header")
+    return val
 
 
 class _TarBudgetStream:
-    """Framing-aware tar stream wrapper enforcing independent metadata and payload budgets.
+    """Plain USTAR stream wrapper enforcing strict framing and total decompressed byte budgets.
 
-    Every 512-byte tar header block and every non-payload record (PAX ``x``/``g``, GNU ``L``/``K``,
-    EOF zero blocks) is charged against small, independent metadata limits *before* Python's
-    ``tarfile`` module reads or allocates the metadata record—completely separate from the
-    multi-GiB regular-file payload budget.
+    Only POSIX USTAR regular files (``0``/``\\x00``) and directories (``5``) with ASCII octal
+    sizes are permitted. PAX and GNU extended headers (``x``, ``g``, ``X``, ``L``, ``K``, ``S``)
+    and all non-regular/non-directory member types are rejected immediately on the 512-byte
+    header before ``tarfile`` reads any record body, guaranteeing identical record boundaries
+    between this wrapper and ``tarfile.open(..., mode="r|")``.
+
+    Every byte read from the decompressed stream is strictly bounded by
+    ``max_total_bytes + max_metadata_bytes``, with tar headers/padding/EOF blocks also capped
+    independently by ``max_headers`` and ``max_metadata_bytes``.
     """
 
     def __init__(
@@ -208,26 +219,37 @@ class _TarBudgetStream:
         *,
         max_headers: int,
         max_metadata_bytes: int,
-        max_single_metadata_bytes: int,
         max_member_bytes: int,
         max_total_bytes: int,
     ) -> None:
         self._stream = stream
         self._max_headers = max_headers
         self._max_metadata_bytes = max_metadata_bytes
-        self._max_single_metadata_bytes = max_single_metadata_bytes
         self._max_member_bytes = max_member_bytes
         self._max_total_bytes = max_total_bytes
+        self._max_stream_bytes = max_total_bytes + max_metadata_bytes
         self._buf = bytearray()
         self._remaining_body = 0
         self.header_count = 0
         self.metadata_bytes = 0
         self.payload_bytes = 0
+        self.total_stream_bytes = 0
+
+    def _raw_read(self, n: int) -> bytes:
+        piece = self._stream.read(n)
+        if not piece:
+            return b""
+        self.total_stream_bytes += len(piece)
+        if self.total_stream_bytes > self._max_stream_bytes:
+            raise FetchError(
+                f"Decompressed archive stream exceeded maximum byte budget ({self._max_stream_bytes} bytes)"
+            )
+        return piece
 
     def _read_exact(self, n: int) -> bytes:
         chunks = bytearray()
         while len(chunks) < n:
-            piece = self._stream.read(n - len(chunks))
+            piece = self._raw_read(n - len(chunks))
             if not piece:
                 break
             chunks.extend(piece)
@@ -256,35 +278,34 @@ class _TarBudgetStream:
         self._charge_metadata(512)
 
         typeflag = block[156:157]
-        try:
-            size = _parse_tar_size(block[124:136])
-        except ValueError as exc:
-            raise FetchError(f"Malformed tar header size field: {exc}") from exc
-        if size < 0:
-            raise FetchError("Negative size in tar header")
-        padded = ((size + 511) // 512) * 512
+        if typeflag in _TAR_EXTENDED_TYPEFLAGS:
+            raise FetchError(
+                f"Refusing tar PAX/GNU extended header (typeflag {typeflag!r}); "
+                "plain USTAR regular files and directories only"
+            )
+        if typeflag not in _TAR_ALLOWED_TYPEFLAGS:
+            raise FetchError(
+                f"Refusing non-regular tar member typeflag {typeflag!r}; "
+                "plain USTAR regular files and directories only"
+            )
+        if block[257:263] != _USTAR_MAGIC or block[263:265] != _USTAR_VERSION:
+            raise FetchError("Refusing non-USTAR tar header; plain USTAR format only")
 
-        if typeflag in _TAR_METADATA_TYPEFLAGS:
-            if size > self._max_single_metadata_bytes:
-                raise FetchError(
-                    f"Single tar metadata/PAX record ({size} bytes) exceeds limit "
-                    f"({self._max_single_metadata_bytes} bytes)"
-                )
-            self._charge_metadata(padded)
-            self._remaining_body = padded
-        elif typeflag in _TAR_REGULAR_TYPEFLAGS:
-            if size > self._max_member_bytes:
-                raise FetchError(
-                    f"Archive member size {size} exceeds per-member limit ({self._max_member_bytes})"
-                )
-            if self.payload_bytes + size > self._max_total_bytes:
-                raise FetchError(
-                    f"Archive expanded payload exceeds limit ({self._max_total_bytes} bytes)"
-                )
-            self.payload_bytes += size
-            self._remaining_body = padded
-        else:
-            raise FetchError(f"Refusing non-regular tar member typeflag {typeflag!r}")
+        size = _parse_ustar_octal_size(block[124:136])
+        if typeflag == b"5" and size != 0:
+            raise FetchError(f"Refusing tar directory header with non-zero size ({size})")
+        if size > self._max_member_bytes:
+            raise FetchError(
+                f"Archive member size {size} exceeds per-member limit ({self._max_member_bytes})"
+            )
+        if self.payload_bytes + size > self._max_total_bytes:
+            raise FetchError(
+                f"Archive expanded payload exceeds limit ({self._max_total_bytes} bytes)"
+            )
+        padded = ((size + 511) // 512) * 512
+        self._charge_metadata(padded - size)
+        self.payload_bytes += size
+        self._remaining_body = padded
         return block
 
     def read(self, size: int = -1) -> bytes:
@@ -299,7 +320,7 @@ class _TarBudgetStream:
                 del self._buf[:take]
             elif self._remaining_body > 0:
                 take = min(want - len(out), self._remaining_body)
-                piece = self._stream.read(take)
+                piece = self._raw_read(take)
                 if not piece:
                     break
                 out.extend(piece)
@@ -460,7 +481,10 @@ def _as_scalar_float(val: Any, what: str) -> float:
     arr = np.asarray(val)
     if arr.size != 1 or arr.dtype.kind not in "iuf":
         raise FetchError(f"{what}: expected numeric scalar")
-    return float(arr.reshape(-1)[0])
+    out = float(arr.reshape(-1)[0])
+    if not math.isfinite(out):
+        raise FetchError(f"{what}: non-finite numeric value {out!r} refused")
+    return out
 
 
 def _as_scalar_int(val: Any, what: str) -> int:
@@ -549,8 +573,9 @@ def _validate_var_attr_value(
         if kind != "thresholds":
             raise FetchError(f"{what}: tail_quantile only approved on thresholds")
         q = _as_scalar_float(val, what)
-        if abs(q - float(cfg.gate.tail_quantile)) > 1e-9:
-            raise FetchError(f"{what}: tail_quantile {q} != {cfg.gate.tail_quantile}")
+        expected_q = float(cfg.gate.tail_quantile)
+        if not (math.isfinite(q) and math.isfinite(expected_q) and q == expected_q):
+            raise FetchError(f"{what}: tail_quantile {q!r} != {expected_q!r}")
         return
 
     if attr_name == "train_end_utc":
@@ -636,8 +661,9 @@ def _validate_netcdf_root_attr_value(
     if kind == "thresholds":
         if attr_name == "tail_quantile":
             q = _as_scalar_float(val, what)
-            if abs(q - float(cfg.gate.tail_quantile)) > 1e-9:
-                raise FetchError(f"{what}: tail_quantile {q} != {cfg.gate.tail_quantile}")
+            expected_q = float(cfg.gate.tail_quantile)
+            if not (math.isfinite(q) and math.isfinite(expected_q) and q == expected_q):
+                raise FetchError(f"{what}: tail_quantile {q!r} != {expected_q!r}")
             return
         if attr_name == "train_end_utc":
             _validate_train_end_value(val, cfg, what)
@@ -1097,18 +1123,17 @@ def _safe_extract_archive(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     max_tar_headers: int | None = None,
     max_tar_metadata_bytes: int = DEFAULT_MAX_TAR_METADATA_BYTES,
-    max_single_tar_metadata_bytes: int = DEFAULT_MAX_SINGLE_TAR_METADATA_BYTES,
     max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
     max_readme_bytes: int = DEFAULT_MAX_README_BYTES,
     min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
 ) -> set[str]:
-    """Stream-extract regular files with independent tar metadata and payload budgets."""
+    """Stream-extract plain USTAR regular files/directories with strict stream and metadata budgets."""
     extracted_files: set[str] = set()
     staging_real = staging_dir.resolve(strict=True)
     member_count = 0
     total_written = 0
     header_limit = (
-        min(DEFAULT_MAX_TAR_HEADERS, max(max_members * 3, 16))
+        min(DEFAULT_MAX_TAR_HEADERS, max_members)
         if max_tar_headers is None
         else max_tar_headers
     )
@@ -1128,7 +1153,6 @@ def _safe_extract_archive(
                     decompressed,
                     max_headers=header_limit,
                     max_metadata_bytes=max_tar_metadata_bytes,
-                    max_single_metadata_bytes=max_single_tar_metadata_bytes,
                     max_member_bytes=max_member_bytes,
                     max_total_bytes=max_total_bytes,
                 )
@@ -1139,9 +1163,17 @@ def _safe_extract_archive(
                             raise FetchError(
                                 f"Archive exceeds maximum allowed member count ({max_members})"
                             )
+                        if member.pax_headers:
+                            raise FetchError(
+                                f"Refusing tar member with PAX extended headers: {member.name!r}"
+                            )
                         if member.issym() or member.islnk() or member.isdev() or member.isfifo():
                             raise FetchError(f"Refusing non-regular tar member: {member.name!r}")
-                        if not (member.isfile() or member.isdir()):
+                        if not (member.isfile() or member.isdir()) or member.type not in (
+                            tarfile.REGTYPE,
+                            tarfile.AREGTYPE,
+                            tarfile.DIRTYPE,
+                        ):
                             raise FetchError(f"Refusing unsupported tar member type: {member.name!r}")
                         clean_name = member.name.rstrip("/")
                         if not clean_name or clean_name == ".":
@@ -1556,7 +1588,6 @@ def fetch_scoring_data(
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
     max_tar_headers: int | None = None,
     max_tar_metadata_bytes: int = DEFAULT_MAX_TAR_METADATA_BYTES,
-    max_single_tar_metadata_bytes: int = DEFAULT_MAX_SINGLE_TAR_METADATA_BYTES,
     max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
     max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
@@ -1641,7 +1672,6 @@ def fetch_scoring_data(
             max_total_bytes=max_total_bytes,
             max_tar_headers=max_tar_headers,
             max_tar_metadata_bytes=max_tar_metadata_bytes,
-            max_single_tar_metadata_bytes=max_single_tar_metadata_bytes,
             max_manifest_bytes=max_manifest_bytes,
         )
         manifest = verify_staged_bundle(
