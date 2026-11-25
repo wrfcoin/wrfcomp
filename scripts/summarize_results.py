@@ -1,7 +1,8 @@
 """Summarise a candidate's official promotion records into one small JSON file.
 
 Reads only the committed records under results/<candidate>/<year>/promotion_*/ (the locked
-check's own output) and writes results/<candidate>/summary.json. Numbers are copied from the
+check's own output) and writes results/<candidate>/summary.json. With no argument, every
+candidate folder under results/ that holds promotion records is summarised. Numbers are copied from the
 scorecards, never recomputed, so anyone can trace each value to its source file.
 """
 
@@ -10,6 +11,12 @@ import json
 from pathlib import Path
 
 VARIABLES = ("t2m", "td2m", "u10", "v10", "msl")
+RESULTS = Path(__file__).resolve().parents[1] / "results"
+
+
+def candidate_dirs(results: Path = RESULTS) -> list[Path]:
+    """Every folder under ``results`` with at least one year's promotion decision."""
+    return sorted(p for p in results.iterdir() if p.is_dir() and any(p.glob("*/promotion_*/decision.json")))
 
 
 def summarize(candidate_dir: Path) -> dict:
@@ -48,12 +55,13 @@ def summarize(candidate_dir: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("candidate_dir", type=Path)
+    parser.add_argument("candidate_dir", type=Path, nargs="*", help="default: every candidate in results/")
     args = parser.parse_args()
-    summary = summarize(args.candidate_dir)
-    out = args.candidate_dir / "summary.json"
-    out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
-    print(out)
+    for candidate_dir in args.candidate_dir or candidate_dirs():
+        summary = summarize(candidate_dir)
+        out = candidate_dir / "summary.json"
+        out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        print(out)
 
 
 if __name__ == "__main__":

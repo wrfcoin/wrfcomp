@@ -1,0 +1,51 @@
+{
+  "baselines": [
+    "climatology",
+    "noaa-gefs"
+  ],
+  "candidate": {
+    "model_id": "gefs-station-corrected-own",
+    "model_version": "1"
+  },
+  "decision": "PROMOTED",
+  "harness_version": {
+    "scores": "2.7.0",
+    "wrfcomp": "0.1.0"
+  },
+  "promotion_rule_version": 2,
+  "protocol_version": "0.1.0",
+  "quarters": [
+    {
+      "period": "2023-Q1",
+      "reasons": [],
+      "result": "promotion_2023-Q1_cc9dacc8e14e8301",
+      "verdict": "PASSED",
+      "verdict_sha256": "cc9dacc8e14e83014db3df01d6c8d5cd4f5bcfb202b554cf81b8e89929574b05"
+    },
+    {
+      "period": "2023-Q2",
+      "reasons": [],
+      "result": "promotion_2023-Q2_9799376baacff3c2",
+      "verdict": "PASSED",
+      "verdict_sha256": "9799376baacff3c2c27686271b7209656276550b6656d9bf1ee156a52bfe90a1"
+    },
+    {
+      "period": "2023-Q3",
+      "reasons": [],
+      "result": "promotion_2023-Q3_f6b59ace7c459153",
+      "verdict": "PASSED",
+      "verdict_sha256": "f6b59ace7c45915343501334c037f1de4bd805ede1d20bead187e33a563f74c0"
+    },
+    {
+      "period": "2023-Q4",
+      "reasons": [],
+      "result": "promotion_2023-Q4_73c0d31c88edca4f",
+      "verdict": "PASSED",
+      "verdict_sha256": "73c0d31c88edca4f6b58df719ac2300ca4361ad09d8741771dcabb0363658f51"
+    }
+  ],
+  "quarters_passed": 4,
+  "quarters_required": 3,
+  "references_sha256": "116847d948447556a16d7514aa57cbf4262be3927b218045bd870ed5c4b9ac7e",
+  "year": 2023
+}
