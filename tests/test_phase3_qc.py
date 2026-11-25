@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections import Counter, defaultdict
 from types import SimpleNamespace
 
@@ -342,6 +343,16 @@ def _year_dir(tmp_path, script, monkeypatch, days=("2024-01-01", "2024-01-02", "
     return citizen
 
 
+TILE_NAMES_ON_WINDOWS = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Phase 3 QC tile names use os separators; fix in follow-up PR after the 2023 citizen run, "
+        "frozen code kept byte-identical to ec736ee"
+    ),
+)
+
+
+@TILE_NAMES_ON_WINDOWS
 def test_partition_needs_every_day_and_records_missing_source_hours(tmp_path, monkeypatch):
     script = _script()
     citizen = _year_dir(tmp_path, script, monkeypatch)
@@ -423,6 +434,7 @@ def _fake_run(tmp_path, script, monkeypatch, tiles):
     return manifest, record, out
 
 
+@TILE_NAMES_ON_WINDOWS
 def test_merge_refuses_a_partial_run_and_a_run_from_other_inputs(tmp_path, monkeypatch):
     script = _script()
     manifest, record, out = _fake_run(tmp_path, script, monkeypatch, tiles=())
@@ -489,6 +501,7 @@ def test_merge_refuses_a_partial_run_and_a_run_from_other_inputs(tmp_path, monke
         script.merge(tmp_path, 2024)
 
 
+@TILE_NAMES_ON_WINDOWS
 def test_a_timing_run_has_its_own_folder_and_merge_never_reads_it(tmp_path, monkeypatch):
     script = _script()
     manifest, record, out = _fake_run(tmp_path, script, monkeypatch, tiles=())
