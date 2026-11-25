@@ -14,6 +14,7 @@ from pofs_fixtures import recorded_epoch
 from wrfcomp.pofs_shadow import (
     MinerEntry,
     ShadowLedgerParams,
+    _mean_wasserstein,
 )
 
 DEFAULT_PARAMS = ShadowLedgerParams(alpha_slash=0.50)
@@ -542,6 +543,7 @@ def test_minimum_stake_spoiler_does_not_increase_combined_reward():
     rival = fx["innov2_fc"]
     control = recorded_epoch([original, MinerEntry("rival", 100, forecast=rival)], **kwargs)
     floor = DEFAULT_PARAMS.k_min
+    matched_control = recorded_epoch([original, MinerEntry("rival", 100 - floor, forecast=rival)], **kwargs)
     split = recorded_epoch(
         [
             original,
@@ -550,10 +552,10 @@ def test_minimum_stake_spoiler_does_not_increase_combined_reward():
         ],
         **kwargs,
     )
-    before, after = _by_id(control), _by_id(split)
+    before, matched, after = _by_id(control), _by_id(matched_control), _by_id(split)
     assert before["rival"].reward > 0 and before["first"].reward > 0
     assert after["copy"].status == "clone" and after["copy"].reward == 0
-    assert after["first"].delta_crps == before["first"].delta_crps
+    assert after["first"].delta_crps == matched["first"].delta_crps
     assert after["rival"].reward + after["copy"].reward <= before["rival"].reward
 
 
@@ -574,3 +576,545 @@ def test_below_minimum_commit_cannot_reserve_clone_slot(stake):
     payouts = _by_id(result)
     assert payouts["early"].status == "below_minimum"
     assert payouts["first_eligible"].reward == pytest.approx(POOL_AMOUNT)
+
+
+# ---------------------------------------------------------------------------
+# 7. Stake-weighted Meta-Ensemble vs 50 perturbed minimum-stake Sybil wallets
+# ---------------------------------------------------------------------------
+
+
+def _walsh_hadamard(order: int) -> np.ndarray:
+    mat = np.array([[1.0]], dtype=np.float64)
+    while mat.shape[0] < order:
+        mat = np.block([[mat, mat], [mat, -mat]])
+    return mat
+
+
+def test_fifty_min_stake_perturbed_sybils_do_not_distort_honest_delta_or_payout() -> None:
+    """50 minimum-stake wallets perturbed just outside clone tolerance cannot distort honest miners."""
+    n_obs = 256
+    fx = _make_synoptic_fixture(n_obs=n_obs, n_members=31)
+    gefs, obs, thr = fx["gefs_fc"], fx["obs"], fx["tail_thr"]
+
+    rng = np.random.default_rng(999)
+    innov3_mean = fx["signal"] + rng.normal(0.0, 0.6, size=n_obs)
+    innov3_fc = innov3_mean[:, None] + rng.normal(0.0, float(np.sqrt(1.0 + 0.6**2)), size=(n_obs, 31))
+
+    field_scale = max(float(np.sqrt(gefs.var(axis=1).mean())), float(np.std(obs)))
+    clone_tol = DEFAULT_PARAMS.clone_relative_tolerance * field_scale
+    hadamard = _walsh_hadamard(n_obs)
+    # Row-wise +-1.05*clone_tol Walsh-Hadamard perturbations sit 5% outside tolerance pairwise
+    # so all 50 minimum-stake wallets pass clone deduplication and enter the Meta-Ensemble.
+    copies = [innov3_fc + (1.05 * clone_tol) * hadamard[i + 1, :, None] for i in range(50)]
+    sorted_copies = [np.sort(c, axis=1) for c in copies]
+    min_pair_w1 = min(
+        _mean_wasserstein(sorted_copies[i], sorted_copies[j]) for i in range(50) for j in range(i + 1, 50)
+    )
+    assert min_pair_w1 > clone_tol
+
+    total_attacker_stake = 50.0 * DEFAULT_PARAMS.k_min
+    honest_1 = MinerEntry("honest_1", stake=2500.0, forecast=fx["innov1_fc"])
+    honest_2 = MinerEntry("honest_2", stake=2500.0, forecast=fx["innov2_fc"])
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=gefs,
+        obs=obs,
+        tail_threshold=thr,
+    )
+
+    single = recorded_epoch(
+        [honest_1, honest_2, MinerEntry("attacker", stake=total_attacker_stake, forecast=innov3_fc)],
+        **kwargs,
+    )
+    sybils = [MinerEntry(f"sybil_{i:02d}", stake=DEFAULT_PARAMS.k_min, forecast=copies[i]) for i in range(50)]
+    split = recorded_epoch([honest_1, honest_2, *sybils], **kwargs)
+
+    before, after = _by_id(single), _by_id(split)
+    admitted = [p for p in split.payouts if p.miner_id.startswith("sybil_") and p.status == "eligible"]
+    assert len(admitted) == 50
+
+    # Stated small tolerances compared with one wallet holding the same total stake (500):
+    # |Delta-CRPS change| <= 1e-3 and relative payout change <= 2%.
+    for name in ("honest_1", "honest_2"):
+        assert before[name].delta_crps is not None and after[name].delta_crps is not None
+        assert abs(after[name].delta_crps - before[name].delta_crps) <= 1e-3
+        assert abs(after[name].reward - before[name].reward) / before[name].reward <= 0.02
+
+    attacker_split_total = sum(p.reward for p in split.payouts if p.miner_id.startswith("sybil_"))
+    assert attacker_split_total <= before["attacker"].reward
+
+
+# ---------------------------------------------------------------------------
+# 8. Public promoted-candidate relays and consecutive-epoch nuisance slash
+# ---------------------------------------------------------------------------
+
+
+def test_public_promoted_candidate_first_relay_earns_zero_and_honest_still_earns() -> None:
+    """First relay of a public promoted candidate (e.g. v3) is a clone earning zero; honest earns."""
+    fx = _make_synoptic_fixture()
+    v3_public_fc = fx["innov2_fc"]  # calibrated forecast passing all GEFS gates
+    honest_fc = fx["innov1_fc"]
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=fx["gefs_fc"],
+        obs=fx["obs"],
+        tail_threshold=fx["tail_thr"],
+    )
+
+    # Control: without v3 configured as a public reference, relaying v3 would earn the full pool.
+    unlisted = recorded_epoch([MinerEntry("v3_relay", stake=100.0, forecast=v3_public_fc)], **kwargs)
+    assert _by_id(unlisted)["v3_relay"].status == "eligible"
+    assert _by_id(unlisted)["v3_relay"].reward == pytest.approx(POOL_AMOUNT)
+
+    # With v3 listed as a public reference, even the FIRST relay earns zero.
+    first_relay = recorded_epoch(
+        [MinerEntry("v3_relay", stake=100.0, forecast=v3_public_fc)],
+        public_references=[v3_public_fc],
+        **kwargs,
+    )
+    p_first = _by_id(first_relay)["v3_relay"]
+    assert p_first.status == "public_clone"
+    assert p_first.reward == 0.0
+    assert p_first.slash == 0.0
+    assert first_relay.unpaid_remainder == pytest.approx(POOL_AMOUNT)
+    assert first_relay.public_clone_streaks == {"v3_relay": 1}
+
+    # Perturbed copy of v3 inside clone tolerance (30 members or small jitter) is also caught.
+    jittered_v3 = v3_public_fc + np.random.default_rng(808).normal(0.0, 0.003, size=v3_public_fc.shape)
+    near_relays = recorded_epoch(
+        [
+            MinerEntry("v3_drop_member", stake=100.0, forecast=v3_public_fc[:, :-1]),
+            MinerEntry("v3_jitter", stake=100.0, forecast=jittered_v3),
+            MinerEntry("honest", stake=100.0, forecast=honest_fc),
+        ],
+        public_references=[v3_public_fc],
+        **kwargs,
+    )
+    honest_solo = recorded_epoch(
+        [MinerEntry("honest", stake=100.0, forecast=honest_fc)],
+        public_references=[v3_public_fc],
+        **kwargs,
+    )
+    by_near = _by_id(near_relays)
+    assert by_near["v3_drop_member"].status == "public_clone"
+    assert by_near["v3_drop_member"].reward == 0.0
+    assert by_near["v3_jitter"].status == "public_clone"
+    assert by_near["v3_jitter"].reward == 0.0
+    assert by_near["honest"].status == "eligible"
+    assert by_near["honest"].reward == pytest.approx(POOL_AMOUNT)
+    assert by_near["honest"] == _by_id(honest_solo)["honest"]
+
+
+def test_consecutive_public_reference_relays_incur_nuisance_slash_and_reset_on_honesty() -> None:
+    """Relaying a public reference in 2+ consecutive epochs triggers the small nuisance slash."""
+    fx = _make_synoptic_fixture()
+    v3_public_fc = fx["innov2_fc"]
+    honest_fc = fx["innov1_fc"]
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=fx["gefs_fc"],
+        obs=fx["obs"],
+        tail_threshold=fx["tail_thr"],
+        public_references=[v3_public_fc],
+    )
+
+    # Epoch 1: first relay of v3 -> earns 0, no slash yet (streak 1).
+    ep1 = recorded_epoch([MinerEntry("relayer", stake=100.0, forecast=v3_public_fc)], **kwargs)
+    assert _by_id(ep1)["relayer"].status == "public_clone"
+    assert _by_id(ep1)["relayer"].reward == 0.0
+    assert _by_id(ep1)["relayer"].slash == 0.0
+    assert ep1.public_clone_streaks == {"relayer": 1}
+
+    # Epoch 2 (consecutive): jittered relay of v3 -> earns 0 AND incurs 2% nuisance slash (streak 2).
+    jittered_v3 = v3_public_fc + np.random.default_rng(809).normal(0.0, 0.002, size=v3_public_fc.shape)
+    ep2 = recorded_epoch(
+        [MinerEntry("relayer", stake=100.0, forecast=jittered_v3)],
+        prior_public_clone_streaks=ep1.public_clone_streaks,
+        **kwargs,
+    )
+    expected_nuisance = 100.0 * DEFAULT_PARAMS.public_clone_slash
+    assert expected_nuisance <= 0.5 * DEFAULT_PARAMS.max_slash_cap * 100.0
+    assert _by_id(ep2)["relayer"].status == "public_clone"
+    assert _by_id(ep2)["relayer"].reward == 0.0
+    assert _by_id(ep2)["relayer"].slash == pytest.approx(expected_nuisance)
+    assert ep2.public_clone_streaks == {"relayer": 2}
+
+    # Epoch 3: wallet submits an honest independent forecast -> earns full pool and streak resets.
+    ep3 = recorded_epoch(
+        [MinerEntry("relayer", stake=100.0, forecast=honest_fc)],
+        prior_public_clone_streaks=ep2.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(ep3)["relayer"].status == "eligible"
+    assert _by_id(ep3)["relayer"].reward == pytest.approx(POOL_AMOUNT)
+    assert _by_id(ep3)["relayer"].slash == 0.0
+    assert ep3.public_clone_streaks == {}
+
+    # Epoch 4: single relay after honesty starts a fresh streak (no slash on first repeat).
+    ep4 = recorded_epoch(
+        [MinerEntry("relayer", stake=100.0, forecast=v3_public_fc)],
+        prior_public_clone_streaks=ep3.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(ep4)["relayer"].status == "public_clone"
+    assert _by_id(ep4)["relayer"].slash == 0.0
+    assert ep4.public_clone_streaks == {"relayer": 1}
+
+    # Raw GEFS relay over two consecutive epochs (no innovator present) also triggers nuisance slash.
+    gefs_ep1 = recorded_epoch([MinerEntry("gefs_spam", stake=100.0, forecast=fx["gefs_fc"])], **kwargs)
+    assert _by_id(gefs_ep1)["gefs_spam"].reward == 0.0
+    assert _by_id(gefs_ep1)["gefs_spam"].slash == 0.0
+    assert gefs_ep1.public_clone_streaks == {"gefs_spam": 1}
+    gefs_ep2 = recorded_epoch(
+        [MinerEntry("gefs_spam", stake=100.0, forecast=fx["gefs_fc"])],
+        prior_public_clone_streaks=gefs_ep1.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(gefs_ep2)["gefs_spam"].reward == 0.0
+    assert _by_id(gefs_ep2)["gefs_spam"].slash == pytest.approx(expected_nuisance)
+    assert gefs_ep2.public_clone_streaks == {"gefs_spam": 2}
+
+
+def test_negative_delta_splitter_cannot_dodge_slash_or_gain_reward_array_mode() -> None:
+    """Array mode: splitting a negative-Delta miner into 10 or 50 wallets cannot raise pay or cut slash."""
+    n_obs = 256
+    fx = _make_synoptic_fixture(n_obs=n_obs, n_members=31)
+    gefs, obs, thr = fx["gefs_fc"], fx["obs"], fx["tail_thr"]
+
+    field_scale = max(float(np.sqrt(gefs.var(axis=1).mean())), float(np.std(obs)))
+    clone_tol = DEFAULT_PARAMS.clone_relative_tolerance * field_scale
+    hadamard = _walsh_hadamard(n_obs)
+
+    # Shifted forecast: beats GEFS (passes gates) but is worse than the honest Meta-Ensemble (Delta < 0).
+    att_fc = fx["innov1_fc"] + 0.7
+    honest_1 = MinerEntry("honest_1", stake=2500.0, forecast=fx["innov1_fc"])
+    honest_2 = MinerEntry("honest_2", stake=2500.0, forecast=fx["innov2_fc"])
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=gefs,
+        obs=obs,
+        tail_threshold=thr,
+    )
+
+    total_stake = 500.0
+    unsplit = recorded_epoch(
+        [honest_1, honest_2, MinerEntry("attacker", stake=total_stake, forecast=att_fc)],
+        **kwargs,
+    )
+    by_unsplit = _by_id(unsplit)
+    assert by_unsplit["attacker"].status == "eligible"
+    assert by_unsplit["attacker"].delta_crps is not None and by_unsplit["attacker"].delta_crps < 0.0
+    unsplit_honest_total = by_unsplit["honest_1"].reward + by_unsplit["honest_2"].reward
+
+    for n_wallets in (10, 50):
+        copies = [att_fc + (1.05 * clone_tol) * hadamard[i + 1, :, None] for i in range(n_wallets)]
+        sybils = [
+            MinerEntry(f"sybil_{i:02d}", stake=total_stake / n_wallets, forecast=copies[i])
+            for i in range(n_wallets)
+        ]
+        split = recorded_epoch([honest_1, honest_2, *sybils], **kwargs)
+        by_split = _by_id(split)
+        admitted = [p for p in split.payouts if p.miner_id.startswith("sybil_") and p.status == "eligible"]
+        assert len(admitted) == n_wallets
+        split_reward = sum(p.reward for p in admitted)
+        split_slash = sum(p.slash for p in admitted)
+        split_honest_total = by_split["honest_1"].reward + by_split["honest_2"].reward
+        assert split_reward <= by_unsplit["attacker"].reward + 1e-12
+        assert split_slash >= by_unsplit["attacker"].slash - 1e-12
+        assert split_honest_total >= unsplit_honest_total - 1e-12
+
+
+def test_negative_delta_splitter_cannot_dodge_slash_or_gain_reward_scorecard_mode() -> None:
+    """Scorecard mode: splitting a negative-Delta whale into 10 or 50 wallets gives identical pay & slash."""
+    from pathlib import Path
+
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence, load_scorecard, settle_from_scorecards
+
+    ref = load_scorecard(Path(__file__).resolve().parents[2] / "experiments" / "gefs_2024-Q1.json")
+
+    def _make_card(model_id: str, digest: str, loss_scale: float):
+        d = ref.model_dump()
+        d["model_id"] = model_id
+        d["forecast_sha256"] = digest
+        d["baseline_id"] = "noaa-gefs"
+        d["baseline_sha256"] = ref.forecast_sha256
+        d["passed_gate"] = True
+        for var, leads in d["metrics"].items():
+            d["gates"][var] = dict.fromkeys(d["gates"][var], True)
+            row = leads["all"]
+            row["crpss_vs_baseline"] = 1.0 - loss_scale
+            row["crpss_vs_baseline_ecdf"] = 1.0 - loss_scale
+            row["spread_skill_ratio"] = 1.0
+            row["dm_pvalue"] = 0.001
+            row["twcrps_p95"] = 0.1
+            row["baseline_twcrps_p95"] = 0.2
+            for h in d["leads_scored"]:
+                leads[str(h)]["loss"] *= loss_scale
+        return type(ref).model_validate(d)
+
+    t = np.datetime64(ref.period_start)
+    honest = _make_card("honest", "a" * 64, 0.50)
+
+    for whale_loss, whale_stake, n_wallets in ((0.80, 100.0, 10), (0.60, 100.0, 10), (0.95, 500.0, 50)):
+        whale = _make_card("whale", "b" * 64, whale_loss)
+        ev_single = EpochEvidence(
+            t,
+            ref.forecast_sha256,
+            {
+                "honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s")),
+                "whale": Commitment(whale.forecast_sha256, t - np.timedelta64(9, "s")),
+            },
+        )
+        res_single = settle_from_scorecards(
+            {"gefs": ref, "honest": honest, "whale": whale},
+            baseline_key="gefs",
+            pool_amount=POOL_AMOUNT,
+            params=DEFAULT_PARAMS,
+            stakes={"gefs": 100.0, "honest": 500.0, "whale": whale_stake},
+            evidence=ev_single,
+        )
+
+        split_cards = {"gefs": ref, "honest": honest}
+        split_stakes = {"gefs": 100.0, "honest": 500.0}
+        split_receipts = {"honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s"))}
+        for idx in range(n_wallets):
+            key = f"sybil_{idx:02d}"
+            card = _make_card(key, f"{idx + 100:064x}", whale_loss)
+            split_cards[key] = card
+            split_stakes[key] = whale_stake / n_wallets
+            split_receipts[key] = Commitment(card.forecast_sha256, t - np.timedelta64(8, "s"))
+
+        res_split = settle_from_scorecards(
+            split_cards,
+            baseline_key="gefs",
+            pool_amount=POOL_AMOUNT,
+            params=DEFAULT_PARAMS,
+            stakes=split_stakes,
+            evidence=EpochEvidence(t, ref.forecast_sha256, split_receipts),
+        )
+        by_single, by_split = _by_id(res_single), _by_id(res_split)
+        assert by_single["whale"].status == "eligible"
+        assert by_single["whale"].delta_crps is not None and by_single["whale"].delta_crps < 0.0
+        sybil_payouts = [p for p in res_split.payouts if p.miner_id.startswith("sybil_")]
+        assert len(sybil_payouts) == n_wallets and all(p.status == "eligible" for p in sybil_payouts)
+        assert sum(p.reward for p in sybil_payouts) == pytest.approx(
+            by_single["whale"].reward, rel=1e-11, abs=1e-11
+        )
+        assert sum(p.slash for p in sybil_payouts) == pytest.approx(
+            by_single["whale"].slash, rel=1e-11, abs=1e-11
+        )
+        assert by_split["honest"].reward == pytest.approx(by_single["honest"].reward, rel=1e-11, abs=1e-11)
+
+
+def test_skipping_epochs_does_not_reset_public_clone_streak() -> None:
+    """Relaying a public reference every other epoch (skipping in between) still triggers nuisance slash."""
+    fx = _make_synoptic_fixture()
+    v3_public_fc = fx["innov2_fc"]
+    honest_fc = fx["innov1_fc"]
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=fx["gefs_fc"],
+        obs=fx["obs"],
+        tail_threshold=fx["tail_thr"],
+        public_references=[v3_public_fc],
+    )
+    expected_nuisance = 100.0 * DEFAULT_PARAMS.public_clone_slash
+
+    # Epoch 1: relayer submits v3 -> streak 1, no slash yet.
+    ep1 = recorded_epoch(
+        [
+            MinerEntry("honest", stake=100.0, forecast=honest_fc),
+            MinerEntry("relayer", stake=100.0, forecast=v3_public_fc),
+        ],
+        **kwargs,
+    )
+    assert _by_id(ep1)["relayer"].status == "public_clone"
+    assert _by_id(ep1)["relayer"].slash == 0.0
+    assert ep1.public_clone_streaks == {"relayer": 1}
+
+    # Epoch 2: relayer skips the epoch entirely -> streak MUST NOT reset.
+    ep2 = recorded_epoch(
+        [MinerEntry("honest", stake=100.0, forecast=honest_fc)],
+        prior_public_clone_streaks=ep1.public_clone_streaks,
+        **kwargs,
+    )
+    assert ep2.public_clone_streaks == {"relayer": 1}
+
+    # Epoch 3: relayer submits v3 again (every-other-epoch pattern) -> streak 2, nuisance slash fires!
+    ep3 = recorded_epoch(
+        [
+            MinerEntry("honest", stake=100.0, forecast=honest_fc),
+            MinerEntry("relayer", stake=100.0, forecast=v3_public_fc),
+        ],
+        prior_public_clone_streaks=ep2.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(ep3)["relayer"].status == "public_clone"
+    assert _by_id(ep3)["relayer"].reward == 0.0
+    assert _by_id(ep3)["relayer"].slash == pytest.approx(expected_nuisance)
+    assert ep3.public_clone_streaks == {"relayer": 2}
+
+    # Epoch 4: attempting a below-minimum dust submission does NOT reset the streak either.
+    ep4 = recorded_epoch(
+        [
+            MinerEntry("honest", stake=100.0, forecast=honest_fc),
+            MinerEntry("relayer", stake=1.0, forecast=honest_fc),
+        ],
+        prior_public_clone_streaks=ep3.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(ep4)["relayer"].status == "below_minimum"
+    assert ep4.public_clone_streaks == {"relayer": 2}
+
+    # Epoch 5: submitting an actual valid non-clone forecast resets the streak.
+    ep5 = recorded_epoch(
+        [MinerEntry("relayer", stake=100.0, forecast=honest_fc)],
+        prior_public_clone_streaks=ep4.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(ep5)["relayer"].status == "eligible"
+    assert _by_id(ep5)["relayer"].slash == 0.0
+    assert ep5.public_clone_streaks == {}
+
+
+def test_cheap_spoiler_cannot_lift_attacker_in_scorecard_mode() -> None:
+    """Scorecard mode: a 10- or 30-stake negative-score spoiler cannot lift an attacker's net pay."""
+    from pathlib import Path
+
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence, load_scorecard, settle_from_scorecards
+
+    ref = load_scorecard(Path(__file__).resolve().parents[2] / "experiments" / "gefs_2024-Q1.json")
+
+    def _make_card(model_id: str, digest: str, loss_scale: float):
+        d = ref.model_dump()
+        d["model_id"] = model_id
+        d["forecast_sha256"] = digest
+        d["baseline_id"] = "noaa-gefs"
+        d["baseline_sha256"] = ref.forecast_sha256
+        d["passed_gate"] = True
+        for var, leads in d["metrics"].items():
+            d["gates"][var] = dict.fromkeys(d["gates"][var], True)
+            row = leads["all"]
+            row["crpss_vs_baseline"] = 1.0 - loss_scale
+            row["crpss_vs_baseline_ecdf"] = 1.0 - loss_scale
+            row["spread_skill_ratio"] = 1.0
+            row["dm_pvalue"] = 0.001
+            row["twcrps_p95"] = 0.1
+            row["baseline_twcrps_p95"] = 0.2
+            for h in d["leads_scored"]:
+                leads[str(h)]["loss"] *= loss_scale
+        return type(ref).model_validate(d)
+
+    t = np.datetime64(ref.period_start)
+    honest = _make_card("honest", "a" * 64, 0.50)
+    attacker = _make_card("attacker", "b" * 64, 0.52)
+    spoiler = _make_card("spoiler", "c" * 64, 0.95)
+
+    ev_alone = EpochEvidence(
+        t,
+        ref.forecast_sha256,
+        {
+            "honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s")),
+            "attacker": Commitment(attacker.forecast_sha256, t - np.timedelta64(9, "s")),
+        },
+    )
+    res_alone = settle_from_scorecards(
+        {"gefs": ref, "honest": honest, "attacker": attacker},
+        baseline_key="gefs",
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        stakes={"gefs": 100.0, "honest": 500.0, "attacker": 100.0},
+        evidence=ev_alone,
+    )
+    by_alone = _by_id(res_alone)
+    alone_net = by_alone["attacker"].reward - by_alone["attacker"].slash
+    assert alone_net > 0.0
+
+    for spoiler_stake in (10.0, 30.0):
+        ev_sp = EpochEvidence(
+            t,
+            ref.forecast_sha256,
+            {
+                "honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s")),
+                "attacker": Commitment(attacker.forecast_sha256, t - np.timedelta64(9, "s")),
+                "spoiler": Commitment(spoiler.forecast_sha256, t - np.timedelta64(8, "s")),
+            },
+        )
+        res_sp = settle_from_scorecards(
+            {"gefs": ref, "honest": honest, "attacker": attacker, "spoiler": spoiler},
+            baseline_key="gefs",
+            pool_amount=POOL_AMOUNT,
+            params=DEFAULT_PARAMS,
+            stakes={"gefs": 100.0, "honest": 500.0, "attacker": 100.0, "spoiler": spoiler_stake},
+            evidence=ev_sp,
+        )
+        by_sp = _by_id(res_sp)
+        assert by_sp["spoiler"].status == "eligible"
+        assert by_sp["spoiler"].composite_score is not None and by_sp["spoiler"].composite_score < 0.0
+        assert by_sp["spoiler"].reward == 0.0
+        assert by_sp["spoiler"].slash == pytest.approx(DEFAULT_PARAMS.max_slash_cap * spoiler_stake)
+        assert by_sp["honest"].delta_crps == pytest.approx(by_alone["honest"].delta_crps, abs=1e-12)
+        assert by_sp["honest"].reward == pytest.approx(by_alone["honest"].reward, abs=1e-12)
+        assert by_sp["attacker"].reward == pytest.approx(by_alone["attacker"].reward, abs=1e-12)
+        combined_net = (
+            by_sp["attacker"].reward
+            - by_sp["attacker"].slash
+            + by_sp["spoiler"].reward
+            - by_sp["spoiler"].slash
+        )
+        assert combined_net < alone_net
+
+
+def test_cheap_spoiler_cannot_lift_attacker_in_array_mode() -> None:
+    """Array mode: a 10- or 30-stake negative-score spoiler cannot distort honest pay or lift attacker."""
+    rng = np.random.default_rng(202411)
+    n_obs, n_members = 256, 31
+    signal = rng.normal(0.0, 2.0, size=n_obs)
+    obs = signal + rng.normal(0.0, 1.0, size=n_obs)
+    thr = np.full(n_obs, float(np.quantile(obs, 0.95)), dtype=np.float64)
+
+    gefs_fc = (signal + rng.normal(0.0, 1.8, size=n_obs))[:, None] + rng.normal(
+        0.0, float(np.sqrt(1.0 + 1.8**2)), size=(n_obs, n_members)
+    )
+    h_mean = signal + rng.normal(0.0, 0.25, size=n_obs)
+    h_fc = h_mean[:, None] + rng.normal(0.0, float(np.sqrt(1.0 + 0.25**2)), size=(n_obs, n_members))
+    h_anom = (h_fc - h_fc.mean(axis=1, keepdims=True)) / float(np.sqrt(1.0 + 0.25**2))
+    a_fc = (h_mean + 0.25)[:, None] + h_anom * float(np.sqrt(1.0 + 0.25**2 + 0.25**2))
+    # Shifted calibrated spoiler: passes all GEFS gates (eligible) yet hurts M_all (score < 0).
+    sp_fc = (h_mean + 1.40)[:, None] + h_anom * float(np.sqrt(1.0 + 0.25**2 + 1.40**2))
+
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=gefs_fc,
+        obs=obs,
+        tail_threshold=thr,
+    )
+    alone = recorded_epoch(
+        [MinerEntry("honest", 500.0, forecast=h_fc), MinerEntry("attacker", 100.0, forecast=a_fc)], **kwargs
+    )
+    by_alone = _by_id(alone)
+    assert by_alone["attacker"].reward > 0.0
+
+    for sp_stake in (10.0, 30.0):
+        with_sp = recorded_epoch(
+            [
+                MinerEntry("honest", 500.0, forecast=h_fc),
+                MinerEntry("attacker", 100.0, forecast=a_fc),
+                MinerEntry("spoiler", sp_stake, forecast=sp_fc),
+            ],
+            **kwargs,
+        )
+        by_sp = _by_id(with_sp)
+        assert by_sp["spoiler"].status == "eligible"
+        assert by_sp["spoiler"].composite_score is not None and by_sp["spoiler"].composite_score < 0.0
+        assert by_sp["spoiler"].reward == 0.0 and by_sp["spoiler"].slash > 0.0
+        assert by_sp["honest"].delta_crps == pytest.approx(by_alone["honest"].delta_crps, abs=1e-12)
+        assert by_sp["honest"].reward == pytest.approx(by_alone["honest"].reward, abs=1e-12)
+        assert by_sp["attacker"].reward == pytest.approx(by_alone["attacker"].reward, abs=1e-12)
+        assert by_sp["attacker"].reward - by_sp["spoiler"].slash < by_alone["attacker"].reward

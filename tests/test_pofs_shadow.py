@@ -42,8 +42,21 @@ def test_params_frozen_defaults_and_required_alpha_slash() -> None:
     assert params.max_slash_cap == 0.10
     assert params.stake_exponent == 1.0
     assert params.k_min == 10.0
+    assert params.public_clone_slash == 0.02
+    assert params.public_clone_consecutive_epochs == 2
     assert params.h3_cell_cap == 1
     assert params.alpha_slash == 0.5
+
+    with pytest.raises(ValueError, match="public_clone_slash"):
+        ShadowLedgerParams(alpha_slash=0.5, public_clone_slash=0.06)  # > 0.5 * max_slash_cap
+    with pytest.raises(ValueError, match="public_clone_slash"):
+        ShadowLedgerParams(alpha_slash=0.5, public_clone_slash=-0.01)
+    with pytest.raises(ValueError, match="public_clone_slash"):
+        ShadowLedgerParams(alpha_slash=0.5, public_clone_slash=float("nan"))
+    with pytest.raises(ValueError, match="public_clone_consecutive_epochs"):
+        ShadowLedgerParams(alpha_slash=0.5, public_clone_consecutive_epochs=1)
+    with pytest.raises(ValueError, match="public_clone_consecutive_epochs"):
+        ShadowLedgerParams(alpha_slash=0.5, public_clone_consecutive_epochs=True)  # type: ignore[arg-type]
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         params.w_delta = 0.5  # type: ignore[misc]
@@ -637,3 +650,196 @@ def test_rowwise_wasserstein_uses_member_probability_mass():
     # First row moves 1/6 of its mass by 3; second row is identical.
     assert _mean_wasserstein(left, right) == pytest.approx(0.25)
     assert _mean_wasserstein(right, left) == pytest.approx(0.25)
+
+
+def test_stake_weighted_mixture_split_invariance_in_scorecard_mode():
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence
+
+    ref = load_scorecard(EXPERIMENTS_DIR / "gefs_2024-Q1.json")
+
+    def _make_passing_card(model_id: str, digest_char: str, loss_scale: float):
+        d = ref.model_dump()
+        d["model_id"] = model_id
+        d["forecast_sha256"] = digest_char * 64
+        d["baseline_id"] = "noaa-gefs"
+        d["baseline_sha256"] = ref.forecast_sha256
+        d["passed_gate"] = True
+        for var, leads in d["metrics"].items():
+            d["gates"][var] = dict.fromkeys(d["gates"][var], True)
+            row = leads["all"]
+            row["crpss_vs_baseline"] = 1.0 - loss_scale
+            row["crpss_vs_baseline_ecdf"] = 1.0 - loss_scale
+            row["spread_skill_ratio"] = 1.0
+            row["dm_pvalue"] = 0.001
+            row["twcrps_p95"] = 0.1
+            row["baseline_twcrps_p95"] = 0.2
+            for h in d["leads_scored"]:
+                leads[str(h)]["loss"] *= loss_scale
+        return type(ref).model_validate(d)
+
+    honest = _make_passing_card("honest", "a", 0.70)
+    whale = _make_passing_card("whale", "b", 0.80)
+    t = np.datetime64(ref.period_start)
+
+    single_receipts = {
+        "honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s")),
+        "whale": Commitment(whale.forecast_sha256, t - np.timedelta64(9, "s")),
+    }
+    res_single = settle_from_scorecards(
+        {"gefs": ref, "honest": honest, "whale": whale},
+        baseline_key="gefs",
+        pool_amount=550.0,
+        params=ShadowLedgerParams(alpha_slash=0.5),
+        stakes={"gefs": 100.0, "honest": 500.0, "whale": 100.0},
+        evidence=EpochEvidence(t, ref.forecast_sha256, single_receipts),
+    )
+
+    # Split whale's 100 stake across 10 distinct-hash wallets of 10 stake each with identical loss:
+    # linear stake weights keep meta_ensemble_loss and honest's delta_crps exact!
+    split_cards = {"gefs": ref, "honest": honest}
+    split_stakes = {"gefs": 100.0, "honest": 500.0}
+    split_receipts = {"honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s"))}
+    for idx in range(10):
+        c = _make_passing_card(f"sybil_{idx}", f"{idx:x}", 0.80)
+        key = f"sybil_{idx}"
+        split_cards[key] = c
+        split_stakes[key] = 10.0
+        split_receipts[key] = Commitment(c.forecast_sha256, t - np.timedelta64(9 - idx // 2, "s"))
+
+    res_split = settle_from_scorecards(
+        split_cards,
+        baseline_key="gefs",
+        pool_amount=550.0,
+        params=ShadowLedgerParams(alpha_slash=0.5),
+        stakes=split_stakes,
+        evidence=EpochEvidence(t, ref.forecast_sha256, split_receipts),
+    )
+    h_single = next(p for p in res_single.payouts if p.miner_id == "honest")
+    h_split = next(p for p in res_split.payouts if p.miner_id == "honest")
+    assert res_split.meta_ensemble_loss == pytest.approx(res_single.meta_ensemble_loss, abs=1e-12)
+    assert h_split.delta_crps == pytest.approx(h_single.delta_crps, abs=1e-12)
+
+
+def test_committed_v3_quarterly_replay_blocks_public_relay_and_slashes_repeats():
+    import json
+
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence
+
+    results_dir = Path(__file__).resolve().parents[1] / "results" / "gefs-station-corrected-v3"
+    summary = json.loads((results_dir / "summary.json").read_text(encoding="utf-8"))
+    params = ShadowLedgerParams(alpha_slash=0.5)
+    streaks: dict[str, int] = {}
+
+    for idx, quarter in enumerate(("2024-Q1", "2024-Q2", "2024-Q3", "2024-Q4")):
+        gefs_sc = load_scorecard(EXPERIMENTS_DIR / f"gefs_{quarter}.json")
+        v3_path = (
+            Path(__file__).resolve().parents[1]
+            / summary["years"]["2024"]["quarters"][quarter]["references"]["noaa-gefs"]["source"]
+        )
+        v3_sc = load_scorecard(v3_path)
+        t = np.datetime64(gefs_sc.period_start)
+        receipts = {
+            "noaa-gefs": Commitment(gefs_sc.forecast_sha256, t - np.timedelta64(60, "s")),
+            "v3-relay": Commitment(v3_sc.forecast_sha256, t - np.timedelta64(30, "s")),
+        }
+        ev = EpochEvidence(
+            t,
+            gefs_sc.forecast_sha256,
+            receipts,
+            public_reference_digests=(v3_sc.forecast_sha256,),
+        )
+        res = settle_from_scorecards(
+            {"noaa-gefs": gefs_sc, "v3-relay": v3_sc},
+            baseline_key="noaa-gefs",
+            pool_amount=550.0,
+            params=params,
+            stakes=100.0,
+            evidence=ev,
+            public_references=[v3_sc],
+            prior_public_clone_streaks=streaks,
+        )
+        streaks = dict(res.public_clone_streaks)
+        by_id = {p.miner_id: p for p in res.payouts}
+        assert by_id["v3-relay"].reward == 0.0
+        assert by_id["noaa-gefs"].reward == 0.0
+        assert res.unpaid_remainder == pytest.approx(550.0)
+        expected_status = "public_clone" if quarter != "2024-Q4" else "gefs_gate"
+        assert by_id["v3-relay"].status == expected_status
+        expected_slash = 0.0 if idx == 0 else 2.0
+        assert by_id["v3-relay"].slash == pytest.approx(expected_slash)
+        assert by_id["noaa-gefs"].slash == pytest.approx(expected_slash)
+        assert streaks == {"noaa-gefs": idx + 1, "v3-relay": idx + 1}
+
+
+def test_public_reference_and_streak_validation_guards():
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence
+
+    ref = load_scorecard(EXPERIMENTS_DIR / "gefs_2024-Q1.json")
+    t = np.datetime64(ref.period_start)
+    params = ShadowLedgerParams(alpha_slash=0.5)
+
+    with pytest.raises(ValueError, match="invalid SHA-256"):
+        EpochEvidence(t, ref.forecast_sha256, {}, public_reference_digests=("not-hex",))
+
+    with pytest.raises(ValueError, match="public_references must be a sequence or mapping"):
+        settle_from_scorecards(
+            {"gefs": ref},
+            baseline_key="gefs",
+            pool_amount=550.0,
+            params=params,
+            public_references=ref.forecast_sha256,  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValueError, match="public_references must be a sequence or mapping"):
+        settle_compute_pool(
+            [MinerEntry("m", 100.0)],
+            pool_amount=550.0,
+            params=params,
+            baseline_loss=1.0,
+            obs=np.array([1.0, 2.0]),
+            public_references=np.ones((2, 2)),  # type: ignore[arg-type]
+        )
+
+    with pytest.raises(ValueError, match="prior_public_clone_streaks"):
+        settle_from_scorecards(
+            {"gefs": ref},
+            baseline_key="gefs",
+            pool_amount=550.0,
+            params=params,
+            prior_public_clone_streaks={"w": -1},
+        )
+
+    with pytest.raises(ValueError, match="prior_public_clone_streaks"):
+        settle_from_scorecards(
+            {"gefs": ref},
+            baseline_key="gefs",
+            pool_amount=550.0,
+            params=params,
+            prior_public_clone_streaks={"w": True},  # type: ignore[dict-item]
+        )
+
+    ev = EpochEvidence(
+        t,
+        ref.forecast_sha256,
+        {"gefs": Commitment(ref.forecast_sha256, t - np.timedelta64(5, "s"))},
+        public_reference_digests=("a" * 64,),
+    )
+    with pytest.raises(ValueError, match="do not match epoch public_reference_digests"):
+        settle_from_scorecards(
+            {"gefs": ref},
+            baseline_key="gefs",
+            pool_amount=550.0,
+            params=params,
+            evidence=ev,
+            public_references=["b" * 64],
+        )
+
+    # Zero-streak entries passed in prior_public_clone_streaks are pruned and never retained.
+    pruned = settle_from_scorecards(
+        {"gefs": ref},
+        baseline_key="gefs",
+        pool_amount=550.0,
+        params=params,
+        prior_public_clone_streaks={"stale_zero": 0},
+    )
+    assert pruned.public_clone_streaks == {}
