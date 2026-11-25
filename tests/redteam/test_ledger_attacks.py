@@ -980,3 +980,141 @@ def test_skipping_epochs_does_not_reset_public_clone_streak() -> None:
     assert _by_id(ep5)["relayer"].status == "eligible"
     assert _by_id(ep5)["relayer"].slash == 0.0
     assert ep5.public_clone_streaks == {}
+
+
+def test_cheap_spoiler_cannot_lift_attacker_in_scorecard_mode() -> None:
+    """Scorecard mode: a 10- or 30-stake negative-score spoiler cannot lift an attacker's net pay."""
+    from pathlib import Path
+
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence, load_scorecard, settle_from_scorecards
+
+    ref = load_scorecard(Path(__file__).resolve().parents[2] / "experiments" / "gefs_2024-Q1.json")
+
+    def _make_card(model_id: str, digest: str, loss_scale: float):
+        d = ref.model_dump()
+        d["model_id"] = model_id
+        d["forecast_sha256"] = digest
+        d["baseline_id"] = "noaa-gefs"
+        d["baseline_sha256"] = ref.forecast_sha256
+        d["passed_gate"] = True
+        for var, leads in d["metrics"].items():
+            d["gates"][var] = dict.fromkeys(d["gates"][var], True)
+            row = leads["all"]
+            row["crpss_vs_baseline"] = 1.0 - loss_scale
+            row["crpss_vs_baseline_ecdf"] = 1.0 - loss_scale
+            row["spread_skill_ratio"] = 1.0
+            row["dm_pvalue"] = 0.001
+            row["twcrps_p95"] = 0.1
+            row["baseline_twcrps_p95"] = 0.2
+            for h in d["leads_scored"]:
+                leads[str(h)]["loss"] *= loss_scale
+        return type(ref).model_validate(d)
+
+    t = np.datetime64(ref.period_start)
+    honest = _make_card("honest", "a" * 64, 0.50)
+    attacker = _make_card("attacker", "b" * 64, 0.52)
+    spoiler = _make_card("spoiler", "c" * 64, 0.95)
+
+    ev_alone = EpochEvidence(
+        t,
+        ref.forecast_sha256,
+        {
+            "honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s")),
+            "attacker": Commitment(attacker.forecast_sha256, t - np.timedelta64(9, "s")),
+        },
+    )
+    res_alone = settle_from_scorecards(
+        {"gefs": ref, "honest": honest, "attacker": attacker},
+        baseline_key="gefs",
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        stakes={"gefs": 100.0, "honest": 500.0, "attacker": 100.0},
+        evidence=ev_alone,
+    )
+    by_alone = _by_id(res_alone)
+    alone_net = by_alone["attacker"].reward - by_alone["attacker"].slash
+    assert alone_net > 0.0
+
+    for spoiler_stake in (10.0, 30.0):
+        ev_sp = EpochEvidence(
+            t,
+            ref.forecast_sha256,
+            {
+                "honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s")),
+                "attacker": Commitment(attacker.forecast_sha256, t - np.timedelta64(9, "s")),
+                "spoiler": Commitment(spoiler.forecast_sha256, t - np.timedelta64(8, "s")),
+            },
+        )
+        res_sp = settle_from_scorecards(
+            {"gefs": ref, "honest": honest, "attacker": attacker, "spoiler": spoiler},
+            baseline_key="gefs",
+            pool_amount=POOL_AMOUNT,
+            params=DEFAULT_PARAMS,
+            stakes={"gefs": 100.0, "honest": 500.0, "attacker": 100.0, "spoiler": spoiler_stake},
+            evidence=ev_sp,
+        )
+        by_sp = _by_id(res_sp)
+        assert by_sp["spoiler"].status == "eligible"
+        assert by_sp["spoiler"].composite_score is not None and by_sp["spoiler"].composite_score < 0.0
+        assert by_sp["spoiler"].reward == 0.0
+        assert by_sp["spoiler"].slash == pytest.approx(DEFAULT_PARAMS.max_slash_cap * spoiler_stake)
+        assert by_sp["honest"].delta_crps == pytest.approx(by_alone["honest"].delta_crps, abs=1e-12)
+        assert by_sp["honest"].reward == pytest.approx(by_alone["honest"].reward, abs=1e-12)
+        assert by_sp["attacker"].reward == pytest.approx(by_alone["attacker"].reward, abs=1e-12)
+        combined_net = (
+            by_sp["attacker"].reward
+            - by_sp["attacker"].slash
+            + by_sp["spoiler"].reward
+            - by_sp["spoiler"].slash
+        )
+        assert combined_net < alone_net
+
+
+def test_cheap_spoiler_cannot_lift_attacker_in_array_mode() -> None:
+    """Array mode: a 10- or 30-stake negative-score spoiler cannot distort honest pay or lift attacker."""
+    rng = np.random.default_rng(202411)
+    n_obs, n_members = 256, 31
+    signal = rng.normal(0.0, 2.0, size=n_obs)
+    obs = signal + rng.normal(0.0, 1.0, size=n_obs)
+    thr = np.full(n_obs, float(np.quantile(obs, 0.95)), dtype=np.float64)
+
+    gefs_fc = (signal + rng.normal(0.0, 1.8, size=n_obs))[:, None] + rng.normal(
+        0.0, float(np.sqrt(1.0 + 1.8**2)), size=(n_obs, n_members)
+    )
+    h_mean = signal + rng.normal(0.0, 0.25, size=n_obs)
+    h_fc = h_mean[:, None] + rng.normal(0.0, float(np.sqrt(1.0 + 0.25**2)), size=(n_obs, n_members))
+    h_anom = (h_fc - h_fc.mean(axis=1, keepdims=True)) / float(np.sqrt(1.0 + 0.25**2))
+    a_fc = (h_mean + 0.25)[:, None] + h_anom * float(np.sqrt(1.0 + 0.25**2 + 0.25**2))
+    # Shifted calibrated spoiler: passes all GEFS gates (eligible) yet hurts M_all (score < 0).
+    sp_fc = (h_mean + 1.40)[:, None] + h_anom * float(np.sqrt(1.0 + 0.25**2 + 1.40**2))
+
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=gefs_fc,
+        obs=obs,
+        tail_threshold=thr,
+    )
+    alone = recorded_epoch(
+        [MinerEntry("honest", 500.0, forecast=h_fc), MinerEntry("attacker", 100.0, forecast=a_fc)], **kwargs
+    )
+    by_alone = _by_id(alone)
+    assert by_alone["attacker"].reward > 0.0
+
+    for sp_stake in (10.0, 30.0):
+        with_sp = recorded_epoch(
+            [
+                MinerEntry("honest", 500.0, forecast=h_fc),
+                MinerEntry("attacker", 100.0, forecast=a_fc),
+                MinerEntry("spoiler", sp_stake, forecast=sp_fc),
+            ],
+            **kwargs,
+        )
+        by_sp = _by_id(with_sp)
+        assert by_sp["spoiler"].status == "eligible"
+        assert by_sp["spoiler"].composite_score is not None and by_sp["spoiler"].composite_score < 0.0
+        assert by_sp["spoiler"].reward == 0.0 and by_sp["spoiler"].slash > 0.0
+        assert by_sp["honest"].delta_crps == pytest.approx(by_alone["honest"].delta_crps, abs=1e-12)
+        assert by_sp["honest"].reward == pytest.approx(by_alone["honest"].reward, abs=1e-12)
+        assert by_sp["attacker"].reward == pytest.approx(by_alone["attacker"].reward, abs=1e-12)
+        assert by_sp["attacker"].reward - by_sp["spoiler"].slash < by_alone["attacker"].reward

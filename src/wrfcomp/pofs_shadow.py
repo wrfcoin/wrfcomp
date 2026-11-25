@@ -186,7 +186,9 @@ class ComputePoolSettlement:
         object.__setattr__(
             self,
             "public_clone_streaks",
-            MappingProxyType(dict(sorted(self.public_clone_streaks.items()))),
+            MappingProxyType(
+                {k: v for k, v in sorted(self.public_clone_streaks.items()) if v > 0}
+            ),
         )
 
 
@@ -727,8 +729,46 @@ def _settle(
             winners.append(k)
     winners.sort()
     stakes_by_id = {m.miner_id: float(m.stake) for m in ordered}
-    total_winner_stake = math.fsum(stakes_by_id[j] for j in winners)
-    meta = mixture(winners) if winners else None
+
+    def _score_eligible(
+        pool_ids: list[str],
+    ) -> tuple[float | None, dict[str, float], dict[str, float]]:
+        if not pool_ids:
+            return None, {}, {}
+        m_loss = mixture(pool_ids)
+        tot_s = math.fsum(stakes_by_id[j] for j in pool_ids)
+        d_out: dict[str, float] = {}
+        s_out: dict[str, float] = {}
+        for j in pool_ids:
+            crpss_j = 1.0 - losses[j] / baseline
+            others = [x for x in pool_ids if x != j]
+            if others:
+                share = stakes_by_id[j] / tot_s
+                d_j = ((1.0 - share) / share) * (mixture(others) - m_loss) / baseline
+            else:
+                d_j = (baseline - m_loss) / baseline
+            d_out[j] = d_j
+            s_out[j] = (1.0 - params.w_delta) * crpss_j + params.w_delta * d_j
+        return m_loss, d_out, s_out
+
+    # Deterministic multi-pass (two passes in the common case, iterated to fixed point):
+    # exclude eligible wallets whose composite score is negative (slashed spoilers) from
+    # the reference Meta-Ensemble so a cheap spoiler cannot lift another winner's Delta,
+    # while preserving each excluded spoiler's own negative-score slash from its first pass.
+    core = list(winners)
+    dropped_scores: dict[str, tuple[float, float]] = {}
+    while len(core) >= 2:
+        _, pass_deltas, pass_scores = _score_eligible(core)
+        neg_score = [j for j in core if pass_scores[j] < 0.0]
+        if not neg_score or len(neg_score) == len(core):
+            break
+        for j in neg_score:
+            dropped_scores[j] = (pass_deltas[j], pass_scores[j])
+        neg_set = set(neg_score)
+        core = [j for j in core if j not in neg_set]
+
+    meta, core_deltas, core_scores = _score_eligible(core)
+    core_stake = math.fsum(stakes_by_id[j] for j in core)
     next_streaks: dict[str, int] = dict(prior_streaks)
     payouts = []
     weights = []
@@ -741,21 +781,19 @@ def _settle(
         if status[k] in ("non_reveal_or_mismatch", "protocol_fault"):
             slash = m.stake * params.max_slash_cap
         elif status[k] == "eligible":
-            others = [j for j in winners if j != k]
-            if others:
-                share = stakes_by_id[k] / total_winner_stake
-                delta = ((1.0 - share) / share) * (mixture(others) - meta) / baseline
+            if k in core_deltas:
+                delta = core_deltas[k]
+                score = core_scores[k]
+                weight = m.stake**params.stake_exponent * max(0.0, score)
             else:
-                delta = (baseline - meta) / baseline
-            score = (1 - params.w_delta) * crpss + params.w_delta * delta
-            weight = m.stake**params.stake_exponent * max(0.0, score)
+                delta, score = dropped_scores[k]
         elif status[k] == "gefs_gate" and loss is not None:
             # Measure harm against the already-fixed eligible pool at a fixed 50/50
             # reference weight (independent of k's stake) so splitting stake cannot
             # dilute the excluded miner's downside; it never affects a winner's Delta.
-            if winners:
-                diag_ids = sorted([*winners, k])
-                diag_weights = [total_winner_stake if j == k else stakes_by_id[j] for j in diag_ids]
+            if core:
+                diag_ids = sorted([*core, k])
+                diag_weights = [core_stake if j == k else stakes_by_id[j] for j in diag_ids]
                 delta = min(0.0, (meta - mixture(diag_ids, diag_weights)) / baseline)
             else:
                 delta = 0.0

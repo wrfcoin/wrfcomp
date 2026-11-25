@@ -37,8 +37,10 @@ public reference in two or more consecutive submitted epochs incurs a small nuis
 (`public_clone_slash`, default 2% of stake, one-fifth of `max_slash_cap`)—high enough to make
 automated public-model spam strictly unprofitable while staying gentle against an accidental
 single-epoch collision. Skipping an epoch (no submission, or a non-admitted late, below-floor or
-faulty entry) preserves the wallet's streak rather than resetting it, so relaying every other epoch
-still triggers the nuisance slash; only a valid submitted non-clone forecast resets the streak.
+faulty entry) preserves the wallet's active non-zero streak rather than resetting it, so relaying
+every other epoch still triggers the nuisance slash; only a valid submitted non-clone forecast
+resets the streak. `public_clone_streaks` drops wallets once their streak is zero (and never stores
+absent zero-streak wallets), keeping the map sparse to active streaks only.
 Among remaining eligible wallets, receipt time determines priority, with wallet ID breaking exact
 ties; subsequent miner-to-miner clones earn zero.
 
@@ -59,11 +61,16 @@ stake-share odds when other eligible winners exist:
 `Delta_CRPS_i = ((1 - p_i) / p_i) * (L(M_{-i}) - L(M_all)) / L_base`, where `p_i = K_i / sum_j K_j`
 (reducing exactly to `(L(M_all) - L_i) / L_base` in linear scorecard mode and remaining strictly
 split-resistant for both positive and negative `Delta` in quadratic CRPS array mode; a lone winner
-falls back to `(L_base - L(M_all)) / L_base`). An excluded `gefs_gate` miner's own diagnostic
-downside is evaluated at a fixed 50/50 reference weight against the fixed eligible pool so splitting
-stake cannot dilute its negative-skill slash either, and its presence never changes an eligible
-miner's marginal score. The scorecard approximation uses the stake-weighted mean of normalized losses
-across eligible models; it cannot measure physical ensemble diversity.
+falls back to `(L_base - L(M_all)) / L_base`). To prevent a cheap eligible spoiler with a negative
+composite score from lifting other winners' `Delta`, settlement runs a deterministic multi-pass
+(two passes in the common case, iterated to fixed point): Pass 1 scores all eligible winners,
+excludes any eligible wallets whose composite score is negative (preserving their Pass-1 slash and
+zero reward), and recomputes `M_all` and `Delta_CRPS` for the remaining positive-score winners
+without them. An excluded `gefs_gate` miner's own diagnostic downside is evaluated at a fixed 50/50
+reference weight against the clean eligible pool so splitting stake cannot dilute its negative-skill
+slash either, and its presence never changes an eligible miner's marginal score. The scorecard
+approximation uses the stake-weighted mean of normalized losses across eligible models; it cannot
+measure physical ensemble diversity.
 
 Eligible wallets with positive composite score share the compute pool in proportion to stake times
 score at the default exponent. For a fixed forecast and total stake K, at most one of m copies can earn.

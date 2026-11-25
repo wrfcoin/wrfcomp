@@ -833,3 +833,13 @@ def test_public_reference_and_streak_validation_guards():
             evidence=ev,
             public_references=["b" * 64],
         )
+
+    # Zero-streak entries passed in prior_public_clone_streaks are pruned and never retained.
+    pruned = settle_from_scorecards(
+        {"gefs": ref},
+        baseline_key="gefs",
+        pool_amount=550.0,
+        params=params,
+        prior_public_clone_streaks={"stale_zero": 0},
+    )
+    assert pruned.public_clone_streaks == {}
