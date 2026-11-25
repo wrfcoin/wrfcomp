@@ -1,0 +1,10 @@
+{
+ "verdict": "help",
+ "help_cells": [
+  "t2m@1h (p=0.001606, quarters 4/4)",
+  "t2m@3h (p=2.611e-06, quarters 4/4)",
+  "td2m@6h (p=0.002383, quarters 3/4)"
+ ],
+ "harm": [],
+ "alpha_per_cell": 0.008333333333333333
+}

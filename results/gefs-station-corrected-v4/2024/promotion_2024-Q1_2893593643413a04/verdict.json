@@ -1,0 +1,45 @@
+{
+  "baselines": [
+    "climatology",
+    "noaa-gefs"
+  ],
+  "candidate": {
+    "forecast_sha256": "cdd9729490d22386d9ab776567efc88063be65edf8343c33f023c0c4aae9999c",
+    "model_id": "gefs-station-corrected-own",
+    "model_version": "1"
+  },
+  "forecast_inputs": [
+    {
+      "content_sha256": "9d698855b05f243d6e6befd0bae90a7bc064f66e11f969c9fdd9fed2bf9e2690",
+      "init_first": "2024-01-01T00:00:00",
+      "init_last": "2024-01-31T12:00:00",
+      "n_init_times": 62
+    },
+    {
+      "content_sha256": "2103cae835658426f28f0fb21d0ec9d90a3108c71c5a9c0d8db5e2eab02d44fb",
+      "init_first": "2024-02-01T00:00:00",
+      "init_last": "2024-02-29T12:00:00",
+      "n_init_times": 58
+    },
+    {
+      "content_sha256": "4f80f00a596e80a1116be6d8bb328884feca84e222370fabbae0faee5d7eb72b",
+      "init_first": "2024-03-01T00:00:00",
+      "init_last": "2024-03-31T12:00:00",
+      "n_init_times": 62
+    }
+  ],
+  "harness_version": {
+    "scores": "2.7.0",
+    "wrfcomp": "0.1.0"
+  },
+  "period": "2024-Q1",
+  "promotion_rule_version": 2,
+  "protocol_version": "0.1.0",
+  "reasons": [],
+  "references_sha256": "116847d948447556a16d7514aa57cbf4262be3927b218045bd870ed5c4b9ac7e",
+  "scorecards": {
+    "candidate_vs_climatology.json": "4572deff1babc3e08b65854b9cee4f58cc9ecb37580536f8b974e2f7cf1ce125",
+    "candidate_vs_noaa-gefs.json": "e6e9224471ad12a5b7242f34841c8caaea9d0527cbee9cd2fce182b56c7d5c37"
+  },
+  "verdict": "PASSED"
+}
