@@ -170,7 +170,7 @@ MODEL_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 ISO_TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$")
 _TAR_ZERO_BLOCK = b"\x00" * 512
 _TAR_EXTENDED_TYPEFLAGS = frozenset({b"x", b"g", b"X", b"L", b"K", b"S"})
-_TAR_ALLOWED_TYPEFLAGS = frozenset({b"0", b"\x00", b"5"})
+_TAR_ALLOWED_TYPEFLAGS = frozenset({tarfile.REGTYPE, tarfile.DIRTYPE})
 _USTAR_MAGIC = b"ustar\x00"
 _USTAR_VERSION = b"00"
 
@@ -202,11 +202,12 @@ def _parse_ustar_octal_size(field: bytes) -> int:
 class _TarBudgetStream:
     """Plain USTAR stream wrapper enforcing strict framing and total decompressed byte budgets.
 
-    Only POSIX USTAR regular files (``0``/``\\x00``) and directories (``5``) with ASCII octal
-    sizes are permitted. PAX and GNU extended headers (``x``, ``g``, ``X``, ``L``, ``K``, ``S``)
-    and all non-regular/non-directory member types are rejected immediately on the 512-byte
-    header before ``tarfile`` reads any record body, guaranteeing identical record boundaries
-    between this wrapper and ``tarfile.open(..., mode="r|")``.
+    Only canonical POSIX USTAR regular files (``REGTYPE`` = ``b"0"``) and explicit zero-size
+    directories (``DIRTYPE`` = ``b"5"``) with ASCII octal sizes are permitted; the legacy
+    ``AREGTYPE`` (``b"\\x00"``) marker, PAX/GNU extended headers (``x``, ``g``, ``X``, ``L``,
+    ``K``, ``S``), and all other member types are rejected immediately on the 512-byte header
+    before ``tarfile`` reads any record body, guaranteeing identical record boundaries between
+    this wrapper and ``tarfile.open(..., mode="r|")``.
 
     Every byte read from the decompressed stream is strictly bounded by
     ``max_total_bytes + max_metadata_bytes``, with tar headers/padding/EOF blocks also capped
@@ -1171,7 +1172,6 @@ def _safe_extract_archive(
                             raise FetchError(f"Refusing non-regular tar member: {member.name!r}")
                         if not (member.isfile() or member.isdir()) or member.type not in (
                             tarfile.REGTYPE,
-                            tarfile.AREGTYPE,
                             tarfile.DIRTYPE,
                         ):
                             raise FetchError(f"Refusing unsupported tar member type: {member.name!r}")

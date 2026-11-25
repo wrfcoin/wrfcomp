@@ -913,7 +913,7 @@ def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp
             break
         assert hdr[257:263] == b"ustar\x00"
         assert hdr[263:265] == b"00"
-        assert hdr[156:157] in (b"0", b"\x00")
+        assert hdr[156:157] == tarfile.REGTYPE
         size = int(hdr[124:136].rstrip(b"\x00 ").decode("ascii"), 8)
         pos += 512 + ((size + 511) // 512) * 512
         seen_headers += 1
@@ -1002,6 +1002,28 @@ def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp
             config_path=CONFIG_PATH,
             expected_manifest=manifest_sidecar,
         )
+
+    # 4b. Legacy AREGTYPE (b"\x00") marker (including trailing-slash directory-normalization case
+    # with non-zero body size) is refused immediately at the first header check.
+    for idx, (arc_name, body) in enumerate([("README.md", b"ok"), ("truth/", b"X" * 512)]):
+        areg_tar = tmp_path / f"ustar_areg_{idx}.tar.gz"
+        info = tarfile.TarInfo(arc_name)
+        info.type = tarfile.AREGTYPE
+        info.size = len(body)
+        raw_hdr = info.tobuf(tarfile.USTAR_FORMAT)
+        assert raw_hdr[156:157] == tarfile.AREGTYPE
+        padded_body = body + b"\x00" * ((512 - len(body) % 512) % 512)
+        with gzip.open(areg_tar, "wb") as gz:
+            gz.write(raw_hdr + padded_body + b"\x00" * 1024)
+        with pytest.raises(fetcher.FetchError, match="Refusing non-regular tar member"):
+            fetcher.fetch_scoring_data(
+                year=2024,
+                data_dir=tmp_path / f"areg_dest_{idx}",
+                archive=areg_tar,
+                references_path=synthetic_env["ref_path"],
+                config_path=CONFIG_PATH,
+                expected_manifest=manifest_sidecar,
+            )
 
     # 5. Plain USTAR archive exceeding independent tar metadata bytes and header count caps
     # is rejected even under the default 10 GiB payload cap.

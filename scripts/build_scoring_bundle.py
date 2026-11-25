@@ -1109,7 +1109,7 @@ def _verify_written_archive(
         for member in tf:
             if member.pax_headers:
                 raise BundleError(f"Written archive contains PAX headers on member: {member.name!r}")
-            if not member.isfile() or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE):
+            if not member.isfile() or member.type != tarfile.REGTYPE:
                 raise BundleError(f"Written archive contains non-file member: {member.name!r}")
             src = tf.extractfile(member)
             if src is None:
