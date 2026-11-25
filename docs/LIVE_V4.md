@@ -44,25 +44,42 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
 | Temperature, dewpoint | tenths of deg C | tenths from the remarks T-group (as ISD for ASOS); whole degrees from the body when there is no T-group |
 | Pressure | `SLP`, tenths of hPa | remarks `SLPppp`, tenths of hPa; altimeter never used; no SLP gives NaN |
 | Wind | tenths of m/s, converted from knots | knots to m/s rounded to 0.1 (5 kt = 2.6 m/s); calm = 0, 0; variable or missing direction = NaN; not in knots = NaN |
-| Report types | FM-15, FM-16 | METAR, SPECI (the same reports) |
-| Quality control | NCEI quality flags | none exist in real time; ISD's range limits applied; a correction replaces the report it corrects |
+| Dewpoint above temperature | dewpoint discarded per report, before hourly matching | the same, per report, before hourly matching |
+| Report types | FM-15, FM-16 and SY-MT; FM-12 synoptic rows as a fallback for a station-year with none | METAR and SPECI only (FM-15, FM-16); this feed has no SY-MT or FM-12, so a station that sends no METAR has no live truth |
+| Quality control | NCEI quality flags; no extra temperature or pressure limits | no flags exist in real time; live-only limits instead: temperature and dewpoint -80..60 deg C, sea-level pressure 850..1090 hPa, wind at most 90 m/s (ISD's limit) |
+| Corrections | one record per report | two reports of one station at one exact time: the later fetch wins, among the fetches the issue is allowed to see (below) |
 
 ## Causality
 
-- An issue at T is given only truth labels up to T, and inside them only readings measured at or
-  before T (`metar.causal`). The code refuses otherwise (`metar.assert_causal`); the frozen model
-  checks the same again.
+- For an issue at T, every report measured after T (to the exact second) is dropped **before** the
+  hourly slots are chosen (`metar.truth_as_of`). A report after T can therefore never take the slot
+  of an earlier one, nor be counted as measured at T because its offset rounds to 0 minutes. The
+  result is checked again (`metar.assert_causal`), and the frozen model checks the same once more.
 - A store for T is not built until a METAR fetch made at least 15 minutes after T exists, so the
   reading at T is final.
 - GEFS: only files of cycle T are read (above).
+
+## What each issue saw is frozen
+
+- When an issue is first built, its `inputs.json` pins the METAR fetch files present at that moment
+  (name and sha256) and its GEFS cycle's hash. Fetch files and GEFS cycles are written once.
+- Every later replay gives that issue exactly its pinned fetches. A fetch appended later (a
+  correction, say) never changes an earlier issue, its store, or the predictors it left in the
+  learned state. A later issue pins the later fetch, so a new verification reading enters the error
+  history from the first issue whose build could see it.
+- A pinned fetch or cycle that is missing or changed is refused. Issue files (`inputs.json`,
+  `v4.zarr`, `v4.sha256`, `build.json`) are written once; a rebuild must reproduce them exactly.
+- Building an issue first builds, in order, every earlier kept issue of the year that has not been
+  built, so every issue in the learned state has its own pinned inputs.
 
 ## Learned state (v2 regression, v3 pressure gain, v4 own-reading gain)
 
 - The state is never stored. Each build replays every kept live cycle of the year in order with the
   frozen code (`gefs_station_v3.Replay`, then `citizen_arms.Replay` with no citizen data, exactly as
-  `scripts/build_v4.py`). Each replayed issue t sees only the truth causal at t, so an error of an
-  earlier issue enters the state only once its verifying reading has been measured. Anyone with the
-  kept cycles (about 1 MB each) and the stored METAR fetches can recompute it.
+  `scripts/build_v4.py`). Each replayed issue t sees only its pinned fetches and only readings
+  measured at or before t, so an error of an earlier issue enters the state only once its verifying
+  reading has been measured and fetched. Anyone with the kept cycles (about 1 MB each), the stored
+  METAR fetches and the `inputs.json` files can recompute it.
 - **Cold start.** The frozen models forget everything older than their windows (v2 60 days; v3 and
   v4 gains 30 days; same-hour issues only) and keep nothing across a calendar year. Nothing from the
   frozen 2023 or 2024 history therefore has any weight live. Live starts cold on the first live day,
@@ -77,23 +94,44 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
 
 ## The 2025 date checks
 
-The frozen code refuses every time from 2025-01-01 on. `wrfcomp.live.dates.live_dates(year)` lifts
-exactly these checks, for one live year, only while a live build runs, and restores them on exit:
+The frozen code refuses every time from 2025-01-01 on. Live builds do not switch that off anywhere
+shared. A `wrfcomp.live.dates.LiveYear(year)` policy object is passed explicitly down the live path.
+It holds its own private copies of the frozen modules, loaded from the same source files (their
+sha256 is checked and recorded in each `build.json`). Only in those copies:
 
-1. `gefs_station_v2.year_bounds` (`END`), used by the v2, v3 and v4 replays;
-2. `baselines.io.layout`, used by the GEFS extractor;
-3. `harness.schemas.validate_forecast_dataset`, used when a store is checked or written.
+1. `gefs_station_v2.year_bounds` accepts the live year and refuses every other year (a 2026 policy
+   refuses 2025 and 2027);
+2. `baselines.io.layout` (used by the GEFS extractor's copy) reads a config whose sealed-test start
+   is 1 January after the live year;
+3. `harness.schemas.validate_forecast_dataset` is called with that config passed as `cfg=`.
 
-No model file and nothing under `configs/` is changed. The truth parsers' cutoff stays: live readings
-never go through them. A test replays a synthetic 2024 world through the live path and through the
-frozen build path (identical content hashes), and the same world moved to 2026 under `live_dates`
-(identical numbers).
+No attribute of the imported `wrfcomp` modules and nothing under `configs/` is changed. Ordinary
+calls anywhere in the process, other threads included, keep refusing every 2025-or-later time while
+a live build runs; a test checks all three guards from a second thread during a live replay. The
+truth parsers' cutoff is not involved: live readings never go through them. A store is written only
+if every init and valid time is inside the live year.
+
+Equivalence: a test replays a synthetic 2024 world through the live replay and through the frozen
+build path (identical content hashes), and the same world moved to 2026 through a `LiveYear(2026)`
+policy (identical numbers).
+
+## Where live data may go
+
+- The data directory is `$WRFCOMP_DATA_DIR` (default `~/wrfcomp-data`). The script has no option to
+  point live output elsewhere.
+- Refused:
+  - a data directory inside the repository or a temp directory;
+  - a data directory that is, or is inside, an evaluation folder (`truth`, `candidates`, `baselines`,
+    `phase3`, `gate1` and the others the pipeline uses);
+  - a `live` folder that is a symlink or holds an evaluation folder;
+  - any symlink on the way to a file the builder writes (checked before every write).
 
 ## Output
 
 `$WRFCOMP_DATA_DIR/live/<YYYY-MM-DD>T<HH>Z/`: `v4.zarr`, `v4.sha256` (its `content_sha256`) and
-`build.json` (code commit, live start, missing cycles, hashes of every GEFS cycle and METAR fetch
-used, the learned gains per issue). Kept inputs: `live/gefs/<YYYYMMDDHH>.zarr`, `live/metar/*.json`.
+`build.json` (code commit, frozen source hashes, live start, missing cycles, the learned gains per
+issue), and `inputs.json` (the pinned METAR fetches and GEFS cycle hash). Every issue folder is
+written once. Kept inputs: `live/gefs/<YYYYMMDDHH>.zarr`, `live/metar/*.json`.
 
 ## Transfer
 

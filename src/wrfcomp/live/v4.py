@@ -1,60 +1,119 @@
 """Live candidate v4: one store per issue time T, built by the frozen v3 and v4 code from live inputs.
 
-Layout under ``<data>/live/`` (never under the evaluation folders):
+Layout under ``<data>/live/`` (never under the evaluation folders; see :func:`live_root`):
 
-* ``gefs/<YYYYMMDDHH>.zarr``: the raw GEFS cycle at the 500 stations (``baselines.gefs.extract``,
-  unchanged: same bucket, byte ranges from the index, point extraction, lapse and dewpoint);
-* ``metar/<fetch time>.json``: every METAR fetch, unchanged (``wrfcomp.live.metar``);
-* ``<YYYY-MM-DD>T<HH>Z/v4.zarr``, ``v4.sha256`` and ``build.json``: the store for issue T.
+* ``gefs/<YYYYMMDDHH>.zarr``: the raw GEFS cycle at the 500 stations, written once
+  (``baselines.gefs.extract``, unchanged: same bucket, index byte ranges, point extraction, lapse and
+  dewpoint);
+* ``metar/<fetch time>.json``: every METAR fetch, unchanged, written once (``wrfcomp.live.metar``);
+* ``<YYYY-MM-DD>T<HH>Z/``: per issue, written once: ``inputs.json`` (the pinned inputs), ``v4.zarr``,
+  ``v4.sha256`` and ``build.json``.
 
-The model is the frozen code: ``gefs_station_v3.Replay`` (v3) then ``citizen_arms.Replay`` with no
-citizen data (arm B = v4), exactly as ``scripts/build_v4.py``. Learned state (v2 regression, v3
-pressure gain, v4 own-reading gain) is never stored: it is rebuilt each time by replaying every
-kept live cycle of the year in order, from the first live cycle (a cold start, as the frozen replay
-starts every 1 January). Each replayed issue t sees only ``metar.causal(truth, t)``: labels up to t
-and readings measured at or before t; errors of earlier issues therefore enter only once their
-verifying reading has been measured. The frozen code keeps no state across a calendar year and
-refuses issues whose 48 h lead crosses it (30 Dec 00Z to 31 Dec 12Z); live does the same.
+**What each issue sees is frozen when it is first built.** ``inputs.json`` pins the METAR fetch files
+(name and sha256) present at that moment and the GEFS cycle's hash. Every later replay gives that
+issue exactly those fetches (and only reports measured at or before its time), so a fetch appended
+later (a correction, say) can never change an earlier issue, its store, or the predictors it left in
+the learned state. Later issues pin later fetches, so verification readings enter the error history
+only from the first issue whose build could see them.
+
+**The model** is the frozen code (``gefs_station_v3.Replay`` then ``citizen_arms.Replay`` with no
+citizen data, exactly as ``scripts/build_v4.py``), run through a :class:`~wrfcomp.live.dates.LiveYear`
+policy passed explicitly (private copies of the frozen modules; nothing shared is changed). Learned
+state is never stored: it is rebuilt by replaying every kept live cycle of the year in order from the
+first (a cold start, as the frozen replay starts every 1 January). The frozen code keeps no state
+across a calendar year and refuses issues whose 48 h lead crosses it (30 Dec 00Z to 31 Dec 12Z).
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
 import re
 import subprocess
+import tempfile
 from importlib import resources
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
-from wrfcomp.baselines import gefs
-from wrfcomp.baselines.io import CONFIG, write
+from wrfcomp.baselines import gefs as shared_gefs
+from wrfcomp.baselines.io import CONFIG
 from wrfcomp.harness.hashing import content_sha256
 from wrfcomp.live import metar
-from wrfcomp.live.dates import LiveRefusedError, live_dates
-from wrfcomp.models import citizen_arms as arms
-from wrfcomp.models import gefs_station_v2 as v2
-from wrfcomp.models import gefs_station_v3 as v3
+from wrfcomp.live.dates import LiveRefusedError, LiveYear
 
 LIVE_DIR = "live"
 ISSUE_HOURS = (0, 12)
 HOUR = np.timedelta64(1, "h")
 S3 = "https://noaa-gefs-pds.s3.amazonaws.com"
+# Folder names the evaluation pipeline uses under the data directory. A live root must not be one of
+# them, sit inside one, or hold one.
+EVALUATION_DIRS = frozenset(
+    {
+        "baselines",
+        "bundle",
+        "candidates",
+        "citizen",
+        "confirm-2023",
+        "configs",
+        "experiments",
+        "gate1",
+        "isd-lite",
+        "parsed",
+        "phase3",
+        "promotion",
+        "raw",
+        "thresholds",
+        "truth",
+    }
+)
+TEMP_DIRS = ("/tmp", tempfile.gettempdir())
 
 
 # -- places ------------------------------------------------------------------------------------
 
 
-def live_root(data: Path) -> Path:
-    """``<data>/live``; refused inside the repository or under /tmp."""
-    data = Path(data).resolve()
-    repo = CONFIG.parents[1]
-    if data.is_relative_to(repo) or data.is_relative_to("/tmp"):
+def default_data_dir() -> Path:
+    return Path(os.environ.get("WRFCOMP_DATA_DIR") or Path.home() / "wrfcomp-data")
+
+
+def live_root(data: Path | None = None) -> Path:
+    """``<data>/live``, refused unless it is a safe place for live data:
+
+    the data directory is not inside the repository or a temp directory, is not an evaluation folder
+    and is not inside one; ``live`` is not a symlink and holds no evaluation folder."""
+    data = Path(default_data_dir() if data is None else data)
+    resolved = data.resolve()
+    repo = CONFIG.parents[1].resolve()
+    if resolved.is_relative_to(repo) or any(resolved.is_relative_to(Path(t).resolve()) for t in TEMP_DIRS):
         raise LiveRefusedError("live data belongs in the external data directory")
-    return data / LIVE_DIR
+    if EVALUATION_DIRS.intersection(resolved.parts) or resolved.name == LIVE_DIR:
+        raise LiveRefusedError(f"the data directory {resolved} is or is inside an evaluation folder")
+    root = resolved / LIVE_DIR
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise LiveRefusedError("the live folder must be a real directory, not a link")
+    if root.is_dir() and EVALUATION_DIRS.intersection(p.name for p in root.iterdir()):
+        raise LiveRefusedError("the live folder holds an evaluation folder")
+    return root
+
+
+def safe(root: Path, path: Path) -> Path:
+    """``path`` inside ``root`` with no symlink on the way (checked before every write)."""
+    path = Path(path)
+    rel = path.relative_to(root)
+    here = root
+    for part in rel.parts:
+        here = here / part
+        if here.is_symlink():
+            raise LiveRefusedError(f"refusing a linked path inside the live folder: {here}")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise LiveRefusedError(f"{path} is outside the live folder")
+    return path
 
 
 def issue_dir(root: Path, t) -> Path:
@@ -97,7 +156,7 @@ def check_issue(t) -> np.datetime64:
     t = np.datetime64(ts.to_datetime64(), "ns")
     if ts.year < 2025:
         raise LiveRefusedError("live issues are 2025 or later; earlier years are evaluation data")
-    if t + v2.LEADS[-1] >= np.datetime64(f"{ts.year + 1:04d}-01-01"):
+    if t + np.timedelta64(48, "h") >= np.datetime64(f"{ts.year + 1:04d}-01-01"):
         raise LiveRefusedError("the frozen model makes no forecast whose 48 h lead crosses 1 January")
     return t
 
@@ -105,7 +164,7 @@ def check_issue(t) -> np.datetime64:
 # -- GEFS --------------------------------------------------------------------------------------
 
 
-class CheckedTransfer(gefs.Transfer):
+class CheckedTransfer(shared_gefs.Transfer):
     """``gefs.Transfer`` that refuses any file of another cycle and any field of another time.
 
     Every URL must be a file of cycle T, and every index line of a field v4 uses must carry the
@@ -129,7 +188,7 @@ class CheckedTransfer(gefs.Transfer):
         return data
 
     def _check_index(self, index: str, member: str, lead: int) -> None:
-        wanted = {*gefs.FIELDS.values(), gefs.HEIGHT}
+        wanted = {*shared_gefs.FIELDS.values(), shared_gefs.HEIGHT}
         step = "anl" if lead == 0 else f"{lead} hour fcst"
         ens = "ENS=low-res ctl" if member == "c00" else f"ENS=+{int(member[1:])}"
         seen = set()
@@ -144,17 +203,21 @@ class CheckedTransfer(gefs.Transfer):
             raise LiveRefusedError("index has none of the fields v4 uses")
 
 
-def fetch_cycle(root: Path, t, *, transfer: CheckedTransfer | None = None) -> dict:
-    """Fetch GEFS cycle ``t`` at the stations and keep it as ``gefs/<YYYYMMDDHH>.zarr``."""
+def fetch_cycle(
+    root: Path, t, *, transfer: CheckedTransfer | None = None, policy: LiveYear | None = None
+) -> dict:
+    """Fetch GEFS cycle ``t`` at the stations and keep it, once, as ``gefs/<YYYYMMDDHH>.zarr``."""
     t = check_issue(t)
-    dest = raw_path(root, t)
+    policy = LiveYear(pd.Timestamp(t).year) if policy is None else policy
+    if policy.year != pd.Timestamp(t).year:
+        raise LiveRefusedError("the live policy is for another year")
+    dest = safe(root, raw_path(root, t))
     if dest.exists():
         with xr.open_zarr(dest, chunks=None) as kept:
             return {"path": str(dest), "content_sha256": content_sha256(kept), "bytes": 0}
     transfer = CheckedTransfer(t) if transfer is None else transfer
-    with live_dates(pd.Timestamp(t).year):
-        raw = gefs.extract(stations(), t, root / "cache", transfer)
-        write(raw, dest)
+    raw = policy.gefs.extract(stations(), t, safe(root, root / "cache"), transfer)
+    policy.write(raw, dest)
     with xr.open_zarr(dest, chunks=None) as kept:
         return {"path": str(dest), "content_sha256": content_sha256(kept), "bytes": transfer.bytes}
 
@@ -162,30 +225,39 @@ def fetch_cycle(root: Path, t, *, transfer: CheckedTransfer | None = None) -> di
 # -- replay ------------------------------------------------------------------------------------
 
 
-def no_citizen_snapshot() -> dict:
-    return {v: (np.empty(0), np.empty(0), np.empty(0, dtype=np.int64)) for v in arms.VARIABLES}
+def no_citizen_snapshot(models) -> dict:
+    return {v: (np.empty(0), np.empty(0), np.empty(0, dtype=np.int64)) for v in models.arms.VARIABLES}
 
 
-NO_PAIRS = arms.Pairs(
-    citizen=np.empty(0, int), official=np.empty(0, int), distance_km=np.empty(0), cell=np.empty(0, int)
-)
+def no_pairs(models):
+    return models.arms.Pairs(
+        citizen=np.empty(0, int), official=np.empty(0, int), distance_km=np.empty(0), cell=np.empty(0, int)
+    )
 
 
-def replay(raws: list[xr.Dataset], truth: xr.Dataset, year: int, *, causal=True):
+def frozen_models():
+    """The shared frozen modules, for evaluation years (tests replay 2024 with these)."""
+    from wrfcomp.models import citizen_arms, gefs_station_v2, gefs_station_v3
+
+    return SimpleNamespace(v2=gefs_station_v2, v3=gefs_station_v3, arms=citizen_arms)
+
+
+def replay(raws: list[xr.Dataset], truth_for, year: int, models):
     """Frozen v3 then frozen v4 over ``raws`` in order. Yields (t, v3 issue, v4 issue, diagnostics).
 
-    ``truth`` covers the year from 1 January (hourly labels); with ``causal`` each issue t is given
-    only ``metar.causal(truth, t)``."""
-    start, _ = v2.year_bounds(year)
-    truth = truth.sel(valid_time=slice(np.datetime64(start, "ns"), None))
-    v3_replay = v3.Replay(year)
-    v4_replay = arms.Replay(year, truth, NO_PAIRS)
+    ``truth_for(t)`` is the truth issue t may see (labels from 1 January up to t); ``models`` is a
+    :class:`LiveYear` for live years, :func:`frozen_models` for evaluation years."""
+    v3_replay = None
     for raw in raws:
         t = raw.init_time.values[0]
-        seen = metar.causal(truth, t) if causal else truth
+        seen = truth_for(t)
+        metar.assert_causal(seen, t)
+        if v3_replay is None:
+            v3_replay = models.v3.Replay(year)
+            v4_replay = models.arms.Replay(year, seen, no_pairs(models))
         a, _ = v3_replay.issue(raw, seen)
         v4_replay.truth = seen
-        b, _, diag = v4_replay.issue(a, no_citizen_snapshot())
+        b, _, diag = v4_replay.issue(a, no_citizen_snapshot(models))
         yield t, a, b, diag
 
 
@@ -217,67 +289,137 @@ def code_state() -> dict:
     return {"code_commit": commit, "clean_tree": status == ""}
 
 
-def build_issue(data: Path, t) -> dict:
-    """Build the live v4 store for issue ``t`` from the kept cycles and METAR fetches."""
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_once(root: Path, path: Path, text: str) -> None:
+    path = safe(root, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_text() != text:
+            raise LiveRefusedError(f"{path} exists with other content; issue files are written once")
+        return
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_text(text)
+    tmp.rename(path)
+
+
+def pinned_inputs(root: Path, t: np.datetime64, raw_hash: str) -> dict:
+    """The inputs issue ``t`` sees: read from its ``inputs.json``, or pinned now if it has none."""
+    path = issue_dir(root, t) / "inputs.json"
+    if path.exists():
+        safe(root, path)
+        pinned = json.loads(path.read_text())
+        if pinned["gefs_sha256"] != raw_hash:
+            raise LiveRefusedError(f"the kept GEFS cycle of {pinned['init']} differs from its pinned hash")
+        for item in pinned["metar"]:
+            file = root / "metar" / item["file"]
+            if not file.is_file() or _sha256(safe(root, file)) != item["sha256"]:
+                raise LiveRefusedError(f"pinned METAR fetch {item['file']} is missing or changed")
+        return pinned
+    fetches = metar.stored(root / "metar")
+    if not any(metar.fetch_time(f) >= t + metar.CLOSE_AFTER for f in fetches):
+        when = np.datetime_as_string(t, unit="h")
+        raise LiveRefusedError(f"no METAR fetch 15 minutes or more after {when}; readings not final")
+    pinned = {
+        "init": str(np.datetime_as_string(t, unit="h")),
+        "gefs_sha256": raw_hash,
+        "metar": [{"file": f.name, "sha256": _sha256(safe(root, f))} for f in fetches],
+        "truth_source": metar.API,
+    }
+    _write_once(root, path, json.dumps(pinned, indent=1) + "\n")
+    return pinned
+
+
+def build_issue(t, data: Path | None = None) -> dict:
+    """Build the live v4 store for issue ``t``, first building (once) every earlier kept issue of the
+    year that has not been built yet. Existing issues are replayed from their pinned inputs and must
+    reproduce their stores exactly."""
     root = live_root(data)
     t = check_issue(t)
     year = pd.Timestamp(t).year
+    policy = LiveYear(year)
     paths = kept_cycles(root, t)
     if not paths or raw_path(root, t) != paths[-1]:
         raise LiveRefusedError("the GEFS cycle of the issue is not kept; fetch it first")
-    fetches = metar.stored(root / "metar")
-    if not fetches or metar.fetch_time(fetches[-1]) < t + metar.CLOSE_AFTER:
-        raise LiveRefusedError("no METAR fetch 15 minutes or more after the issue time; readings not final")
     first = _stem_time(paths[0])
-    expected = np.arange(first, t + HOUR, 12 * HOUR)
     present = {_stem_time(p) for p in paths}
-    missing = [str(np.datetime_as_string(c, unit="h")) for c in expected if c not in present]
-    site = stations()
-    reports = metar.reports_frame(fetches, icao_map())
-    if len(reports):
-        reports = reports[reports.obs_time < np.datetime64(f"{year + 1:04d}-01-01")]
-    truth = metar.hourly_truth(reports, site, np.datetime64(f"{year:04d}-01-01T00", "ns"), t)
-    raws, raw_hashes = [], []
+    missing = [
+        str(np.datetime_as_string(c, unit="h"))
+        for c in np.arange(first, t + HOUR, 12 * HOUR)
+        if c not in present
+    ]
+    site, icaos = stations(), icao_map()
+    start = np.datetime64(f"{year:04d}-01-01T00", "ns")
+    raws, pins, frames = [], {}, {}
     for path in paths:
-        with xr.open_zarr(path, chunks=None) as source:
+        with xr.open_zarr(safe(root, path), chunks=None) as source:
             raw = source.load()
         c = _stem_time(path)
         if not np.array_equal(raw.init_time.values, [c]):
             raise LiveRefusedError(f"kept cycle {path.name} holds another initialization")
         raws.append(raw)
-        raw_hashes.append({"init": path.stem, "content_sha256": content_sha256(raw)})
+        pins[c] = pinned_inputs(root, c, content_sha256(raw))
+
+    def truth_for(c):
+        names = [item["file"] for item in pins[c]["metar"]]
+        for name in names:
+            if name not in frames:
+                frames[name] = metar.reports_frame([root / "metar" / name], icaos)
+        # Corrections: the later pinned fetch wins (reports_frame's rule, applied across files).
+        parts = [frames[n].assign(_order=i) for i, n in enumerate(names) if len(frames[n])]
+        reports = (
+            pd.concat(parts)
+            .sort_values(["station_id", "obs_time", "_order"], kind="mergesort")
+            .drop_duplicates(["station_id", "obs_time"], keep="last")
+            .drop(columns="_order")
+            if parts
+            else metar.reports_frame([], icaos)
+        )
+        return metar.truth_as_of(reports, site, start, c)
+
+    result = None
     issues = []
-    with live_dates(year):
-        for c, _, b, diag in replay(raws, truth, year):
-            issues.append({"init": diag.init, "phi": diag.phi, "own_defined": diag.own_defined})
-            if c == t:
-                store = b
-        out_dir = issue_dir(root, t)
-        dest = out_dir / "v4.zarr"
-        for var in store.variables.values():
-            var.encoding.clear()
-        if dest.exists():
-            with xr.open_zarr(dest, chunks=None) as previous:
-                xr.testing.assert_identical(store, previous.load())
-        else:
-            write(store, dest)
+    for c, _, b, diag in replay(raws, truth_for, year, policy):
+        issues.append({"init": diag.init, "phi": diag.phi, "own_defined": diag.own_defined})
+        record = _publish(root, policy, c, b, pins[c], first, missing, issues)
+        if c == t:
+            result = record
+    return result
+
+
+def _publish(root, policy, c, store, pinned, first, missing, issues) -> dict:
+    out_dir = issue_dir(root, c)
+    dest = safe(root, out_dir / "v4.zarr")
+    for var in store.variables.values():
+        var.encoding.clear()
+    if dest.exists():
+        with xr.open_zarr(dest, chunks=None) as previous:
+            xr.testing.assert_identical(store, previous.load())
+    else:
+        policy.write(store, dest)
     with xr.open_zarr(dest, chunks=None) as saved:
         digest = content_sha256(saved)
-    record = {
-        "init": str(np.datetime_as_string(t, unit="h")),
-        "model_id": store.attrs["model_id"],
-        "model_version": store.attrs["model_version"],
-        "candidate": "v4 = v3 + the airport's own reading (frozen Phase 3 arm B), live inputs",
-        "content_sha256": digest,
-        "store": dest.name,
-        **code_state(),
-        "live_start": str(np.datetime_as_string(first, unit="h")),
-        "missing_cycles": missing,
-        "gefs": raw_hashes,
-        "metar": metar.sha256_files(fetches),
-        "truth_source": metar.API,
-        "issues": issues,
-    }
-    (out_dir / "v4.sha256").write_text(f"{digest}  v4.zarr\n")
-    (out_dir / "build.json").write_text(json.dumps(record, indent=1) + "\n")
+    _write_once(root, out_dir / "v4.sha256", f"{digest}  v4.zarr\n")
+    build = out_dir / "build.json"
+    if not build.exists():
+        record = {
+            "init": pinned["init"],
+            "model_id": store.attrs["model_id"],
+            "model_version": store.attrs["model_version"],
+            "candidate": "v4 = v3 + the airport's own reading (frozen Phase 3 arm B), live inputs",
+            "content_sha256": digest,
+            "store": dest.name,
+            **code_state(),
+            "frozen_sources_sha256": policy.sources,
+            "live_start": str(np.datetime_as_string(first, unit="h")),
+            "missing_cycles": [m for m in missing if np.datetime64(m) < c],
+            "inputs": "inputs.json",
+            "issues": list(issues),
+        }
+        _write_once(root, build, json.dumps(record, indent=1) + "\n")
+    record = json.loads(safe(root, build).read_text())
+    if record["content_sha256"] != digest:
+        raise LiveRefusedError(f"{build} records another store")
     return record
