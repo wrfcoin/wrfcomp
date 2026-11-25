@@ -56,6 +56,7 @@ import pandas as pd
 import xarray as xr
 
 from wrfcomp.harness.truth import OFFSET_FILL_VALUE, match_station_to_hours
+from wrfcomp.live.locks import file_lock
 
 API = "https://aviationweather.gov/api/data/metar"
 USER_AGENT = "wrfcomp-live/0.1"
@@ -65,6 +66,7 @@ VARIABLES = ("t2m", "td2m", "u10", "v10", "msl")
 KNOT = 0.514444
 CLOSE_AFTER = np.timedelta64(15, "m")
 STAMP = "%Y%m%dT%H%M%S.%fZ"  # fetch file names: completion time, microseconds
+FETCH_LOCK = "metar.lock"
 MAX_WIND_MS = 90.0  # ISD's limit (900 tenths of m/s)
 SLP_RANGE_HPA = (850.0, 1090.0)
 TEMP_RANGE_C = (-80.0, 60.0)
@@ -174,17 +176,21 @@ def fetch(
         if not isinstance(batch, list):
             raise ValueError("unexpected METAR API response")
         reports.extend(batch)
-    completed = clock().astimezone(UTC)
-    stamp = completed.strftime(STAMP)
-    path = directory / f"{stamp}.json"
-    body = {
-        "source": API,
-        "started_at": started.strftime(STAMP),
-        "completed_at": stamp,
-        "hours": hours,
-        "reports": reports,
-    }
-    publish_file(path, json.dumps(body, sort_keys=True) + "\n")
+    # The completion time is taken and the file linked into place under the fetch lock, the same lock
+    # a build holds while it records its start and lists the fetches: a fetch is either complete and
+    # in place before a build starts, or completed after it.
+    with file_lock(directory.parent / "locks" / FETCH_LOCK, blocking=True):
+        completed = clock().astimezone(UTC)
+        stamp = completed.strftime(STAMP)
+        path = directory / f"{stamp}.json"
+        body = {
+            "source": API,
+            "started_at": started.strftime(STAMP),
+            "completed_at": stamp,
+            "hours": hours,
+            "reports": reports,
+        }
+        publish_file(path, json.dumps(body, sort_keys=True) + "\n")
     return path, received
 
 
@@ -208,9 +214,26 @@ def publish_file(path: Path, text: str) -> None:
 
 
 def fetch_time(path: Path) -> np.datetime64:
-    """When a fetch became available (its completion time, from its name)."""
-    form = STAMP if "." in path.stem else "%Y%m%dT%H%M%SZ"
-    return np.datetime64(datetime.strptime(path.stem, form), "ns")
+    """When a fetch became available: its completion time, from its name (microsecond stamp only).
+    Legacy whole-second names carried the request START, which cannot show availability: refused."""
+    try:
+        return np.datetime64(datetime.strptime(path.stem, STAMP), "ns")
+    except ValueError as exc:
+        raise ValueError(f"{path.name} has no verified completion time") from exc
+
+
+def verified_fetch(path: Path) -> tuple[np.datetime64, str]:
+    """(completion time, sha256) of a stored fetch, refused unless its body's ``completed_at``
+    matches its name."""
+    when = fetch_time(path)
+    data = path.read_bytes()
+    try:
+        completed = json.loads(data).get("completed_at")
+    except ValueError as exc:
+        raise ValueError(f"{path.name} is not a fetch file") from exc
+    if completed != path.stem:
+        raise ValueError(f"{path.name} has no verified completion time")
+    return when, hashlib.sha256(data).hexdigest()
 
 
 def stored(directory: Path) -> list[Path]:

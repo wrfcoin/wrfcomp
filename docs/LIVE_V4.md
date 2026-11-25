@@ -62,11 +62,15 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
 
 ## What each issue saw is frozen
 
-- **When a fetch counts.** A METAR fetch file is named by its completion time, to the microsecond,
-  and is linked into place only after it completes. Each build takes one snapshot at its start: the
-  fetch files already in place whose completion time is at or before the start. A fetch still in
-  flight at the start, or completed after it (also later in the same second), is never part of that
-  build.
+- **When a fetch counts.** A METAR fetch file is named by, and records (`completed_at`), its
+  completion time to the microsecond. That time is taken, and the file linked into place, under the
+  fetch lock (`live/locks/metar.lock`). A build records its start and lists the eligible fetches
+  once, under the same lock: name, completion time and sha256 of every fetch file in place that
+  completed at or before the start. So a fetch is either complete and in place before a build starts
+  (and may be used), or completed after it (and is never used by that build). Pinned files are
+  re-hashed when read; a change is refused. A fetch file without a verified completion time (a
+  legacy whole-second name, which recorded the request start, or a body that does not match its
+  name) is refused.
 - **Fetch window.** From that snapshot, an issue at T sees only fetches completed by its cutoff: the
   earlier of the build start and T + 24 h. The daily run builds the 00Z issue at about T + 4.5 h and
   the previous 12Z issue at about T + 16.5 h, both inside the window. If no fetch completed 15 minutes
@@ -87,8 +91,9 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
   refused. Each build replays every published issue on the way and must reproduce its store exactly;
   otherwise it stops before anything new is published.
 - **Writing.** One build at a time (`live/locks/build.lock`) and one writer per issue
-  (`live/locks/<issue>.lock`); a second writer is refused, not queued, and the locks are released
-  when the process ends. Every file is staged under an exclusive temporary name and linked into place
+  (`live/locks/<issue>.lock`); a second writer is refused, not queued. Each lock is a thread lock
+  (threads of one process) plus an OS file lock (`flock` on Linux and macOS, `msvcrt.locking` on
+  Windows; other processes), both released when the holder finishes or the process ends. Every file is staged under an exclusive temporary name and linked into place
   without replacing anything.
 
 ## Learned state (v2 regression, v3 pressure gain, v4 own-reading gain)

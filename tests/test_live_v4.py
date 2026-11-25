@@ -459,10 +459,11 @@ def test_hourly_truth_follows_the_harness_rule(tmp_path):
     )
 
 
-def _write_fetch(reports, directory, stamp="20261202T160000Z"):
+def _write_fetch(reports, directory, stamp="20261202T160000.000000Z"):
+    """A stored fetch as metar.fetch writes it: named by, and recording, its completion time."""
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{stamp}.json"
-    path.write_text(json.dumps({"reports": reports, "fetched_at": stamp}))
+    path.write_text(json.dumps({"reports": reports, "completed_at": stamp}))
     return path
 
 
@@ -600,7 +601,7 @@ def _world_reports(labels, sig, seed=4):
 
 
 def _stamp(t):
-    return f"{pd.Timestamp(t):%Y%m%dT%H%M%SZ}"
+    return f"{pd.Timestamp(t):%Y%m%dT%H%M%S.%fZ}"
 
 
 def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", days=20):
@@ -713,7 +714,9 @@ def test_a_changed_pinned_fetch_or_cycle_is_refused(live_world):
 def test_build_issue_refuses_without_final_readings_or_the_cycle(live_world):
     data, root, raws, last = live_world
     for path in metar.stored(root / "metar"):
-        path.rename(path.with_name(f"{_stamp(last + 10 * M)}.json"))
+        body = json.loads(path.read_text())
+        path.unlink()
+        _write_fetch(body["reports"], path.parent, _stamp(last + 10 * M))
     with pytest.raises(LiveRefusedError, match="readings not final"):
         live.build_issue(last, data)
     with pytest.raises(LiveRefusedError, match="not kept"):
@@ -915,8 +918,8 @@ def test_concurrent_builds_keep_one_intact_manifest_inside_the_live_tree(live_wo
         th.start()
     for th in threads:
         th.join(300)
-    assert results and all(r == results[0] for r in results)
-    assert all("another live writer" in e for e in errors)
+    assert results and all(r == results[0] for r in results), (results, errors)
+    assert all("another live writer" in e for e in errors), errors
     assert live.build_issue(last, data)["content_sha256"] == results[0]
     for here, dirs, files in os.walk(data):
         for name in dirs + files:
@@ -984,9 +987,8 @@ def test_a_fetch_in_flight_at_build_start_is_never_pinned(live_world, monkeypatc
 def test_fetch_snapshot_uses_completion_time_to_the_microsecond(live_world):
     data, root, raws, last = live_world
     start = last + 5 * H + np.timedelta64(200, "ms")
-    same_second = root / "metar" / f"{pd.Timestamp(start + np.timedelta64(200, 'ms')):%Y%m%dT%H%M%S.%fZ}.json"
-    same_second.write_text(json.dumps({"reports": []}))
-    names = [f.name for _, f in live.fetch_snapshot(root, start)]
+    same_second = _write_fetch([], root / "metar", _stamp(start + np.timedelta64(200, "ms")))
+    names = [f.name for _, f, _ in live.fetch_snapshot(root, start)]
     assert same_second.name not in names and len(names) == 1
 
 
@@ -1002,3 +1004,80 @@ def test_a_gap_can_never_be_filled_after_a_later_issue_is_published(live_world):
     assert not live.issue_dir(root, gap).exists()
     record = live.build_issue(last, data)
     assert _hour(gap) in record["missing_cycles"]
+
+
+# -- round 4 regressions -------------------------------------------------------------------------
+
+
+def test_fetch_publication_and_the_build_start_share_one_synchronization_point(live_world, monkeypatch):
+    """Side 1: a fetch has taken its completion time but is not yet in place when a build starts.
+    The build waits at the fetch lock, so its start and its one fetch list come after the file is in
+    place: the fetch is pinned, and was available at the recorded start. (Side 2, a fetch published
+    after the snapshot, is test_a_fetch_in_flight_at_build_start_is_never_pinned.)"""
+    data, root, raws, last = live_world
+    x = pd.Timestamp(last + 5 * H).tz_localize("UTC").to_pydatetime()
+    times = iter([x, x + pd.Timedelta(seconds=1)])
+    paused, release = threading.Event(), threading.Event()
+    original = metar.publish_file
+
+    def slow_publish(path, text):
+        if path.parent.name == "metar":
+            paused.set()
+            release.wait(30)
+        return original(path, text)
+
+    monkeypatch.setattr(metar, "publish_file", slow_publish)
+    fetched = {}
+    fetcher = threading.Thread(
+        target=lambda: fetched.update(
+            path=metar.fetch(root / "metar", ICAO, 30, clock=lambda: next(times), get=lambda url: b"[]")[0]
+        )
+    )
+    fetcher.start()
+    assert paused.wait(30)
+    built = {}
+    builder = threading.Thread(
+        target=lambda: built.update(record=live.build_issue(last, data, now=last + 5 * H + 2 * S))
+    )
+    builder.start()
+    builder.join(2)
+    assert builder.is_alive()  # waiting at the synchronization point
+    assert not live.issue_dir(root, last).exists()
+    release.set()
+    fetcher.join(30)
+    builder.join(300)
+    pinned = json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
+    assert fetched["path"].name in [m["file"] for m in pinned["metar"]]
+    assert metar.fetch_time(fetched["path"]) <= np.datetime64(pinned["build_started"])
+
+
+@pytest.mark.parametrize("kind", ["legacy name", "unverified body"])
+def test_a_fetch_without_a_verified_completion_time_is_refused(live_world, kind):
+    data, root, raws, last = live_world
+    if kind == "legacy name":
+        (root / "metar" / "20260320T160000Z.json").write_text(json.dumps({"reports": []}))
+    else:
+        (root / "metar" / f"{_stamp(last + 5 * H)}.json").write_text(json.dumps({"reports": []}))
+    with pytest.raises(LiveRefusedError, match="no verified completion time"):
+        live.build_issue(last, data)
+    assert not live.issue_dir(root, last).exists()
+
+
+def test_the_fetch_list_is_taken_once_with_hashes(live_world, monkeypatch):
+    """A pinned fetch's hash comes from the one list taken at build start; a file changed after it is
+    refused when it is read."""
+    data, root, raws, last = live_world
+    fetch = metar.stored(root / "metar")[0]
+    calls = []
+    original = live.fetch_snapshot
+
+    def once(root_, started):
+        calls.append(started)
+        out = original(root_, started)
+        fetch.write_text(fetch.read_text().replace("27010KT", "27011KT", 1))  # changed after the list
+        return out
+
+    monkeypatch.setattr(live, "fetch_snapshot", once)
+    with pytest.raises(LiveRefusedError, match="missing or changed"):
+        live.build_issue(last, data)
+    assert len(calls) == 1 and not live.issue_dir(root, last).exists()

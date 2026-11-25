@@ -40,12 +40,6 @@ from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows
-    fcntl = None
-    import msvcrt
-
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -55,6 +49,7 @@ from wrfcomp.baselines.io import CONFIG
 from wrfcomp.harness.hashing import content_sha256
 from wrfcomp.live import metar
 from wrfcomp.live.dates import LiveRefusedError, LiveYear
+from wrfcomp.live.locks import LockBusyError, file_lock
 
 LIVE_DIR = "live"
 ISSUE_HOURS = (0, 12)
@@ -311,24 +306,17 @@ def _sha256(path: Path) -> str:
 
 
 @contextmanager
-def _lock(root: Path, name: str):
-    """An exclusive, non-blocking writer lock ``locks/<name>.lock``, released when the process ends.
-    A second writer is refused, not queued."""
+def _lock(root: Path, name: str, *, blocking: bool = False):
+    """An exclusive writer lock ``locks/<name>.lock`` (``wrfcomp.live.locks``). Non-blocking by
+    default: a second writer is refused, not queued."""
     path = safe(root, root / "locks" / f"{name}.lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     safe(root, path)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        try:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            else:  # pragma: no cover - Windows
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            raise LiveRefusedError(f"another live writer holds {path.name}") from exc
-        yield
-    finally:
-        os.close(fd)
+        with file_lock(path, blocking=blocking):
+            yield
+    except LockBusyError as exc:
+        raise LiveRefusedError(f"another live writer holds {path.name}") from exc
 
 
 def _publish_once(root: Path, path: Path, text: str) -> bool:
@@ -379,11 +367,20 @@ def published_issues(root: Path, year: int) -> dict:
     return out
 
 
-def fetch_snapshot(root: Path, started: np.datetime64) -> list[tuple[np.datetime64, Path]]:
-    """The METAR fetches available at build start, taken ONCE: files already linked into place (a
-    fetch is linked only after it completes) whose completion time is at or before the start. A fetch
-    still in flight at the start, or completed after it, is never part of this build."""
-    return [(metar.fetch_time(f), f) for f in metar.stored(root / "metar") if metar.fetch_time(f) <= started]
+def fetch_snapshot(root: Path, started: np.datetime64) -> list[tuple[np.datetime64, Path, str]]:
+    """The METAR fetches available at build start, listed ONCE: (completion time, file, sha256) of
+    every fetch file in place whose completion time is at or before the start. Called under the fetch
+    lock (see :func:`build_issue`), so a fetch is either complete and in place before the start or
+    completed after it. A file without a verified completion time (legacy names) is refused."""
+    out = []
+    for f in metar.stored(safe(root, root / "metar")):
+        try:
+            when, digest = metar.verified_fetch(safe(root, f))
+        except ValueError as exc:
+            raise LiveRefusedError(str(exc)) from exc
+        if when <= started:
+            out.append((when, f, digest))
+    return out
 
 
 def pin_fetches(root: Path, t: np.datetime64, started: np.datetime64, snapshot) -> dict:
@@ -392,18 +389,18 @@ def pin_fetches(root: Path, t: np.datetime64, started: np.datetime64, snapshot) 
     more after ``t`` (a delayed first build), it is a retrospective backfill: the fetches up to the
     first one completed 15 minutes or more after ``t``, and nothing later, flagged as such."""
     cutoff = min(started, t + AUTHORIZED_WINDOW)
-    final = [when for when, _ in snapshot if when >= t + metar.CLOSE_AFTER]
+    final = [when for when, _, _ in snapshot if when >= t + metar.CLOSE_AFTER]
     if not final:
         raise LiveRefusedError(f"no METAR fetch 15 minutes or more after {_hour(t)}; readings not final")
     backfill = min(final) > cutoff
     if backfill:
         cutoff = min(final)
-    chosen = [f for when, f in snapshot if when <= cutoff]
+    chosen = [(f, digest) for when, f, digest in snapshot if when <= cutoff]
     return {
         "build_started": str(np.datetime_as_string(started, unit="us")),
         "fetch_cutoff": str(np.datetime_as_string(cutoff, unit="us")),
         "retrospective_backfill": bool(backfill),
-        "metar": [{"file": f.name, "sha256": _sha256(safe(root, f))} for f in chosen],
+        "metar": [{"file": f.name, "sha256": digest} for f, digest in chosen],
     }
 
 
@@ -429,10 +426,13 @@ def build_issue(t, data: Path | None = None, *, now=None) -> dict:
     root = live_root(data)
     t = check_issue(t)
     year = pd.Timestamp(t).year
-    started = _now() if now is None else np.datetime64(now, "ns")
     policy = LiveYear(year)
     with _lock(root, "build"):
-        snapshot = fetch_snapshot(root, started)
+        # The synchronization point with fetch publication: the build start and the one list of
+        # eligible fetches are taken together under the fetch lock.
+        with _lock(root, metar.FETCH_LOCK.removesuffix(".lock"), blocking=True):
+            started = _now() if now is None else np.datetime64(now, "ns")
+            snapshot = fetch_snapshot(root, started)
         return _build(root, t, year, started, snapshot, policy)
 
 
@@ -491,9 +491,13 @@ def _build(root, t, year, started, snapshot, policy) -> dict:
 
     def truth_for(c):
         names = [item["file"] for item in manifests[c]["metar"]]
-        for name in names:
+        for item in manifests[c]["metar"]:
+            name = item["file"]
             if name not in frames:
-                frames[name] = metar.reports_frame([root / "metar" / name], icaos)
+                path = safe(root, root / "metar" / name)
+                if _sha256(path) != item["sha256"]:
+                    raise LiveRefusedError(f"pinned METAR fetch {name} is missing or changed")
+                frames[name] = metar.reports_frame([path], icaos)
         # Corrections: the later pinned fetch wins (reports_frame's rule, applied across files).
         parts = [frames[n].assign(_order=i) for i, n in enumerate(names) if len(frames[n])]
         reports = (
