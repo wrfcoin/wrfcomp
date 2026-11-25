@@ -199,7 +199,7 @@ def synthetic_env(tmp_path: Path) -> dict[str, Any]:
             },
         }
     ref_path = tmp_path / "REFERENCES.json"
-    ref_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    ref_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     return {
         "data_dir": data_dir,
         "out_dir": tmp_path / "bundle",
@@ -1389,7 +1389,7 @@ def test_install_after_inventory_gains_another_year(synthetic_env, tmp_path, mon
         inventory["periods"][label.replace("2024", "2023")] = json.loads(
             json.dumps(entry).replace("2024", "2023")
         )
-    path.write_text(json.dumps(inventory, indent=4), encoding="utf-8")
+    path.write_text(json.dumps(inventory, indent=4), encoding="utf-8", newline="\n")
     install_args = dict(
         year=2024,
         archive=Path(bundle["archive_path"]),
@@ -1406,7 +1406,7 @@ def test_install_after_inventory_gains_another_year(synthetic_env, tmp_path, mon
     for label in manifest["periods"]:
         entry = inventory["periods"][label]
         entry["other_reference_forecasts"]["0" * 64] += ".changed"
-        path.write_text(json.dumps(inventory), encoding="utf-8")
+        path.write_text(json.dumps(inventory), encoding="utf-8", newline="\n")
         with pytest.raises(fetcher.FetchError, match="references_sha256"):
             fetcher.fetch_scoring_data(data_dir=tmp_path / label, **install_args)
         assert not (tmp_path / label / "gate1").exists()
