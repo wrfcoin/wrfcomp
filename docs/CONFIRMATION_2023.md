@@ -1,8 +1,8 @@
-# 2023 confirmation period: proposal (lane V1, step 1)
+# 2023 confirmation period
 
-**Status: proposal, measurements, and the code for it (section 6).** No 2023 reference or threshold is
-built, pinned or scored. No locked file is changed by this pull request. Data builds wait for the owner's
-disk decision.
+**Status: design, code and reference data are done (sections 6 and 7).** The 2023 references are built.
+Pinning them is a separate locked change that needs the owner's approval (#40). No candidate has been built
+or scored on 2023.
 
 Manager rulings, 2026-11-24: the Q4 end of 2023-12-15T12Z is accepted; the existing `promote` printing
 `PROMOTED` for 2023 is read as confirmed, with no change to the locked script.
@@ -120,25 +120,10 @@ archive has the same layout as 2024. The three stores are at their final place,
   for December (about 19 s a cycle), which would be about **3.7 h**.
 - Stored: GEFS stores ≈ **0.9 GB**, restart cache ≈ **1.3 GB** (can be deleted once a month is verified).
 
-**Disk. The full build does not fit under the stop line today.** `df` at the end of this step:
-41,522 MiB free on `/` (40.5 GiB; `df -h` shows 41G). The stop line is 40 GB.
-
-| Item, under `~/wrfcomp-data/` | As 2024 was built | Lean |
-| --- | ---: | ---: |
-| `baselines/gefs/2023*.zarr` | 0.9 GB | 0.9 GB |
-| `baselines/points/` restart cache | 1.3 GB | 0.1 GB (deleted month by month) |
-| `gate1/2023-*_h00-12/` reference stores | 4.0 GB (months and quarters) | 2.6 GB at peak (quarters kept, months removed after joining) |
-| `truth/isd_conus_2023.nc`, `thresholds/tail_p95_to_2022-12-17.nc` | 0.13 GB | 0.13 GB |
-| `candidates/<model>/2023-MM.zarr` (one candidate version) | 1.0 GB | 1.0 GB |
-| Scoring scratch (joined quarter, removed after) | 0.3 GB | 0.3 GB |
-| **Total** | **about 7.6 GB** | **about 5.0 GB** |
-
-So about 5 to 8 GB must be freed, or the stop line moved, before step 2. This is the manager's call. Things
-I can see that are reproducible (I deleted nothing): the 2024 GEFS restart cache `baselines/points/`
-(1.3 GB; the 2024 cycles are complete and audited), the rejected v1 candidate stores (0.8 GB), `parsed/`
-(0.7 GB), the provisional GEFS directories (0.17 GB). Together about 3 GB, which is not enough for the
-2024-style build and tight for the lean one. `/mnt/d` has 1.2 TB free and would work as a separate data
-directory for 2023 (slower, many small files).
+**Disk.** Estimated before the build: about 7.6 GB if built as 2024 was (monthly and quarterly stores and
+the restart cache kept), about 5.0 GB lean (quarters kept, months removed after joining, restart cache
+deleted as cycles are verified), in both cases including about 1 GB for one candidate's 2023 stores and
+0.3 GB of scoring scratch. The lean layout was used; section 7 has the measured sizes.
 
 ## 5. How lane C3's candidate (v3) gets 2023 stores without seeing 2023 scores
 
@@ -161,14 +146,7 @@ directory for 2023 (slower, many small files).
 Raw-GEFS and climatology scorecards for 2023 (the pinned references) are not candidate scores, but they do
 show how the references behave in 2023. Build and pin them only after v3 is frozen.
 
-## Where I think the contract is wrong or incomplete
-
-- The ticket says free space is about 41 GB against a 40 GB stop line and asks where the build goes. With
-  those two numbers no placement on `/` works; see section 4.
-- "Persistence and GEFS as today" is right for GEFS. Persistence and climatology as today would use a
-  rolling cutoff in 2023 (section 2), so they need the explicit cutoff.
-
-## 6. Code (step 2, code only)
+## 6. Code
 
 All of it is unlocked code. The default behaviour of every changed function and command is unchanged.
 
@@ -198,19 +176,47 @@ compared by harness content hash with `experiments/REFERENCES.json`:
 
 Nothing was written to disk for this check.
 
-**The commands for 2023, once the disk decision is made (not run):**
-
-```sh
-uv run python scripts/build_thresholds.py --train-truth "$D/truth/isd_conus_train.nc" \
-  --train-end 2022-12-17T18 --out "$D/thresholds/tail_p95_to_2022-12-17.nc"
-uv run python scripts/run_gate1.py --data-dir "$D" --init-hours 0 12 --out experiments/ \
-  --confirmation-train-end 2022-12-17T18 --truth "$D/truth/isd_conus_train.nc" \
-  --thresholds "$D/thresholds/tail_p95_to_2022-12-17.nc" \
-  --period 2023-01 ... --period 2023-12 --period 2023-Q1 ... --period 2023-Q4
-```
-
 Tests: `tests/test_baselines_models.py` (the rolling-cutoff trap and its fix, for both models),
 `tests/test_gate1_scripts.py` (thresholds cut and attribute, a confirmation month end to end with a
 check that train data after the cutoff cannot move the references, the refusals, and the 2023 schedule
-with the real config: 180, 182, 184 and 152 init times).
+with the real config: 180, 182, 184 and 152 init times). `scripts/slice_truth.py` (the scored truth slice) has its own test there.
+
+## 7. The data build (done 2026-11-24)
+
+All under the data directory (`$D`), built at commit `5cd7fe4` of this branch. The 2024 check of section 6
+was repeated at that commit first and matched all three pinned hashes.
+
+```sh
+uv run python scripts/slice_truth.py --source "$D/truth/isd_conus_train.nc" \
+  --start 2022-12-31T18 --end 2023-12-17T18 --out "$D/truth/isd_conus_2023.nc"
+uv run python scripts/build_thresholds.py --train-truth "$D/truth/isd_conus_train.nc" \
+  --train-end 2022-12-17T18 --out "$D/thresholds/tail_p95_to_2022-12-17.nc"
+uv run python scripts/build_baselines.py gefs <each of the 698 init times>
+uv run python scripts/run_gate1.py --data-dir "$D" --init-hours 0 12 --out <dir> \
+  --confirmation-train-end 2022-12-17T18 --truth "$D/truth/isd_conus_2023.nc" \
+  --thresholds "$D/thresholds/tail_p95_to_2022-12-17.nc" \
+  --period 2023-01 ... --period 2023-12        # then the same with --period 2023-Q1 ... 2023-Q4
+```
+
+| Item | Result |
+| --- | --- |
+| Truth slice `truth/isd_conus_2023.nc` | 8,425 hours, 2022-12-31T18Z to 2023-12-17T18Z, 0.13 GB |
+| Thresholds `thresholds/tail_p95_to_2022-12-17.nc` | 500 stations, no station-month without a threshold |
+| GEFS 2023 | 698 cycles (695 downloaded here, 123.7 GB received and discarded, 5 h 43 min at four cycles at a time); 0.9 GB stored |
+| GEFS verification | every cycle: 500 stations, 31 members, 5 leads, all values finite, no dewpoint above temperature; none failed. Each cycle's restart cache was deleted once the cycle was verified |
+| Reference stores `gate1/2023-Qn_h00-12/` | climatology, persistence and GEFS for the four quarters, 2.0 GB. The monthly stores were removed after each quarter was joined |
+| Init times | Q1 180, Q2 182, Q3 184, Q4 152 (ends 2023-12-15T12Z) |
+| Cutoff recorded in the stores | `train_end_utc` = 2022-12-17T18Z on every climatology and persistence store |
+| Reference scorecards | twelve, `<model>_2023-Qn.json`, in the locked-change pull request |
+
+After the build every reference store, the truth slice and the thresholds file were hashed again from disk
+and equal the hashes in the proposed `experiments/REFERENCES.json`.
+
+The unchanged locked check was run once on 2023-Q4 with the persistence reference store as its input. It
+scored against both references and answered `NOT PASSED`, with the expected reason that the input is a
+reference forecast. That shows the locked script handles a 2023 period as it is. No candidate store for 2023
+was built or scored.
+
+Still open: `scripts/build_candidate.py` is hard-wired to 2024 and needs a year argument before a candidate's
+2023 stores can be built (the candidate lane's file).
 
