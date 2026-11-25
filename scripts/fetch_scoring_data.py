@@ -37,11 +37,22 @@ from typing import Any
 
 import h5py
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from wrfcomp.harness.align import check_forecast_not_sealed, check_not_sealed
 from wrfcomp.harness.config import HarnessConfig, load_config
 from wrfcomp.harness.hashing import content_sha256
+from wrfcomp.harness.schemas import (
+    _UNIT_ALIASES,
+    OFFSET_SUFFIX,
+    VARIABLE_UNITS,
+    SchemaError,
+    validate_forecast_dataset,
+    validate_thresholds,
+    validate_truth_dataset,
+)
+from wrfcomp.harness.truth import passing_qc_signature
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REFERENCES = ROOT / "experiments" / "REFERENCES.json"
@@ -50,8 +61,9 @@ DEFAULT_MAX_ARCHIVE_BYTES = 8 * 1024**3
 DEFAULT_MAX_MEMBERS = 50_000
 DEFAULT_MAX_MEMBER_BYTES = 512 * 1024**2
 DEFAULT_MAX_TOTAL_BYTES = 10 * 1024**3
-DEFAULT_MAX_STREAM_BYTES = 11 * 1024**3
-DEFAULT_MAX_HEADER_OVERHEAD_BYTES = 256 * 1024**2
+DEFAULT_MAX_TAR_HEADERS = 150_000
+DEFAULT_MAX_TAR_METADATA_BYTES = 64 * 1024**2
+DEFAULT_MAX_SINGLE_TAR_METADATA_BYTES = 64 * 1024
 DEFAULT_MAX_MANIFEST_BYTES = 16 * 1024**2
 DEFAULT_MAX_README_BYTES = 1 * 1024**2
 DEFAULT_MAX_METADATA_BYTES = 1 * 1024**2
@@ -144,37 +156,160 @@ ALLOWED_ZARR_ZARRAY_KEYS = frozenset(
     }
 )
 ALLOWED_ZARR_ZMETADATA_KEYS = frozenset({"metadata", "zarr_consolidated_format"})
+APPROVED_TRUTH_SOURCES = frozenset({"NOAA ISD global-hourly (noaa-global-hourly-pds)"})
+APPROVED_CALENDARS = frozenset({"proleptic_gregorian", "standard", "gregorian"})
+APPROVED_COORD_TOKENS = frozenset({"elevation_m", "latitude", "longitude"})
+APPROVED_DIMS = frozenset({"init_time", "lead_time", "station_id", "ens_member", "valid_time", "month"})
+APPROVED_LEAD_UNITS = frozenset({"hours", "minutes", "seconds", "nanoseconds"})
+NCPROPERTIES_RE = re.compile(r"^version=2,h5netcdf=[0-9.]+,hdf5=[0-9.]+,h5py=[0-9.]+$")
+CF_TIME_UNITS_RE = re.compile(
+    r"^(?:hours|minutes|seconds|days|nanoseconds) since "
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}$"
+)
+PARSER_VERSION_RE = re.compile(r"^[0-9]{1,8}$")
+MODEL_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+ISO_TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$")
+_TAR_ZERO_BLOCK = b"\x00" * 512
+_TAR_METADATA_TYPEFLAGS = frozenset({b"x", b"g", b"L", b"K", b"X"})
+_TAR_REGULAR_TYPEFLAGS = frozenset({b"0", b"\x00", b"5"})
 
 
 class FetchError(RuntimeError):
     """Raised when downloading, verifying, or unpacking a scoring bundle fails."""
 
 
-class _BoundedStream:
-    """Wrapper that enforces a hard cap on total decompressed bytes read by ``tarfile``."""
+def _parse_tar_size(field: bytes) -> int:
+    if not field:
+        return 0
+    if field[0] & 0x80:
+        # GNU base-256 encoding
+        val = field[0] & 0x7F
+        for b in field[1:]:
+            val = (val << 8) | b
+        return val
+    text = field.rstrip(b"\x00 ").decode("ascii", errors="strict").strip()
+    if not text:
+        return 0
+    return int(text, 8)
 
-    def __init__(self, stream: Any, max_bytes: int) -> None:
+
+class _TarBudgetStream:
+    """Framing-aware tar stream wrapper enforcing independent metadata and payload budgets.
+
+    Every 512-byte tar header block and every non-payload record (PAX ``x``/``g``, GNU ``L``/``K``,
+    EOF zero blocks) is charged against small, independent metadata limits *before* Python's
+    ``tarfile`` module reads or allocates the metadata record—completely separate from the
+    multi-GiB regular-file payload budget.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        *,
+        max_headers: int,
+        max_metadata_bytes: int,
+        max_single_metadata_bytes: int,
+        max_member_bytes: int,
+        max_total_bytes: int,
+    ) -> None:
         self._stream = stream
-        self._max_bytes = max_bytes
-        self.bytes_read = 0
+        self._max_headers = max_headers
+        self._max_metadata_bytes = max_metadata_bytes
+        self._max_single_metadata_bytes = max_single_metadata_bytes
+        self._max_member_bytes = max_member_bytes
+        self._max_total_bytes = max_total_bytes
+        self._buf = bytearray()
+        self._remaining_body = 0
+        self.header_count = 0
+        self.metadata_bytes = 0
+        self.payload_bytes = 0
+
+    def _read_exact(self, n: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < n:
+            piece = self._stream.read(n - len(chunks))
+            if not piece:
+                break
+            chunks.extend(piece)
+        return bytes(chunks)
+
+    def _charge_metadata(self, nbytes: int) -> None:
+        self.metadata_bytes += nbytes
+        if self.metadata_bytes > self._max_metadata_bytes:
+            raise FetchError(
+                f"Archive tar metadata bytes exceeded independent budget ({self._max_metadata_bytes} bytes)"
+            )
+
+    def _next_header_block(self) -> bytes:
+        block = self._read_exact(512)
+        if not block:
+            return b""
+        if len(block) < 512 or block == _TAR_ZERO_BLOCK:
+            self._charge_metadata(len(block))
+            return block
+
+        self.header_count += 1
+        if self.header_count > self._max_headers:
+            raise FetchError(
+                f"Archive tar header record count exceeded independent budget ({self._max_headers})"
+            )
+        self._charge_metadata(512)
+
+        typeflag = block[156:157]
+        try:
+            size = _parse_tar_size(block[124:136])
+        except ValueError as exc:
+            raise FetchError(f"Malformed tar header size field: {exc}") from exc
+        if size < 0:
+            raise FetchError("Negative size in tar header")
+        padded = ((size + 511) // 512) * 512
+
+        if typeflag in _TAR_METADATA_TYPEFLAGS:
+            if size > self._max_single_metadata_bytes:
+                raise FetchError(
+                    f"Single tar metadata/PAX record ({size} bytes) exceeds limit "
+                    f"({self._max_single_metadata_bytes} bytes)"
+                )
+            self._charge_metadata(padded)
+            self._remaining_body = padded
+        elif typeflag in _TAR_REGULAR_TYPEFLAGS:
+            if size > self._max_member_bytes:
+                raise FetchError(
+                    f"Archive member size {size} exceeds per-member limit ({self._max_member_bytes})"
+                )
+            if self.payload_bytes + size > self._max_total_bytes:
+                raise FetchError(
+                    f"Archive expanded payload exceeds limit ({self._max_total_bytes} bytes)"
+                )
+            self.payload_bytes += size
+            self._remaining_body = padded
+        else:
+            raise FetchError(f"Refusing non-regular tar member typeflag {typeflag!r}")
+        return block
 
     def read(self, size: int = -1) -> bytes:
-        remaining = self._max_bytes - self.bytes_read
-        if remaining < 0:
-            raise FetchError(
-                f"Decompressed archive stream (including headers/metadata) exceeded limit "
-                f"({self._max_bytes} bytes)"
-            )
-        to_read = remaining + 1 if (size is None or size < 0 or size > remaining + 1) else size
-        chunk = self._stream.read(to_read)
-        if chunk:
-            self.bytes_read += len(chunk)
-            if self.bytes_read > self._max_bytes:
-                raise FetchError(
-                    f"Decompressed archive stream (including headers/metadata) exceeded limit "
-                    f"({self._max_bytes} bytes)"
-                )
-        return chunk
+        want = 65536 if (size is None or size < 0) else size
+        if want == 0:
+            return b""
+        out = bytearray()
+        while len(out) < want:
+            if self._buf:
+                take = min(want - len(out), len(self._buf))
+                out.extend(self._buf[:take])
+                del self._buf[:take]
+            elif self._remaining_body > 0:
+                take = min(want - len(out), self._remaining_body)
+                piece = self._stream.read(take)
+                if not piece:
+                    break
+                out.extend(piece)
+                self._remaining_body -= len(piece)
+            else:
+                block = self._next_header_block()
+                if not block:
+                    break
+                self._buf.extend(block)
+        return bytes(out)
 
 
 def default_data_dir() -> Path:
@@ -306,38 +441,248 @@ def _assert_tree_no_symlinks(root: Path, relpath: str, what: str, *, must_exist:
     return cur
 
 
-def _check_attr_value(val: Any, what: str) -> None:
-    if isinstance(val, bytes):
-        if len(val) > MAX_ATTR_VALUE_LEN or b"\x00" in val:
-            raise FetchError(f"{what}: attribute bytes value too large or contains NUL")
-        return
-    if isinstance(val, str):
-        if len(val) > MAX_ATTR_VALUE_LEN or "\x00" in val:
-            raise FetchError(f"{what}: attribute string too large or contains NUL")
-        return
-    if isinstance(val, bool | int | float | np.generic) or val is None:
-        return
-    if isinstance(val, list | tuple):
-        if len(val) > 32:
-            raise FetchError(f"{what}: attribute sequence too long")
-        for item in val:
-            _check_attr_value(item, what)
-        return
-    if isinstance(val, np.ndarray):
-        if val.size > 32:
-            raise FetchError(f"{what}: attribute array too large")
-        return
-    raise FetchError(f"{what}: unsupported attribute value type {type(val).__name__}")
+def _as_text(val: Any, what: str) -> str:
+    if isinstance(val, bytes | np.bytes_):
+        try:
+            text = bytes(val).decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise FetchError(f"{what}: non-ASCII bytes value refused") from exc
+    elif isinstance(val, str | np.str_):
+        text = str(val)
+    else:
+        raise FetchError(f"{what}: expected string value, got {type(val).__name__}")
+    if len(text) > MAX_ATTR_VALUE_LEN or "\x00" in text:
+        raise FetchError(f"{what}: string too large or contains NUL")
+    return text
 
 
-def _validate_zarr_attrs_dict(attrs: Any, allowed_keys: frozenset[str], what: str) -> dict[str, Any]:
+def _as_scalar_float(val: Any, what: str) -> float:
+    arr = np.asarray(val)
+    if arr.size != 1 or arr.dtype.kind not in "iuf":
+        raise FetchError(f"{what}: expected numeric scalar")
+    return float(arr.reshape(-1)[0])
+
+
+def _as_scalar_int(val: Any, what: str) -> int:
+    arr = np.asarray(val)
+    if arr.size != 1 or arr.dtype.kind not in "iu":
+        raise FetchError(f"{what}: expected integer scalar")
+    return int(arr.reshape(-1)[0])
+
+
+def _validate_train_end_value(val: Any, cfg: HarnessConfig, what: str) -> None:
+    text = _as_text(val, what)
+    if not ISO_TIMESTAMP_RE.fullmatch(text):
+        raise FetchError(f"{what}: invalid ISO timestamp {text!r}")
+    assert cfg.splits.train.end is not None
+    if pd.Timestamp(text) != pd.Timestamp(cfg.splits.train.end):
+        raise FetchError(
+            f"{what}: train_end_utc {text!r} does not match config {pd.Timestamp(cfg.splits.train.end)}"
+        )
+
+
+def _validate_var_attr_value(
+    var_name: str,
+    attr_name: str,
+    val: Any,
+    *,
+    kind: str,
+    cfg: HarnessConfig,
+    what: str,
+) -> None:
+    if attr_name == "units":
+        text = _as_text(val, what)
+        if var_name in VARIABLE_UNITS:
+            allowed = _UNIT_ALIASES[VARIABLE_UNITS[var_name]]
+            if text not in allowed:
+                raise FetchError(
+                    f"{what}: invalid units {text!r} for {var_name} (expected one of {sorted(allowed)})"
+                )
+        elif var_name.endswith(OFFSET_SUFFIX) and var_name[: -len(OFFSET_SUFFIX)] in VARIABLE_UNITS:
+            if text != "minutes":
+                raise FetchError(f"{what}: invalid units {text!r} for offset {var_name}")
+        elif var_name == "elevation_m":
+            if text != "m":
+                raise FetchError(f"{what}: invalid units {text!r} for elevation_m")
+        elif var_name == "latitude":
+            if text != "degrees_north":
+                raise FetchError(f"{what}: invalid units {text!r} for latitude")
+        elif var_name == "longitude":
+            if text != "degrees_east":
+                raise FetchError(f"{what}: invalid units {text!r} for longitude")
+        elif var_name in ("valid_time", "init_time"):
+            if not CF_TIME_UNITS_RE.fullmatch(text):
+                raise FetchError(f"{what}: invalid CF time units {text!r}")
+        elif var_name == "lead_time":
+            if text not in APPROVED_LEAD_UNITS:
+                raise FetchError(f"{what}: invalid lead_time units {text!r}")
+        else:
+            raise FetchError(f"{what}: unexpected units attribute on {var_name!r}")
+        return
+
+    if attr_name == "long_name":
+        if kind != "truth" or not var_name.endswith(OFFSET_SUFFIX):
+            raise FetchError(f"{what}: long_name is only approved on truth offset variables")
+        base = var_name[: -len(OFFSET_SUFFIX)]
+        expected = f"Observation time offset from valid_time for {base} (-32768 when missing)"
+        text = _as_text(val, what)
+        if text != expected:
+            raise FetchError(f"{what}: unapproved long_name {text!r}")
+        return
+
+    if attr_name == "calendar":
+        if var_name not in ("valid_time", "init_time"):
+            raise FetchError(f"{what}: calendar only approved on time coordinates")
+        text = _as_text(val, what)
+        if text not in APPROVED_CALENDARS:
+            raise FetchError(f"{what}: unapproved calendar {text!r}")
+        return
+
+    if attr_name == "coordinates":
+        text = _as_text(val, what)
+        tokens = text.split()
+        if not tokens or not set(tokens).issubset(APPROVED_COORD_TOKENS):
+            raise FetchError(f"{what}: unapproved coordinates attribute {text!r}")
+        return
+
+    if attr_name == "tail_quantile":
+        if kind != "thresholds":
+            raise FetchError(f"{what}: tail_quantile only approved on thresholds")
+        q = _as_scalar_float(val, what)
+        if abs(q - float(cfg.gate.tail_quantile)) > 1e-9:
+            raise FetchError(f"{what}: tail_quantile {q} != {cfg.gate.tail_quantile}")
+        return
+
+    if attr_name == "train_end_utc":
+        if kind != "thresholds":
+            raise FetchError(f"{what}: train_end_utc only approved on thresholds")
+        _validate_train_end_value(val, cfg, what)
+        return
+
+    if attr_name == "_ARRAY_DIMENSIONS":
+        ok_dims = isinstance(val, list) and bool(val) and all(
+            isinstance(d, str) and d in APPROVED_DIMS for d in val
+        )
+        if not ok_dims:
+            raise FetchError(f"{what}: unapproved _ARRAY_DIMENSIONS {val!r}")
+        return
+
+    if attr_name == "dtype":
+        text = _as_text(val, what)
+        if var_name != "lead_time" or text != "timedelta64[ns]":
+            raise FetchError(f"{what}: unapproved dtype attribute {text!r} on {var_name!r}")
+        return
+
+    if attr_name == "CLASS":
+        text = _as_text(val, what)
+        if text != "DIMENSION_SCALE":
+            raise FetchError(f"{what}: unapproved HDF5 CLASS {text!r}")
+        return
+
+    if attr_name == "NAME":
+        text = _as_text(val, what)
+        if text != var_name and not text.startswith("This is a netCDF dimension"):
+            raise FetchError(f"{what}: unapproved HDF5 NAME {text!r}")
+        return
+
+    if attr_name in (
+        "_Netcdf4Dimid",
+        "_Netcdf4Coordinates",
+        "_FillValue",
+        "DIMENSION_LIST",
+        "REFERENCE_LIST",
+    ):
+        return
+
+    raise FetchError(f"{what}: unapproved attribute {attr_name!r}")
+
+
+def _validate_netcdf_root_attr_value(
+    attr_name: str, val: Any, *, kind: str, cfg: HarnessConfig, what: str
+) -> None:
+    if attr_name == "_NCProperties":
+        text = _as_text(val, what)
+        if not NCPROPERTIES_RE.fullmatch(text):
+            raise FetchError(f"{what}: unapproved _NCProperties value {text!r}")
+        return
+    if attr_name == "protocol_version":
+        text = _as_text(val, what)
+        if text != cfg.protocol_version:
+            raise FetchError(f"{what}: protocol_version {text!r} != {cfg.protocol_version!r}")
+        return
+    if kind == "truth":
+        if attr_name == "source":
+            text = _as_text(val, what)
+            if text not in APPROVED_TRUTH_SOURCES:
+                raise FetchError(f"{what}: unapproved truth source {text!r}")
+            return
+        if attr_name == "parser_version":
+            text = _as_text(val, what)
+            if not PARSER_VERSION_RE.fullmatch(text):
+                raise FetchError(f"{what}: invalid parser_version {text!r}")
+            return
+        if attr_name == "truth_tolerance_minutes":
+            tol = _as_scalar_int(val, what)
+            if tol != int(cfg.evaluation.truth_tolerance_minutes):
+                raise FetchError(
+                    f"{what}: truth_tolerance_minutes {tol} != {cfg.evaluation.truth_tolerance_minutes}"
+                )
+            return
+        if attr_name == "passing_qc_codes":
+            text = _as_text(val, what)
+            if text != passing_qc_signature():
+                raise FetchError(f"{what}: unapproved passing_qc_codes {text!r}")
+            return
+    if kind == "thresholds":
+        if attr_name == "tail_quantile":
+            q = _as_scalar_float(val, what)
+            if abs(q - float(cfg.gate.tail_quantile)) > 1e-9:
+                raise FetchError(f"{what}: tail_quantile {q} != {cfg.gate.tail_quantile}")
+            return
+        if attr_name == "train_end_utc":
+            _validate_train_end_value(val, cfg, what)
+            return
+    raise FetchError(f"{what}: unapproved root attribute {attr_name!r}")
+
+
+def _validate_zarr_root_attrs(
+    attrs: Any,
+    *,
+    expected_model_id: str | None,
+    what: str,
+) -> dict[str, Any]:
     if not isinstance(attrs, dict):
         raise FetchError(f"{what}: must be a JSON object")
-    disallowed = sorted(set(attrs) - allowed_keys)
+    disallowed = sorted(set(attrs) - ALLOWED_ZARR_ROOT_ATTRS)
+    if disallowed:
+        raise FetchError(f"{what}: unapproved metadata attributes refused: {disallowed}")
+    model_id = _as_text(attrs.get("model_id"), f"{what}['model_id']")
+    if expected_model_id is not None and model_id != expected_model_id:
+        raise FetchError(f"{what}: model_id {model_id!r} != pinned {expected_model_id!r}")
+    if model_id not in REQUIRED_BASELINES:
+        raise FetchError(f"{what}: unapproved reference model_id {model_id!r}")
+    model_ver = _as_text(attrs.get("model_version"), f"{what}['model_version']")
+    if not MODEL_VERSION_RE.fullmatch(model_ver):
+        raise FetchError(f"{what}: unapproved model_version {model_ver!r}")
+    return attrs
+
+
+def _validate_zarr_var_attrs(
+    attrs: Any,
+    *,
+    var_name: str,
+    cfg: HarnessConfig,
+    what: str,
+) -> dict[str, Any]:
+    if not isinstance(attrs, dict):
+        raise FetchError(f"{what}: must be a JSON object")
+    disallowed = sorted(set(attrs) - ALLOWED_ZARR_VAR_ATTRS)
     if disallowed:
         raise FetchError(f"{what}: unapproved metadata attributes refused: {disallowed}")
     for key, val in attrs.items():
-        _check_attr_value(val, f"{what}[{key!r}]")
+        _validate_var_attr_value(
+            var_name, key, val, kind="reference_forecast", cfg=cfg, what=f"{what}[{key!r}]"
+        )
     return attrs
 
 
@@ -345,6 +690,8 @@ def _validate_zarr_store(
     root: Path,
     relpath: str,
     *,
+    cfg: HarnessConfig,
+    expected_model_id: str | None = None,
     max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
     max_metadata_bytes: int = DEFAULT_MAX_METADATA_BYTES,
@@ -381,12 +728,14 @@ def _validate_zarr_store(
 
     parsed_metadata: dict[str, Any] = {".zgroup": zgroup}
     if ".zattrs" in root_files:
-        zattrs = _validate_zarr_attrs_dict(
+        zattrs = _validate_zarr_root_attrs(
             _read_bounded_json(root_files[".zattrs"], max_metadata_bytes, f"{relpath}/.zattrs"),
-            ALLOWED_ZARR_ROOT_ATTRS,
-            f"{relpath}/.zattrs",
+            expected_model_id=expected_model_id,
+            what=f"{relpath}/.zattrs",
         )
         parsed_metadata[".zattrs"] = zattrs
+    else:
+        raise FetchError(f"{relpath}: missing .zattrs with model_id/model_version")
 
     if not var_dirs:
         raise FetchError(f"{relpath}: Zarr store contains no arrays")
@@ -449,10 +798,11 @@ def _validate_zarr_store(
                 if inner_rel == ".zarray":
                     continue
                 if inner_rel == ".zattrs":
-                    vattrs = _validate_zarr_attrs_dict(
+                    vattrs = _validate_zarr_var_attrs(
                         _read_bounded_json(fpath, max_metadata_bytes, f"{relpath}/{var_name}/.zattrs"),
-                        ALLOWED_ZARR_VAR_ATTRS,
-                        f"{relpath}/{var_name}/.zattrs",
+                        var_name=var_name,
+                        cfg=cfg,
+                        what=f"{relpath}/{var_name}/.zattrs",
                     )
                     parsed_metadata[f"{var_name}/.zattrs"] = vattrs
                     continue
@@ -486,7 +836,7 @@ def _validate_zarr_store(
     return set(var_dirs)
 
 
-def _validate_netcdf_file(root: Path, relpath: str, *, kind: str) -> set[str]:
+def _validate_netcdf_file(root: Path, relpath: str, *, kind: str, cfg: HarnessConfig) -> set[str]:
     target = _assert_tree_no_symlinks(root, relpath, f"netcdf {relpath}", must_exist=True)
     if not stat.S_ISREG(os.lstat(target).st_mode):
         raise FetchError(f"{relpath}: expected a regular NetCDF file")
@@ -509,7 +859,13 @@ def _validate_netcdf_file(root: Path, relpath: str, *, kind: str) -> set[str]:
                     f"{relpath}: unapproved root NetCDF metadata attributes refused: {disallowed_root}"
                 )
             for attr_name in h5f.attrs.keys():
-                _check_attr_value(h5f.attrs[attr_name], f"{relpath} root attr {attr_name!r}")
+                _validate_netcdf_root_attr_value(
+                    attr_name,
+                    h5f.attrs[attr_name],
+                    kind=kind,
+                    cfg=cfg,
+                    what=f"{relpath} root attr {attr_name!r}",
+                )
 
             hdf5_datasets: set[str] = set()
             for name in sorted(h5f.keys()):
@@ -528,9 +884,14 @@ def _validate_netcdf_file(root: Path, relpath: str, *, kind: str) -> set[str]:
                         f"{disallowed_var}"
                     )
                 for attr_name in obj.attrs.keys():
-                    if attr_name in ("DIMENSION_LIST", "REFERENCE_LIST"):
-                        continue
-                    _check_attr_value(obj.attrs[attr_name], f"{relpath}/{name} attr {attr_name!r}")
+                    _validate_var_attr_value(
+                        name,
+                        attr_name,
+                        obj.attrs[attr_name],
+                        kind=kind,
+                        cfg=cfg,
+                        what=f"{relpath}/{name} attr {attr_name!r}",
+                    )
                 hdf5_datasets.add(name)
     except FetchError:
         raise
@@ -581,8 +942,8 @@ def expected_pins(
     references_path: Path,
     year: int,
     cfg: HarnessConfig,
-) -> tuple[list[str], dict[str, tuple[str, str]]]:
-    """Return ``(periods, {relpath: (kind, expected_content_sha256)})`` from ``REFERENCES.json``."""
+) -> tuple[list[str], dict[str, tuple[str, str, str | None]]]:
+    """Return ``(periods, {relpath: (kind, expected_content_sha256, model_id)})`` from ``REFERENCES.json``."""
     sealed_dt = cfg.splits.sealed_test.start_utc
     if year >= sealed_dt.year:
         raise FetchError(
@@ -596,15 +957,15 @@ def expected_pins(
         raise FetchError("Invalid REFERENCES.json structure")
 
     periods: list[str] = []
-    pins: dict[str, tuple[str, str]] = {}
+    pins: dict[str, tuple[str, str, str | None]] = {}
 
-    def record(relpath: str, kind: str, digest: str) -> None:
+    def record(relpath: str, kind: str, digest: str, model_id: str | None = None) -> None:
         _validate_relpath(relpath, f"REFERENCES.json {kind}")
         if relpath in pins:
-            if pins[relpath] != (kind, digest):
+            if pins[relpath] != (kind, digest, model_id):
                 raise FetchError(f"Conflicting pins in REFERENCES.json for {relpath}")
         else:
-            pins[relpath] = (kind, digest)
+            pins[relpath] = (kind, digest, model_id)
 
     for period in sorted(inventory["periods"]):
         m = PERIOD_RE.fullmatch(period)
@@ -619,7 +980,7 @@ def expected_pins(
             rec = refs[baseline]
             record(entry["truth"], "truth", rec["truth_sha256"])
             record(entry["thresholds"], "thresholds", rec["thresholds_sha256"])
-            record(rec["store"], "reference_forecast", rec["forecast_sha256"])
+            record(rec["store"], "reference_forecast", rec["forecast_sha256"], str(rec["model_id"]))
 
     if not periods:
         raise FetchError(f"No periods pinned for year {year} in {references_path.name}")
@@ -734,21 +1095,23 @@ def _safe_extract_archive(
     max_members: int = DEFAULT_MAX_MEMBERS,
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
-    max_stream_bytes: int | None = None,
+    max_tar_headers: int | None = None,
+    max_tar_metadata_bytes: int = DEFAULT_MAX_TAR_METADATA_BYTES,
+    max_single_tar_metadata_bytes: int = DEFAULT_MAX_SINGLE_TAR_METADATA_BYTES,
     max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
     max_readme_bytes: int = DEFAULT_MAX_README_BYTES,
     min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
 ) -> set[str]:
-    """Stream-extract regular files into ``staging_dir`` with pre-parse decompression & size limits."""
+    """Stream-extract regular files with independent tar metadata and payload budgets."""
     extracted_files: set[str] = set()
     staging_real = staging_dir.resolve(strict=True)
     member_count = 0
     total_written = 0
-    if max_stream_bytes is None:
-        header_overhead = min(max_members * 1024, DEFAULT_MAX_HEADER_OVERHEAD_BYTES)
-        stream_limit = min(DEFAULT_MAX_STREAM_BYTES, max_total_bytes + header_overhead)
-    else:
-        stream_limit = max_stream_bytes
+    header_limit = (
+        min(DEFAULT_MAX_TAR_HEADERS, max(max_members * 3, 16))
+        if max_tar_headers is None
+        else max_tar_headers
+    )
 
     try:
         fh, _ = _open_regular_nofollow(archive_path, f"archive {archive_path.name}")
@@ -761,7 +1124,14 @@ def _safe_extract_archive(
             else:
                 decompressed = fh
             try:
-                bounded = _BoundedStream(decompressed, stream_limit)
+                bounded = _TarBudgetStream(
+                    decompressed,
+                    max_headers=header_limit,
+                    max_metadata_bytes=max_tar_metadata_bytes,
+                    max_single_metadata_bytes=max_single_tar_metadata_bytes,
+                    max_member_bytes=max_member_bytes,
+                    max_total_bytes=max_total_bytes,
+                )
                 with tarfile.open(fileobj=bounded, mode="r|") as tf:
                     for member in tf:
                         member_count += 1
@@ -948,9 +1318,9 @@ def verify_staged_bundle(
     if extra_in_manifest:
         raise FetchError(f"Archive contains unpinned artifacts: {extra_in_manifest}")
 
-    # Strictly validate physical Zarr v2 / NetCDF layout + chunk bounds BEFORE opening with xarray,
-    # then verify dataset content_sha256 against BOTH MANIFEST.json and REFERENCES.json.
-    for relpath, (kind, ref_sha256) in sorted(pins.items()):
+    # Strictly validate physical Zarr v2 / NetCDF layout + approved metadata values + schema
+    # + chunk bounds BEFORE hashing, then verify dataset content_sha256 against MANIFEST & REFERENCES.
+    for relpath, (kind, ref_sha256, expected_model_id) in sorted(pins.items()):
         entry = manifest_paths[relpath]
         if entry.get("kind") != kind:
             raise FetchError(f"Kind mismatch for {relpath}: manifest={entry.get('kind')}, expected={kind}")
@@ -967,17 +1337,28 @@ def verify_staged_bundle(
             expected_var_names = _validate_zarr_store(
                 staging_dir,
                 relpath,
+                cfg=cfg,
+                expected_model_id=expected_model_id,
                 max_chunk_bytes=max_chunk_bytes,
                 max_dataset_bytes=max_dataset_bytes,
             )
         elif fmt == "netcdf":
-            expected_var_names = _validate_netcdf_file(staging_dir, relpath, kind=kind)
+            expected_var_names = _validate_netcdf_file(staging_dir, relpath, kind=kind, cfg=cfg)
         else:
             raise FetchError(f"Unsupported format {fmt!r} for {relpath}")
 
         with _open_dataset(staged_target, fmt, f"{kind} {relpath}") as ds:
             _check_dataset_bounds(ds, relpath, max_dataset_bytes=max_dataset_bytes)
             _check_not_sealed(ds, kind, relpath, cfg)
+            try:
+                if kind == "truth":
+                    validate_truth_dataset(ds, cfg=cfg)
+                elif kind == "thresholds":
+                    validate_thresholds(ds)
+                elif kind == "reference_forecast":
+                    validate_forecast_dataset(ds, cfg=cfg)
+            except SchemaError as exc:
+                raise FetchError(f"{relpath}: harness schema validation failed: {exc}") from exc
             ds_vars = {str(name) for name in ds.variables}
             if ds_vars != expected_var_names:
                 raise FetchError(
@@ -1173,7 +1554,9 @@ def fetch_scoring_data(
     max_members: int = DEFAULT_MAX_MEMBERS,
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
     max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
-    max_stream_bytes: int | None = None,
+    max_tar_headers: int | None = None,
+    max_tar_metadata_bytes: int = DEFAULT_MAX_TAR_METADATA_BYTES,
+    max_single_tar_metadata_bytes: int = DEFAULT_MAX_SINGLE_TAR_METADATA_BYTES,
     max_manifest_bytes: int = DEFAULT_MAX_MANIFEST_BYTES,
     max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
@@ -1256,7 +1639,9 @@ def fetch_scoring_data(
             max_members=max_members,
             max_member_bytes=max_member_bytes,
             max_total_bytes=max_total_bytes,
-            max_stream_bytes=max_stream_bytes,
+            max_tar_headers=max_tar_headers,
+            max_tar_metadata_bytes=max_tar_metadata_bytes,
+            max_single_tar_metadata_bytes=max_single_tar_metadata_bytes,
             max_manifest_bytes=max_manifest_bytes,
         )
         manifest = verify_staged_bundle(

@@ -47,14 +47,26 @@ def _make_truth(seed: int = 1) -> xr.Dataset:
     stations = np.array(["72405013743", "72295023174"], dtype="U11")
     return xr.Dataset(
         {
-            "t2m": (("valid_time", "station_id"), rng.normal(280.0, 2.0, (4, 2)).astype(np.float32)),
+            "t2m": (
+                ("valid_time", "station_id"),
+                rng.normal(280.0, 2.0, (4, 2)).astype(np.float32),
+                {"units": "K"},
+            ),
         },
         coords={
             "valid_time": times,
             "station_id": stations,
-            "latitude": ("station_id", np.array([38.85, 33.94], dtype=np.float32)),
-            "longitude": ("station_id", np.array([-77.04, -118.41], dtype=np.float32)),
-            "elevation_m": ("station_id", np.array([4.0, 38.0], dtype=np.float32)),
+            "latitude": (
+                "station_id",
+                np.array([38.85, 33.94], dtype=np.float32),
+                {"units": "degrees_north"},
+            ),
+            "longitude": (
+                "station_id",
+                np.array([-77.04, -118.41], dtype=np.float32),
+                {"units": "degrees_east"},
+            ),
+            "elevation_m": ("station_id", np.array([4.0, 38.0], dtype=np.float32), {"units": "m"}),
         },
     )
 
@@ -64,9 +76,18 @@ def _make_thresholds(seed: int = 2) -> xr.Dataset:
     stations = np.array(["72405013743", "72295023174"], dtype="U11")
     return xr.Dataset(
         {
-            "t2m": (("station_id", "month"), rng.uniform(290.0, 305.0, (2, 12)).astype(np.float32)),
+            "t2m": (
+                ("station_id", "month"),
+                rng.uniform(290.0, 305.0, (2, 12)).astype(np.float32),
+                {"units": "K", "tail_quantile": 0.95, "train_end_utc": "2023-12-17T18:00:00.000000000"},
+            ),
         },
         coords={"station_id": stations, "month": np.arange(1, 13, dtype=np.int32)},
+        attrs={
+            "protocol_version": "0.1.0",
+            "tail_quantile": 0.95,
+            "train_end_utc": "2023-12-17T18:00:00.000000000",
+        },
     )
 
 
@@ -81,6 +102,7 @@ def _make_forecast(model_id: str, start: str, seed: int) -> xr.Dataset:
             "t2m": (
                 ("init_time", "lead_time", "station_id", "ens_member"),
                 rng.normal(280.0, 1.5, (2, 2, 2, 2)).astype(np.float32),
+                {"units": "K"},
             )
         },
         coords={
@@ -88,6 +110,17 @@ def _make_forecast(model_id: str, start: str, seed: int) -> xr.Dataset:
             "lead_time": leads,
             "station_id": stations,
             "ens_member": members,
+            "latitude": (
+                "station_id",
+                np.array([38.85, 33.94], dtype=np.float32),
+                {"units": "degrees_north"},
+            ),
+            "longitude": (
+                "station_id",
+                np.array([-77.04, -118.41], dtype=np.float32),
+                {"units": "degrees_east"},
+            ),
+            "elevation_m": ("station_id", np.array([4.0, 38.0], dtype=np.float32), {"units": "m"}),
         },
         attrs={"model_id": model_id, "model_version": "test-1"},
     )
@@ -343,7 +376,7 @@ def test_extraction_download_manifest_and_chunk_limits(synthetic_env, tmp_path, 
         )
 
     # Per-member size limit
-    with pytest.raises(fetcher.FetchError, match="exceeds limit"):
+    with pytest.raises(fetcher.FetchError, match="exceeds per-member limit"):
         fetcher.fetch_scoring_data(
             year=2024,
             data_dir=tmp_path / "lim_member",
@@ -840,7 +873,7 @@ def test_fetch_resolves_zenodo_record_url_with_mock_transport(synthetic_env, tmp
 
 
 def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp_path):
-    """Re-review item 1: cap decompressed tar stream including PAX extended headers before member yield."""
+    """Independent tar metadata budget stops PAX/header bombs even under the default 10 GiB payload cap."""
     summary = builder.build_bundle(
         year=2024,
         data_dir=synthetic_env["data_dir"],
@@ -851,7 +884,8 @@ def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp
     )
     manifest_sidecar = Path(summary["manifest_sidecar"])
 
-    # Tiny 2-byte member wrapped in a 100 KiB PAX extended header (member payload is tiny, header is huge).
+    # 1. Single 100 KiB PAX extended header on a 2-byte member is rejected BEFORE allocation,
+    # even with the default 10 GiB payload budget!
     bloated = tmp_path / "pax_bomb.tar.gz"
     with gzip.open(bloated, "wb") as gz, tarfile.open(
         fileobj=gz, mode="w", format=tarfile.PAX_FORMAT
@@ -861,7 +895,7 @@ def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp
         info.pax_headers = {"comment": "X" * 100_000}
         tf.addfile(info, io.BytesIO(b"ok"))
 
-    with pytest.raises(fetcher.FetchError, match="Decompressed archive stream"):
+    with pytest.raises(fetcher.FetchError, match="Single tar metadata/PAX record"):
         fetcher.fetch_scoring_data(
             year=2024,
             data_dir=tmp_path / "pax_dest",
@@ -869,8 +903,40 @@ def test_decompression_stream_budget_caps_pax_header_metadata(synthetic_env, tmp
             references_path=synthetic_env["ref_path"],
             config_path=CONFIG_PATH,
             expected_manifest=manifest_sidecar,
-            max_total_bytes=4096,
-            max_stream_bytes=8192,
+        )
+
+    # 2. Many smaller PAX records exceeding total metadata budget are rejected even under 10 GiB payload cap.
+    many_pax = tmp_path / "many_pax.tar.gz"
+    with gzip.open(many_pax, "wb") as gz, tarfile.open(
+        fileobj=gz, mode="w", format=tarfile.PAX_FORMAT
+    ) as tf:
+        for idx in range(12):
+            info = tarfile.TarInfo(f"truth/part_{idx}.txt")
+            info.size = 2
+            info.pax_headers = {"comment": "Y" * 2000}
+            tf.addfile(info, io.BytesIO(b"ok"))
+
+    with pytest.raises(fetcher.FetchError, match="tar metadata bytes exceeded independent budget"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "many_pax_dest",
+            archive=many_pax,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_manifest=manifest_sidecar,
+            max_tar_metadata_bytes=16 * 1024,
+        )
+
+    # 3. Raw tar header record count budget enforced independently of payload budget.
+    with pytest.raises(fetcher.FetchError, match="header record count exceeded independent budget"):
+        fetcher.fetch_scoring_data(
+            year=2024,
+            data_dir=tmp_path / "many_hdr_dest",
+            archive=many_pax,
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            expected_manifest=manifest_sidecar,
+            max_tar_headers=6,
         )
 
 
@@ -959,6 +1025,65 @@ def test_builder_public_metadata_allowlist_and_nested_netcdf_group(synthetic_env
             min_free_gb=0.0,
         )
     t2m_zattrs_path.write_bytes(orig_t2m_zattrs)
+
+    # 6. Allowed key with INVALID VALUE: bad t2m units on truth NetCDF (logical hash still matches!)
+    ds_bad_units = _make_truth(seed=10)
+    ds_bad_units["t2m"].attrs["units"] = "degC"
+    ds_bad_units.to_netcdf(truth_path, engine="h5netcdf")
+    with pytest.raises(builder.BundleError, match="invalid units"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+
+    # 7. Allowed key with INVALID VALUE: unapproved free-text provenance in truth 'source' attr
+    ds_bad_source = _make_truth(seed=10)
+    ds_bad_source.attrs["source"] = "private-host:/tmp/dump"
+    ds_bad_source.to_netcdf(truth_path, engine="h5netcdf")
+    with pytest.raises(builder.BundleError, match="unapproved truth source"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    truth_path.write_bytes(orig_truth_bytes)
+
+    # 8. Allowed key with INVALID VALUE: wrong units on Zarr t2m
+    bad_units_zattrs = json.loads(orig_t2m_zattrs.decode("utf-8"))
+    bad_units_zattrs["units"] = "fahrenheit"
+    t2m_zattrs_path.write_text(json.dumps(bad_units_zattrs), encoding="utf-8")
+    with pytest.raises(builder.BundleError, match="invalid units"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    t2m_zattrs_path.write_bytes(orig_t2m_zattrs)
+
+    # 9. Allowed key with INVALID VALUE: unapproved model_version free text in Zarr root .zattrs
+    bad_ver_attrs = json.loads(orig_zattrs.decode("utf-8"))
+    bad_ver_attrs["model_version"] = "private /host/path note"
+    (gefs_path / ".zattrs").write_text(json.dumps(bad_ver_attrs), encoding="utf-8")
+    with pytest.raises(builder.BundleError, match="unapproved model_version"):
+        builder.build_bundle(
+            year=2024,
+            data_dir=data_dir,
+            out_dir=synthetic_env["out_dir"],
+            references_path=synthetic_env["ref_path"],
+            config_path=CONFIG_PATH,
+            min_free_gb=0.0,
+        )
+    (gefs_path / ".zattrs").write_bytes(orig_zattrs)
 
 
 def test_existing_destination_physical_byte_hash_and_inventory_verified(synthetic_env, tmp_path):

@@ -36,11 +36,22 @@ from typing import Any
 
 import h5py
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from wrfcomp.harness.align import check_forecast_not_sealed, check_not_sealed
 from wrfcomp.harness.config import HarnessConfig, load_config
 from wrfcomp.harness.hashing import content_sha256
+from wrfcomp.harness.schemas import (
+    _UNIT_ALIASES,
+    OFFSET_SUFFIX,
+    VARIABLE_UNITS,
+    SchemaError,
+    validate_forecast_dataset,
+    validate_thresholds,
+    validate_truth_dataset,
+)
+from wrfcomp.harness.truth import passing_qc_signature
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REFERENCES = ROOT / "experiments" / "REFERENCES.json"
@@ -141,12 +152,28 @@ class BundleError(RuntimeError):
     """Raised when bundle inputs, pins, disk space, layout, or hashes fail validation."""
 
 
+APPROVED_TRUTH_SOURCES = frozenset({"NOAA ISD global-hourly (noaa-global-hourly-pds)"})
+APPROVED_CALENDARS = frozenset({"proleptic_gregorian", "standard", "gregorian"})
+APPROVED_COORD_TOKENS = frozenset({"elevation_m", "latitude", "longitude"})
+APPROVED_DIMS = frozenset({"init_time", "lead_time", "station_id", "ens_member", "valid_time", "month"})
+APPROVED_LEAD_UNITS = frozenset({"hours", "minutes", "seconds", "nanoseconds"})
+NCPROPERTIES_RE = re.compile(r"^version=2,h5netcdf=[0-9.]+,hdf5=[0-9.]+,h5py=[0-9.]+$")
+CF_TIME_UNITS_RE = re.compile(
+    r"^(?:hours|minutes|seconds|days|nanoseconds) since "
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}$"
+)
+PARSER_VERSION_RE = re.compile(r"^[0-9]{1,8}$")
+MODEL_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+ISO_TIMESTAMP_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?$")
+
+
 @dataclass(frozen=True)
 class PinnedItem:
     relpath: str
     kind: str  # "truth" | "thresholds" | "reference_forecast"
     expected_sha256: str
     pinned_by: tuple[dict[str, str], ...]
+    expected_model_id: str | None = None
 
 
 class _HashingReader:
@@ -264,38 +291,248 @@ def _assert_source_contained(root: Path, relpath: str, what: str) -> Path:
     return cur
 
 
-def _check_attr_value(val: Any, what: str) -> None:
-    if isinstance(val, bytes):
-        if len(val) > MAX_ATTR_VALUE_LEN or b"\x00" in val:
-            raise BundleError(f"{what}: attribute bytes value too large or contains NUL")
-        return
-    if isinstance(val, str):
-        if len(val) > MAX_ATTR_VALUE_LEN or "\x00" in val:
-            raise BundleError(f"{what}: attribute string too large or contains NUL")
-        return
-    if isinstance(val, bool | int | float | np.generic) or val is None:
-        return
-    if isinstance(val, list | tuple):
-        if len(val) > 32:
-            raise BundleError(f"{what}: attribute sequence too long")
-        for item in val:
-            _check_attr_value(item, what)
-        return
-    if isinstance(val, np.ndarray):
-        if val.size > 32:
-            raise BundleError(f"{what}: attribute array too large")
-        return
-    raise BundleError(f"{what}: unsupported attribute value type {type(val).__name__}")
+def _as_text(val: Any, what: str) -> str:
+    if isinstance(val, bytes | np.bytes_):
+        try:
+            text = bytes(val).decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise BundleError(f"{what}: non-ASCII bytes value refused") from exc
+    elif isinstance(val, str | np.str_):
+        text = str(val)
+    else:
+        raise BundleError(f"{what}: expected string value, got {type(val).__name__}")
+    if len(text) > MAX_ATTR_VALUE_LEN or "\x00" in text:
+        raise BundleError(f"{what}: string too large or contains NUL")
+    return text
 
 
-def _validate_zarr_attrs_dict(attrs: Any, allowed_keys: frozenset[str], what: str) -> dict[str, Any]:
+def _as_scalar_float(val: Any, what: str) -> float:
+    arr = np.asarray(val)
+    if arr.size != 1 or arr.dtype.kind not in "iuf":
+        raise BundleError(f"{what}: expected numeric scalar")
+    return float(arr.reshape(-1)[0])
+
+
+def _as_scalar_int(val: Any, what: str) -> int:
+    arr = np.asarray(val)
+    if arr.size != 1 or arr.dtype.kind not in "iu":
+        raise BundleError(f"{what}: expected integer scalar")
+    return int(arr.reshape(-1)[0])
+
+
+def _validate_train_end_value(val: Any, cfg: HarnessConfig, what: str) -> None:
+    text = _as_text(val, what)
+    if not ISO_TIMESTAMP_RE.fullmatch(text):
+        raise BundleError(f"{what}: invalid ISO timestamp {text!r}")
+    assert cfg.splits.train.end is not None
+    if pd.Timestamp(text) != pd.Timestamp(cfg.splits.train.end):
+        raise BundleError(
+            f"{what}: train_end_utc {text!r} does not match config {pd.Timestamp(cfg.splits.train.end)}"
+        )
+
+
+def _validate_var_attr_value(
+    var_name: str,
+    attr_name: str,
+    val: Any,
+    *,
+    kind: str,
+    cfg: HarnessConfig,
+    what: str,
+) -> None:
+    if attr_name == "units":
+        text = _as_text(val, what)
+        if var_name in VARIABLE_UNITS:
+            allowed = _UNIT_ALIASES[VARIABLE_UNITS[var_name]]
+            if text not in allowed:
+                raise BundleError(
+                    f"{what}: invalid units {text!r} for {var_name} (expected one of {sorted(allowed)})"
+                )
+        elif var_name.endswith(OFFSET_SUFFIX) and var_name[: -len(OFFSET_SUFFIX)] in VARIABLE_UNITS:
+            if text != "minutes":
+                raise BundleError(f"{what}: invalid units {text!r} for offset {var_name}")
+        elif var_name == "elevation_m":
+            if text != "m":
+                raise BundleError(f"{what}: invalid units {text!r} for elevation_m")
+        elif var_name == "latitude":
+            if text != "degrees_north":
+                raise BundleError(f"{what}: invalid units {text!r} for latitude")
+        elif var_name == "longitude":
+            if text != "degrees_east":
+                raise BundleError(f"{what}: invalid units {text!r} for longitude")
+        elif var_name in ("valid_time", "init_time"):
+            if not CF_TIME_UNITS_RE.fullmatch(text):
+                raise BundleError(f"{what}: invalid CF time units {text!r}")
+        elif var_name == "lead_time":
+            if text not in APPROVED_LEAD_UNITS:
+                raise BundleError(f"{what}: invalid lead_time units {text!r}")
+        else:
+            raise BundleError(f"{what}: unexpected units attribute on {var_name!r}")
+        return
+
+    if attr_name == "long_name":
+        if kind != "truth" or not var_name.endswith(OFFSET_SUFFIX):
+            raise BundleError(f"{what}: long_name is only approved on truth offset variables")
+        base = var_name[: -len(OFFSET_SUFFIX)]
+        expected = f"Observation time offset from valid_time for {base} (-32768 when missing)"
+        text = _as_text(val, what)
+        if text != expected:
+            raise BundleError(f"{what}: unapproved long_name {text!r}")
+        return
+
+    if attr_name == "calendar":
+        if var_name not in ("valid_time", "init_time"):
+            raise BundleError(f"{what}: calendar only approved on time coordinates")
+        text = _as_text(val, what)
+        if text not in APPROVED_CALENDARS:
+            raise BundleError(f"{what}: unapproved calendar {text!r}")
+        return
+
+    if attr_name == "coordinates":
+        text = _as_text(val, what)
+        tokens = text.split()
+        if not tokens or not set(tokens).issubset(APPROVED_COORD_TOKENS):
+            raise BundleError(f"{what}: unapproved coordinates attribute {text!r}")
+        return
+
+    if attr_name == "tail_quantile":
+        if kind != "thresholds":
+            raise BundleError(f"{what}: tail_quantile only approved on thresholds")
+        q = _as_scalar_float(val, what)
+        if abs(q - float(cfg.gate.tail_quantile)) > 1e-9:
+            raise BundleError(f"{what}: tail_quantile {q} != {cfg.gate.tail_quantile}")
+        return
+
+    if attr_name == "train_end_utc":
+        if kind != "thresholds":
+            raise BundleError(f"{what}: train_end_utc only approved on thresholds")
+        _validate_train_end_value(val, cfg, what)
+        return
+
+    if attr_name == "_ARRAY_DIMENSIONS":
+        ok_dims = isinstance(val, list) and bool(val) and all(
+            isinstance(d, str) and d in APPROVED_DIMS for d in val
+        )
+        if not ok_dims:
+            raise BundleError(f"{what}: unapproved _ARRAY_DIMENSIONS {val!r}")
+        return
+
+    if attr_name == "dtype":
+        text = _as_text(val, what)
+        if var_name != "lead_time" or text != "timedelta64[ns]":
+            raise BundleError(f"{what}: unapproved dtype attribute {text!r} on {var_name!r}")
+        return
+
+    if attr_name == "CLASS":
+        text = _as_text(val, what)
+        if text != "DIMENSION_SCALE":
+            raise BundleError(f"{what}: unapproved HDF5 CLASS {text!r}")
+        return
+
+    if attr_name == "NAME":
+        text = _as_text(val, what)
+        if text != var_name and not text.startswith("This is a netCDF dimension"):
+            raise BundleError(f"{what}: unapproved HDF5 NAME {text!r}")
+        return
+
+    if attr_name in (
+        "_Netcdf4Dimid",
+        "_Netcdf4Coordinates",
+        "_FillValue",
+        "DIMENSION_LIST",
+        "REFERENCE_LIST",
+    ):
+        return
+
+    raise BundleError(f"{what}: unapproved attribute {attr_name!r}")
+
+
+def _validate_netcdf_root_attr_value(
+    attr_name: str, val: Any, *, kind: str, cfg: HarnessConfig, what: str
+) -> None:
+    if attr_name == "_NCProperties":
+        text = _as_text(val, what)
+        if not NCPROPERTIES_RE.fullmatch(text):
+            raise BundleError(f"{what}: unapproved _NCProperties value {text!r}")
+        return
+    if attr_name == "protocol_version":
+        text = _as_text(val, what)
+        if text != cfg.protocol_version:
+            raise BundleError(f"{what}: protocol_version {text!r} != {cfg.protocol_version!r}")
+        return
+    if kind == "truth":
+        if attr_name == "source":
+            text = _as_text(val, what)
+            if text not in APPROVED_TRUTH_SOURCES:
+                raise BundleError(f"{what}: unapproved truth source {text!r}")
+            return
+        if attr_name == "parser_version":
+            text = _as_text(val, what)
+            if not PARSER_VERSION_RE.fullmatch(text):
+                raise BundleError(f"{what}: invalid parser_version {text!r}")
+            return
+        if attr_name == "truth_tolerance_minutes":
+            tol = _as_scalar_int(val, what)
+            if tol != int(cfg.evaluation.truth_tolerance_minutes):
+                raise BundleError(
+                    f"{what}: truth_tolerance_minutes {tol} != {cfg.evaluation.truth_tolerance_minutes}"
+                )
+            return
+        if attr_name == "passing_qc_codes":
+            text = _as_text(val, what)
+            if text != passing_qc_signature():
+                raise BundleError(f"{what}: unapproved passing_qc_codes {text!r}")
+            return
+    if kind == "thresholds":
+        if attr_name == "tail_quantile":
+            q = _as_scalar_float(val, what)
+            if abs(q - float(cfg.gate.tail_quantile)) > 1e-9:
+                raise BundleError(f"{what}: tail_quantile {q} != {cfg.gate.tail_quantile}")
+            return
+        if attr_name == "train_end_utc":
+            _validate_train_end_value(val, cfg, what)
+            return
+    raise BundleError(f"{what}: unapproved root attribute {attr_name!r}")
+
+
+def _validate_zarr_root_attrs(
+    attrs: Any,
+    *,
+    expected_model_id: str | None,
+    what: str,
+) -> dict[str, Any]:
     if not isinstance(attrs, dict):
         raise BundleError(f"{what}: must be a JSON object")
-    disallowed = sorted(set(attrs) - allowed_keys)
+    disallowed = sorted(set(attrs) - ALLOWED_ZARR_ROOT_ATTRS)
+    if disallowed:
+        raise BundleError(f"{what}: unapproved metadata attributes refused: {disallowed}")
+    model_id = _as_text(attrs.get("model_id"), f"{what}['model_id']")
+    if expected_model_id is not None and model_id != expected_model_id:
+        raise BundleError(f"{what}: model_id {model_id!r} != pinned {expected_model_id!r}")
+    if model_id not in REQUIRED_BASELINES:
+        raise BundleError(f"{what}: unapproved reference model_id {model_id!r}")
+    model_ver = _as_text(attrs.get("model_version"), f"{what}['model_version']")
+    if not MODEL_VERSION_RE.fullmatch(model_ver):
+        raise BundleError(f"{what}: unapproved model_version {model_ver!r}")
+    return attrs
+
+
+def _validate_zarr_var_attrs(
+    attrs: Any,
+    *,
+    var_name: str,
+    cfg: HarnessConfig,
+    what: str,
+) -> dict[str, Any]:
+    if not isinstance(attrs, dict):
+        raise BundleError(f"{what}: must be a JSON object")
+    disallowed = sorted(set(attrs) - ALLOWED_ZARR_VAR_ATTRS)
     if disallowed:
         raise BundleError(f"{what}: unapproved metadata attributes refused: {disallowed}")
     for key, val in attrs.items():
-        _check_attr_value(val, f"{what}[{key!r}]")
+        _validate_var_attr_value(
+            var_name, key, val, kind="reference_forecast", cfg=cfg, what=f"{what}[{key!r}]"
+        )
     return attrs
 
 
@@ -304,6 +541,7 @@ def _validate_netcdf_file(
     relpath: str,
     *,
     kind: str,
+    cfg: HarnessConfig,
 ) -> tuple[str, int, list[dict[str, Any]], set[str]]:
     target = _assert_source_contained(data_dir, relpath, f"netcdf {relpath}")
     st = os.lstat(target)
@@ -340,7 +578,13 @@ def _validate_netcdf_file(
                     f"{relpath}: unapproved root NetCDF metadata attributes refused: {disallowed_root}"
                 )
             for attr_name in h5f.attrs.keys():
-                _check_attr_value(h5f.attrs[attr_name], f"{relpath} root attr {attr_name!r}")
+                _validate_netcdf_root_attr_value(
+                    attr_name,
+                    h5f.attrs[attr_name],
+                    kind=kind,
+                    cfg=cfg,
+                    what=f"{relpath} root attr {attr_name!r}",
+                )
 
             hdf5_datasets: set[str] = set()
             for name in sorted(h5f.keys()):
@@ -359,9 +603,14 @@ def _validate_netcdf_file(
                         f"{disallowed_var}"
                     )
                 for attr_name in obj.attrs.keys():
-                    if attr_name in ("DIMENSION_LIST", "REFERENCE_LIST"):
-                        continue
-                    _check_attr_value(obj.attrs[attr_name], f"{relpath}/{name} attr {attr_name!r}")
+                    _validate_var_attr_value(
+                        name,
+                        attr_name,
+                        obj.attrs[attr_name],
+                        kind=kind,
+                        cfg=cfg,
+                        what=f"{relpath}/{name} attr {attr_name!r}",
+                    )
                 hdf5_datasets.add(name)
     except BundleError:
         raise
@@ -380,6 +629,8 @@ def _validate_zarr_store(
     data_dir: Path,
     relpath: str,
     *,
+    cfg: HarnessConfig,
+    expected_model_id: str | None = None,
     max_chunk_bytes: int = DEFAULT_MAX_CHUNK_BYTES,
     max_dataset_bytes: int = DEFAULT_MAX_DATASET_BYTES,
     max_metadata_bytes: int = DEFAULT_MAX_METADATA_BYTES,
@@ -427,12 +678,14 @@ def _validate_zarr_store(
 
     parsed_metadata: dict[str, Any] = {".zgroup": zgroup}
     if ".zattrs" in root_files:
-        zattrs = _validate_zarr_attrs_dict(
+        zattrs = _validate_zarr_root_attrs(
             _read_bounded_json(root_files[".zattrs"], max_metadata_bytes, f"{relpath}/.zattrs"),
-            ALLOWED_ZARR_ROOT_ATTRS,
-            f"{relpath}/.zattrs",
+            expected_model_id=expected_model_id,
+            what=f"{relpath}/.zattrs",
         )
         parsed_metadata[".zattrs"] = zattrs
+    else:
+        raise BundleError(f"{relpath}: missing .zattrs with model_id/model_version")
 
     if not var_dirs:
         raise BundleError(f"{relpath}: Zarr store contains no arrays")
@@ -512,10 +765,11 @@ def _validate_zarr_store(
                     allowed_files.append(fpath)
                     continue
                 if inner_rel == ".zattrs":
-                    vattrs = _validate_zarr_attrs_dict(
+                    vattrs = _validate_zarr_var_attrs(
                         _read_bounded_json(fpath, max_metadata_bytes, f"{relpath}/{var_name}/.zattrs"),
-                        ALLOWED_ZARR_VAR_ATTRS,
-                        f"{relpath}/{var_name}/.zattrs",
+                        var_name=var_name,
+                        cfg=cfg,
+                        what=f"{relpath}/{var_name}/.zattrs",
                     )
                     parsed_metadata[f"{var_name}/.zattrs"] = vattrs
                     allowed_files.append(fpath)
@@ -632,21 +886,25 @@ def collect_pinned_items(
         raise BundleError("Invalid REFERENCES.json structure")
 
     periods: list[str] = []
-    seen: dict[str, tuple[str, str, list[dict[str, str]]]] = {}
+    seen: dict[str, tuple[str, str, list[dict[str, str]], str | None]] = {}
 
-    def record(relpath: str, kind: str, digest: str, citation: dict[str, str]) -> None:
+    def record(
+        relpath: str, kind: str, digest: str, citation: dict[str, str], model_id: str | None = None
+    ) -> None:
         _validate_relpath(relpath, f"{kind} ({citation['period']})")
         if not isinstance(digest, str) or len(digest) != 64:
             raise BundleError(f"Invalid sha256 pin for {relpath}: {digest!r}")
         if relpath in seen:
-            prev_kind, prev_digest, citations = seen[relpath]
+            prev_kind, prev_digest, citations, prev_model = seen[relpath]
             if prev_kind != kind:
                 raise BundleError(f"Conflicting kinds for {relpath}: {prev_kind} vs {kind}")
             if prev_digest != digest:
                 raise BundleError(f"Conflicting sha256 pins for {relpath}: {prev_digest} vs {digest}")
+            if prev_model != model_id:
+                raise BundleError(f"Conflicting model_id pins for {relpath}: {prev_model} vs {model_id}")
             citations.append(citation)
         else:
-            seen[relpath] = (kind, digest, [citation])
+            seen[relpath] = (kind, digest, [citation], model_id)
 
     for period in sorted(inventory["periods"]):
         m = PERIOD_RE.fullmatch(period)
@@ -698,6 +956,7 @@ def collect_pinned_items(
                     "field": "forecast_sha256",
                     "scorecard": scorecard,
                 },
+                model_id=str(rec["model_id"]),
             )
 
     if not periods:
@@ -709,8 +968,9 @@ def collect_pinned_items(
             kind=kind,
             expected_sha256=digest,
             pinned_by=tuple(sorted(citations, key=lambda c: (c["period"], c["baseline"], c["field"]))),
+            expected_model_id=model_id,
         )
-        for relpath, (kind, digest, citations) in sorted(seen.items())
+        for relpath, (kind, digest, citations, model_id) in sorted(seen.items())
     ]
     return inventory, periods, items
 
@@ -891,12 +1151,14 @@ def build_bundle(
             fmt, size_bytes, files, expected_var_names = _validate_zarr_store(
                 data_dir,
                 item.relpath,
+                cfg=cfg,
+                expected_model_id=item.expected_model_id,
                 max_chunk_bytes=max_chunk_bytes,
                 max_dataset_bytes=max_dataset_bytes,
             )
         elif stat.S_ISREG(st.st_mode):
             fmt, size_bytes, files, expected_var_names = _validate_netcdf_file(
-                data_dir, item.relpath, kind=item.kind
+                data_dir, item.relpath, kind=item.kind, cfg=cfg
             )
         else:
             raise BundleError(f"{item.relpath}: unsupported filesystem entry type")
@@ -904,6 +1166,15 @@ def build_bundle(
         with _open_dataset(target, fmt, f"{item.kind} {item.relpath}") as ds:
             _check_dataset_bounds(ds, item.relpath, max_dataset_bytes=max_dataset_bytes)
             _check_not_sealed(ds, item.kind, item.relpath, cfg)
+            try:
+                if item.kind == "truth":
+                    validate_truth_dataset(ds, cfg=cfg)
+                elif item.kind == "thresholds":
+                    validate_thresholds(ds)
+                elif item.kind == "reference_forecast":
+                    validate_forecast_dataset(ds, cfg=cfg)
+            except SchemaError as exc:
+                raise BundleError(f"{item.relpath}: harness schema validation failed: {exc}") from exc
             ds_vars = {str(name) for name in ds.variables}
             if ds_vars != expected_var_names:
                 raise BundleError(
