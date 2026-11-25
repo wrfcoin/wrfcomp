@@ -43,6 +43,8 @@ class ShadowLedgerParams:
     stake_exponent: float = 1.0
     k_min: float = 10.0
     clone_relative_tolerance: float = 0.05
+    public_clone_slash: float = 0.02
+    public_clone_consecutive_epochs: int = 2
     h3_cell_cap: int = 1
 
     def __post_init__(self) -> None:
@@ -64,6 +66,22 @@ class ShadowLedgerParams:
             raise ValueError("k_min must be finite and positive")
         if not math.isfinite(self.clone_relative_tolerance) or self.clone_relative_tolerance < 0:
             raise ValueError("clone_relative_tolerance must be finite and nonnegative")
+        if not math.isfinite(self.public_clone_slash) or not (
+            0.0 <= self.public_clone_slash <= 0.5 * self.max_slash_cap
+        ):
+            raise ValueError(
+                "public_clone_slash must be finite and in [0, 0.5 * max_slash_cap], "
+                f"got {self.public_clone_slash}"
+            )
+        if (
+            isinstance(self.public_clone_consecutive_epochs, bool)
+            or not isinstance(self.public_clone_consecutive_epochs, int)
+            or self.public_clone_consecutive_epochs < 2
+        ):
+            raise ValueError(
+                "public_clone_consecutive_epochs must be an integer >= 2, "
+                f"got {self.public_clone_consecutive_epochs}"
+            )
         if not math.isfinite(self.stake_exponent) or self.stake_exponent < 1.0:
             raise ValueError(
                 f"stake_exponent must be at least 1 for split resistance, got {self.stake_exponent}"
@@ -84,6 +102,10 @@ class Commitment:
     received_at: np.datetime64
 
 
+def _is_valid_sha256(digest: object) -> bool:
+    return isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest)
+
+
 @dataclass(frozen=True)
 class EpochEvidence:
     """Trusted epoch facts. init_time is the first init covered by a batch."""
@@ -91,13 +113,16 @@ class EpochEvidence:
     init_time: np.datetime64
     gefs_digest: str
     commitments: Mapping[str, Commitment]
+    public_reference_digests: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "commitments", MappingProxyType(dict(self.commitments)))
+        pub_digests = tuple(self.public_reference_digests)
+        object.__setattr__(self, "public_reference_digests", pub_digests)
         if not isinstance(self.init_time, np.datetime64) or np.isnat(self.init_time):
             raise ValueError("invalid epoch init")
-        for digest in [self.gefs_digest, *(r.digest for r in self.commitments.values())]:
-            if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        for digest in [self.gefs_digest, *pub_digests, *(r.digest for r in self.commitments.values())]:
+            if not _is_valid_sha256(digest):
                 raise ValueError("invalid SHA-256 digest")
         for receipt in self.commitments.values():
             if not isinstance(receipt.received_at, np.datetime64) or np.isnat(receipt.received_at):
@@ -155,6 +180,14 @@ class ComputePoolSettlement:
     total_paid: float
     unpaid_remainder: float
     total_slashed: float
+    public_clone_streaks: Mapping[str, int] = MappingProxyType({})
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "public_clone_streaks",
+            MappingProxyType(dict(sorted(self.public_clone_streaks.items()))),
+        )
 
 
 @dataclass(frozen=True)
@@ -455,6 +488,8 @@ def settle_compute_pool(
     issue_times: np.ndarray | None = None,
     lead_hours: float | None = None,
     gefs_forecast: np.ndarray | None = None,
+    public_references: Sequence[np.ndarray] | Mapping[str, np.ndarray] = (),
+    prior_public_clone_streaks: Mapping[str, int] | None = None,
 ) -> ComputePoolSettlement:
     """The raw-array adapter settles a single variable/lead forecast batch.
 
@@ -479,6 +514,40 @@ def settle_compute_pool(
         baseline_loss = actual
     if issue_times is not None and evidence and np.min(issue_times) != evidence.init_time:
         raise ValueError("commit cutoff differs from first initialization")
+
+    public_ref_digests: set[str] = set()
+    public_ref_arrays: list[np.ndarray] = []
+    if evidence is not None:
+        public_ref_digests.add(evidence.gefs_digest)
+        public_ref_digests.update(evidence.public_reference_digests)
+    if gefs is not None:
+        public_ref_digests.add(forecast_digest(gefs))
+        public_ref_arrays.append(np.sort(gefs, axis=1))
+    if isinstance(public_references, np.ndarray):
+        raise ValueError("public_references must be a sequence or mapping of 2-D forecast arrays")
+    ref_inputs = (
+        list(public_references.values())
+        if isinstance(public_references, Mapping)
+        else list(public_references)
+    )
+    if ref_inputs:
+        if y is None:
+            raise ValueError("public_references needs observations")
+        supplied_ref_digests: set[str] = set()
+        for ref_raw in ref_inputs:
+            ref_arr = _as_2d_forecast(ref_raw, y.size)
+            ref_digest = forecast_digest(ref_arr)
+            supplied_ref_digests.add(ref_digest)
+            public_ref_digests.add(ref_digest)
+            public_ref_arrays.append(np.sort(ref_arr, axis=1))
+        if evidence is not None and evidence.public_reference_digests:
+            expected_pub = set(evidence.public_reference_digests)
+            if not (
+                supplied_ref_digests <= (expected_pub | {evidence.gefs_digest})
+                and expected_pub <= (supplied_ref_digests | {evidence.gefs_digest})
+            ):
+                raise ValueError("public_references do not match epoch public_reference_digests")
+
     losses, digests, gates, arrays = {}, {}, {}, {}
     cfg = load_config()
     gate_cache = {}
@@ -520,8 +589,11 @@ def settle_compute_pool(
     if arrays and loss_shape is not None:
         raise ValueError("cannot mix forecast and pointwise-loss inputs")
 
+    stakes_by_id = {m.miner_id: float(m.stake) for m in miners}
+
     def mixture(ids):
-        return meta_ensemble_loss([arrays[k] for k in ids], np.ones(len(ids)), y, params, tail_threshold)
+        weights = np.array([stakes_by_id[k] for k in ids], dtype=np.float64)
+        return meta_ensemble_loss([arrays[k] for k in ids], weights, y, params, tail_threshold)
 
     clone_distance = 0.0
     if gefs is not None:
@@ -539,11 +611,46 @@ def settle_compute_pool(
         arrays,
         mixture,
         clone_distance,
+        public_ref_digests=public_ref_digests,
+        public_ref_arrays=public_ref_arrays,
+        prior_public_clone_streaks=prior_public_clone_streaks,
     )
 
 
+def _validate_public_clone_streaks(
+    prior: Mapping[str, int] | None,
+) -> dict[str, int]:
+    if prior is None:
+        return {}
+    validated: dict[str, int] = {}
+    for wallet, count in prior.items():
+        if not isinstance(wallet, str) or not wallet:
+            raise ValueError("prior_public_clone_streaks keys must be non-empty strings")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(
+                f"prior_public_clone_streaks[{wallet!r}] must be a non-negative integer, got {count!r}"
+            )
+        if count > 0:
+            validated[wallet] = count
+    return validated
+
+
 def _settle(
-    miners, pool, params, baseline, evidence, losses, digests, gates, arrays, mixture, clone_distance=0.0
+    miners,
+    pool,
+    params,
+    baseline,
+    evidence,
+    losses,
+    digests,
+    gates,
+    arrays,
+    mixture,
+    clone_distance=0.0,
+    *,
+    public_ref_digests: Collection[str] = (),
+    public_ref_arrays: Sequence[np.ndarray] = (),
+    prior_public_clone_streaks: Mapping[str, int] | None = None,
 ):
     if (
         not math.isfinite(pool)
@@ -553,6 +660,8 @@ def _settle(
         or baseline <= 0
     ):
         raise ValueError("invalid pool or baseline loss")
+    prior_streaks = _validate_public_clone_streaks(prior_public_clone_streaks)
+    pub_digests = set(public_ref_digests)
     ordered = sorted(miners, key=lambda m: m.miner_id)
     wallets = {m.miner_id for m in ordered}
     if len(wallets) != len(miners) or any(
@@ -562,8 +671,20 @@ def _settle(
     receipts = evidence.commitments if evidence else {}
     if receipts.keys() - wallets:
         raise ValueError("committed wallet missing from epoch roster")
+
+    def _matches_public_ref(wallet_id: str) -> bool:
+        if digests.get(wallet_id) in pub_digests:
+            return True
+        if wallet_id in arrays and public_ref_arrays:
+            return any(
+                _mean_wasserstein(arrays[wallet_id], ref_arr) <= clone_distance
+                for ref_arr in public_ref_arrays
+            )
+        return False
+
     status = {}
     revealed = []
+    public_clone_wallets: set[str] = set()
     for m in ordered:
         k = m.miner_id
         receipt = receipts.get(k)
@@ -579,11 +700,17 @@ def _settle(
             status[k] = "below_minimum"
         elif digests[k] == evidence.gefs_digest or not gates.get(k, False) or losses[k] >= baseline:
             status[k] = "gefs_gate"
+            if _matches_public_ref(k):
+                public_clone_wallets.add(k)
         else:
             revealed.append(m)
     winners = []
     for m in sorted(revealed, key=lambda m: (receipts[m.miner_id].received_at, m.miner_id)):
         k = m.miner_id
+        if _matches_public_ref(k):
+            status[k] = "public_clone"
+            public_clone_wallets.add(k)
+            continue
         is_clone = any(
             digests[k] == digests[earlier]
             or (k in arrays and _mean_wasserstein(arrays[k], arrays[earlier]) <= clone_distance)
@@ -596,6 +723,7 @@ def _settle(
             winners.append(k)
     winners.sort()
     meta = mixture(winners) if winners else None
+    next_streaks: dict[str, int] = {}
     payouts = []
     weights = []
     for m in ordered:
@@ -618,6 +746,11 @@ def _settle(
             score = min(0.0, (1 - params.w_delta) * crpss + params.w_delta * delta)
         if score is not None and score < 0:
             slash = m.stake * min(params.max_slash_cap, params.alpha_slash * abs(score))
+        if k in public_clone_wallets:
+            streak = prior_streaks.get(k, 0) + 1
+            next_streaks[k] = streak
+            if streak >= params.public_clone_consecutive_epochs:
+                slash = max(slash, m.stake * params.public_clone_slash)
         weights.append(weight)
         payouts.append(
             MinerPayout(
@@ -644,6 +777,7 @@ def _settle(
         math.fsum(p.reward for p in payouts),
         0.0 if total else pool,
         math.fsum(p.slash for p in payouts),
+        next_streaks,
     )
 
 
@@ -745,6 +879,8 @@ def settle_epoch(
     baseline_forecast: np.ndarray | None = None,
     obs: np.ndarray | None = None,
     tail_threshold: np.ndarray | float | None = None,
+    public_references: Sequence[np.ndarray] | Mapping[str, np.ndarray] = (),
+    prior_public_clone_streaks: Mapping[str, int] | None = None,
 ) -> EpochSettlement:
     """Split ``epoch_emission`` into 55/35/10 pools and settle compute and data payouts."""
     if not math.isfinite(epoch_emission) or epoch_emission < 0.0:
@@ -765,6 +901,8 @@ def settle_epoch(
         baseline_forecast=baseline_forecast,
         obs=obs,
         tail_threshold=tail_threshold,
+        public_references=public_references,
+        prior_public_clone_streaks=prior_public_clone_streaks,
     )
     data = settle_data_pool(stations, pool_amount=p_data, params=params)
     return EpochSettlement(
@@ -928,6 +1066,8 @@ def settle_from_scorecards(
     leads: Sequence[int] | None = None,
     fault_ids: Collection[str] = (),
     evidence: EpochEvidence | None = None,
+    public_references: Sequence[Scorecard | str] | Mapping[str, Scorecard] = (),
+    prior_public_clone_streaks: Mapping[str, int] | None = None,
 ) -> ComputePoolSettlement:
     """Validate ``wrfcomp-eval`` scorecards and settle the compute pool in pointwise-loss mode."""
     cards = dict(scorecards)
@@ -940,6 +1080,53 @@ def settle_from_scorecards(
         evidence.gefs_digest != ref.forecast_sha256 or evidence.init_time != np.datetime64(ref.period_start)
     ):
         raise ValueError("epoch GEFS digest or init differs from reference scorecard")
+
+    public_ref_digests: set[str] = {ref.forecast_sha256}
+    if evidence is not None:
+        public_ref_digests.update(evidence.public_reference_digests)
+    if isinstance(public_references, (str, bytes, Scorecard)):
+        raise ValueError("public_references must be a sequence or mapping of Scorecards or SHA-256 digests")
+    pub_items = (
+        list(public_references.values())
+        if isinstance(public_references, Mapping)
+        else list(public_references)
+    )
+    supplied_pub_digests: set[str] = set()
+    for item in pub_items:
+        if isinstance(item, Scorecard):
+            if (
+                any(
+                    getattr(item, field) != getattr(ref, field)
+                    for field in (
+                        "harness_version",
+                        "protocol_version",
+                        "truth_sha256",
+                        "thresholds_sha256",
+                        "period_start",
+                        "period_end",
+                        "init_hours_scored",
+                        "n_init_times",
+                        "n_stations",
+                    )
+                )
+                or item.sealed_data_used
+            ):
+                raise ValueError("public reference scorecard does not match epoch reference")
+            supplied_pub_digests.add(item.forecast_sha256)
+        elif isinstance(item, str):
+            if not _is_valid_sha256(item):
+                raise ValueError(f"invalid public reference SHA-256 digest: {item!r}")
+            supplied_pub_digests.add(item)
+        else:
+            raise ValueError("public_references entries must be Scorecard objects or SHA-256 digests")
+    if supplied_pub_digests and evidence is not None and evidence.public_reference_digests:
+        expected_pub = set(evidence.public_reference_digests)
+        if not (
+            supplied_pub_digests <= (expected_pub | {ref.forecast_sha256})
+            and expected_pub <= (supplied_pub_digests | {ref.forecast_sha256})
+        ):
+            raise ValueError("public_references do not match epoch public_reference_digests")
+    public_ref_digests.update(supplied_pub_digests)
     cfg = load_config()
     primary = tuple(cfg.evaluation.variables.primary)
     chosen_vars = tuple(variables) if variables is not None else primary
@@ -1022,7 +1209,24 @@ def settle_from_scorecards(
             sc.passed_gate and set(chosen_vars) == set(primary) and list(chosen_leads) == ref.leads_scored
         )
 
-    def mixture(ids):
-        return float(np.mean([losses[k] for k in ids]))
+    stakes_by_id = {m.miner_id: float(m.stake) for m in miners}
 
-    return _settle(miners, pool_amount, params, baseline_loss, evidence, losses, digests, gates, {}, mixture)
+    def mixture(ids):
+        w = np.array([stakes_by_id[k] for k in ids], dtype=np.float64)
+        vals = np.array([losses[k] for k in ids], dtype=np.float64)
+        return float(np.average(vals, weights=w))
+
+    return _settle(
+        miners,
+        pool_amount,
+        params,
+        baseline_loss,
+        evidence,
+        losses,
+        digests,
+        gates,
+        {},
+        mixture,
+        public_ref_digests=public_ref_digests,
+        prior_public_clone_streaks=prior_public_clone_streaks,
+    )

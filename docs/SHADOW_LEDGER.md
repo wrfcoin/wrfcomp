@@ -27,8 +27,17 @@ scorecard variable selection can report diagnostics but cannot authorize payment
 
 A wallet may represent a forecast only after its timely reveal matches its commitment, its stake
 meets the floor and it passes the GEFS gates. An invalid or sealed scorecard provides no reveal
-digest. A committed wallet that submits one incurs the maximum slash. Among eligible wallets,
-receipt time determines priority, with wallet ID breaking exact ties. Subsequent clones earn zero.
+digest. A committed wallet that submits one incurs the maximum slash. Before comparing miners
+against each other, the ledger checks every timely reveal against the configured list of public
+reference forecasts (raw NOAA GEFS plus every public promoted candidate; for the shadow replay
+that is `gefs-station-corrected` v3), treating them as earlier entries in the clone check. Any
+relay matching a public reference (by digest or within the Wasserstein tolerance) is marked
+`public_clone`, excluded from the Meta-Ensemble and earns zero. A wallet that is a clone of a
+public reference in two or more consecutive epochs incurs a small nuisance slash (`public_clone_slash`,
+default 2% of stake, one-fifth of `max_slash_cap`)—high enough to make automated public-model spam
+strictly unprofitable while staying gentle against an accidental single-epoch collision; an honest
+epoch resets the streak. Among remaining eligible wallets, receipt time determines priority, with
+wallet ID breaking exact ties; subsequent miner-to-miner clones earn zero.
 
 For raw ensembles, each member in a row has mass 1/M. The ledger takes the exact 1-Wasserstein
 distance between the two empirical distributions at each observation, then averages over rows.
@@ -38,10 +47,12 @@ observations (both population SD). At zero scale only zero distribution distance
 units rescales the distance and cutoff together. Scorecards support exact forecast-content deduplication
 only; they contain no arrays for a distance test.
 
-Eligible representatives each contribute one equally weighted forecast to the meta-ensemble. The excluded miner's own diagnostic
-downside may be computed by adding it to this fixed pool; its presence never changes an eligible
-miner's marginal score. The scorecard approximation uses the mean of normalized losses across models;
-it cannot measure physical ensemble diversity.
+Eligible representatives combine into the Meta-Ensemble with linear stake weights (proportional to
+`K_i`, matching `stake_exponent = 1.0`), so splitting one stake across multiple wallets never changes
+the ensemble mixture even if copies are perturbed just outside the clone tolerance. The excluded
+miner's own diagnostic downside may be computed by adding it to this fixed pool; its presence never
+changes an eligible miner's marginal score. The scorecard approximation uses the stake-weighted mean
+of normalized losses across eligible models; it cannot measure physical ensemble diversity.
 
 Eligible wallets with positive composite score share the compute pool in proportion to stake times
 score at the default exponent. For a fixed forecast and total stake K, at most one of m copies can earn.
@@ -61,11 +72,11 @@ separately from emissions. The station and validator pool rules are unchanged.
 ### Residual risks
 
 A distance cutoff can accept an independent but similar forecast as a clone and can miss a copy just
-above the cutoff. Equal mixture weight per representative makes undetected copies consequential even
-at minimum stake. Scorecard-only settlement cannot distinguish near-copies with different hashes:
-a one-bit numerical change can change the digest. Keeping forecasts confidential until init time
-through pre-init timelock encryption is the intended defense against live copying; the paper recorder
-does not implement encryption.
+above the cutoff. Linear stake weighting limits a Sybil flood of minimum-stake perturbed copies to
+their combined stake share, but scorecard-only settlement cannot distinguish near-copies with
+different hashes: a one-bit numerical change changes the digest. Keeping forecasts confidential
+until init time through pre-init timelock encryption is the intended defense against live copying;
+the paper recorder does not implement encryption.
 
 The locked spread-skill gate pools squared errors and ensemble variances across observations for
 each variable. A forecast can meet the global band while remaining overconfident during extreme events
@@ -80,8 +91,9 @@ The owner may change these research defaults. Ledger settings are centralized in
 | Setting | Default | Reason |
 | --- | ---: | --- |
 | Minimum wallet stake | 10 paper units | One tenth of the illustrative 100-unit stake; dust wallets cannot participate. |
-| Stake exponent | 1 | Linear stake weight gives each unit equal payout leverage. Exponents below 1 are rejected. |
+| Stake exponent & Meta-Ensemble weight | 1 (linear in `K_i`) | Linear stake weight in both `M_all` and payout gives each unit equal leverage and makes splitting one stake across wallets mixture-invariant. Exponents below 1 are rejected. |
 | Raw clone distance tolerance | 0.05 times field scale | A single member carries about 3% of a 31-member empirical distribution. A 5% allowance covers small distribution changes from a missing member or numerical jitter. This is a shadow policy choice, not a universal similarity threshold. |
+| Public-reference repeat nuisance slash | 2% of stake after 2+ consecutive epochs | At most half of `max_slash_cap` (default 2% = 1/5 of 10%). Makes automated relaying of raw GEFS or public promoted candidates strictly unprofitable on repeat epochs without punishing a single-epoch coincidence; resets on any non-clone epoch. |
 | Maximum slash | 10% | Same ceiling for the worst honest loss and a failed reveal. |
 | Negative-score multiplier | Caller-supplied | The replay uses 0.50; this rate has no owner-set default. |
 | Compute/data/validator shares | 55% / 35% / 10% | Existing shadow emission split. |
@@ -89,24 +101,50 @@ The owner may change these research defaults. Ledger settings are centralized in
 | Default cell capacity | 1 | Existing rural station cap. |
 | Protocol gate | Skill > 0.05, DM p < 0.05, spread-skill 0.85–1.15 inclusive, ≥20 members, no worse tail | Uses the shared evaluator gate and its configured parameters. |
 
-### Gate 1 reference-only replay
+### Committed scorecard shadow replay
 
-All 48 committed reference cards (12 months and four quarters, three models per period) were replayed
-using `settle_from_scorecards(cards, baseline_key="noaa-gefs", pool_amount=550,
-params=ShadowLedgerParams(alpha_slash=0.5), stakes=100)`. Each period is a separate illustration;
-quarters overlap the monthly replays. There are no recorder receipts in these historical artifacts.
-Climatology and persistence do not have passing scorecards against GEFS in this inventory. GEFS is
-the benchmark and has zero individual skill against itself.
+1. **Reference-only replay (no recorder receipts):** All 60 committed reference cards across 20 periods
+   (four 2023 quarters, 12 2024 months, and four 2024 quarters; three models per period) were replayed
+   using `settle_from_scorecards(cards, baseline_key="noaa-gefs", pool_amount=550,
+   params=ShadowLedgerParams(alpha_slash=0.5), stakes=100)`. Each period is a separate illustration;
+   quarters overlap the monthly replays. There are no recorder receipts in these historical artifacts.
+   Climatology and persistence do not have passing scorecards against GEFS in this inventory. GEFS is
+   the benchmark and has zero individual skill against itself.
 
-| Every replay period | Reward | Slash |
-| --- | ---: | ---: |
-| NOAA GEFS | 0 | 0 |
-| Climatology | 0 | 0 |
-| Persistence | 0 | 0 |
-| Unpaid compute pool | 550 | |
+   | Every reference-only period (20 periods) | Reward | Slash |
+   | --- | ---: | ---: |
+   | NOAA GEFS | 0 | 0 |
+   | Climatology | 0 | 0 |
+   | Persistence | 0 | 0 |
+   | Unpaid compute pool | 550 | |
 
-Diagnostic GEFS-normalized persistence skill was −0.81864 in January and −0.21314 in July. The
-historical tables below use a different denominator and settlement policy.
+   Diagnostic GEFS-normalized persistence skill was −0.81864 in January 2024 and −0.21314 in July 2024.
+
+2. **Public promoted-candidate relay replay (`2023-Q1` through `2024-Q4`):** All 8 committed quarterly
+   periods that include promoted candidate `gefs-station-corrected` v3 (`results/gefs-station-corrected-v3/`)
+   were replayed sequentially with simulated timely pre-init receipts for `noaa-gefs` and `v3-relay`
+   (`stake = 100`, `pool_amount = 550`, `alpha_slash = 0.50`, `public_clone_slash = 0.02`), carrying
+   `prior_public_clone_streaks` from each quarter to the next and configuring `public_references=[v3_sc]`
+   alongside raw GEFS (`climatology` and `persistence` have no GEFS-compared scorecards and remain
+   `uncommitted`, earning `0` and slashing `0`). Without v3 in `public_references`, `v3-relay` would have
+   collected `550.00` in 7 of 8 quarters (`2023-Q1..Q4` and `2024-Q1..Q3`, `3,850.00` paper units total)
+   and `0.00` in `2024-Q4` (`gefs_gate`). With v3 configured as a public reference:
+
+   | Quarter | `noaa-gefs` (Status / Reward / Slash) | `v3-relay` (Status / Reward / Slash) | Unpaid pool |
+   | --- | --- | --- | ---: |
+   | `2023-Q1` | `gefs_gate` / `0.00` / `0.00` | `public_clone` / `0.00` / `0.00` | `550.00` |
+   | `2023-Q2` | `gefs_gate` / `0.00` / `2.00` | `public_clone` / `0.00` / `2.00` | `550.00` |
+   | `2023-Q3` | `gefs_gate` / `0.00` / `2.00` | `public_clone` / `0.00` / `2.00` | `550.00` |
+   | `2023-Q4` | `gefs_gate` / `0.00` / `2.00` | `public_clone` / `0.00` / `2.00` | `550.00` |
+   | `2024-Q1` | `gefs_gate` / `0.00` / `2.00` | `public_clone` / `0.00` / `2.00` | `550.00` |
+   | `2024-Q2` | `gefs_gate` / `0.00` / `2.00` | `public_clone` / `0.00` / `2.00` | `550.00` |
+   | `2024-Q3` | `gefs_gate` / `0.00` / `2.00` | `public_clone` / `0.00` / `2.00` | `550.00` |
+   | `2024-Q4` | `gefs_gate` / `0.00` / `2.00` | `gefs_gate` / `0.00` / `2.00` | `550.00` |
+
+   Across all 8 consecutive quarters, nobody earns (`total_paid = 0.00`, `unpaid_remainder = 550.00` per
+   quarter), and each repeated public-reference relayer accrues `14.00` total nuisance slash (`0.00` in
+   `2023-Q1` plus `2.00` in each of the 7 subsequent consecutive quarters). The historical tables below
+   use a different denominator and settlement policy.
 
 ## Historical pre-S3 comparison (superseded)
 
