@@ -40,6 +40,7 @@ from wrfcomp.models import citizen_design2 as d2
 from wrfcomp.models import gefs_station_v2 as v2
 
 STOP_FREE_BYTES = 40 * 10**9
+MIN_COVERED_STATIONS = 50
 
 
 def _load_frozen_builder():
@@ -63,6 +64,22 @@ def check_free_space(data_dir: Path, min_free_bytes: int = STOP_FREE_BYTES) -> N
     if free < min_free_bytes:
         raise BuildRefusedError(
             f"free space {free / 1e9:.1f} GB is below {min_free_bytes / 1e9:.1f} GB stop line"
+        )
+
+
+def _paths_overlap(a: Path, b: Path) -> bool:
+    ra, rb = a.resolve(), b.resolve()
+    return ra == rb or ra in rb.parents or rb in ra.parents
+
+
+def _require_isolated_partial_out(data: Path, out_root: Path | None, stop_after_month: str | None) -> None:
+    if stop_after_month is None:
+        return
+    if out_root is None:
+        raise BuildRefusedError("--stop-after-month requires an isolated --out-dir")
+    if _paths_overlap(out_root, data / "candidates") or _paths_overlap(out_root, data / "phase3-design2"):
+        raise BuildRefusedError(
+            "partial replay --out-dir must not overlap live candidates/ or phase3-design2/"
         )
 
 
@@ -312,18 +329,27 @@ def build_track_a(
     issues=None,
     stations=None,
     verify_extract: bool = True,
+    min_covered: int = MIN_COVERED_STATIONS,
+    reference_covered_sha256: str | None = None,
     min_free_bytes: int = STOP_FREE_BYTES,
 ) -> dict:
     """Build Track A arm C2 (and optionally stop after ``stop_after_month`` in isolated scratch)."""
     check_free_space(data, min_free_bytes)
+    _require_isolated_partial_out(data, out_root, stop_after_month)
     start, _ = v2.year_bounds(year)
     start = np.datetime64(start, "ns")
     issues = loao_qc.issue_times(year) if issues is None else np.asarray(issues, dtype="datetime64[ns]")
     stations = phase3_frozen.registered_stations() if stations is None else list(stations)
     extract_path = data / "citizen" / "conus" / f"issue_extract_{year}.nc"
     extract, snapshot = phase3_frozen.load_extract(extract_path, year, issues, stations)
-    if verify_extract and year == 2024:
-        phase3_frozen.verify_extract_is_current(data, year, extract_path, extract)
+    if verify_extract:
+        if year == 2024:
+            phase3_frozen.verify_extract_is_current(data, year, extract_path, extract)
+        else:
+            raise BuildRefusedError(
+                f"standard extract provenance verification for {year} is not yet implemented "
+                "(deferred until Stage 2 after manager GO)"
+            )
     months = sorted((data / "candidates" / phase3_frozen.A_DIR).glob(f"{year}-??.zarr"))
     seen = []
     for path in months:
@@ -399,14 +425,40 @@ def build_track_a(
         covered = arms.covered_stations(truth.station_id.values, replay.citizen_defined_count, len(issues))
         text = "station_id\n" + "".join(f"{s}\n" for s in covered)
         (meta_dir / "covered_stations_a.csv").write_text(text)
+        cov_sha = hashlib.sha256(text.encode()).hexdigest()
+        ref_sha = reference_covered_sha256
+        if ref_sha is None and year == 2024:
+            d1_build = data / "phase3" / "2024" / "build.json"
+            if d1_build.is_file():
+                ref_sha = json.loads(d1_build.read_text()).get("covered_sha256")
+            elif verify_extract:
+                raise BuildRefusedError(
+                    "missing frozen Design 1 phase3/2024/build.json to verify Track A COVERED parity"
+                )
+        stop_reasons = []
+        if len(covered) < min_covered:
+            stop_reasons.append(f"covered_count {len(covered)} < {min_covered}")
+        d1_parity = None if ref_sha is None else (cov_sha == ref_sha)
+        if d1_parity is False:
+            stop_reasons.append("Track A 2024 COVERED sha256 differs from frozen Design 1 COVERED list")
         out.update(
+            build_kind="full_year",
             n_issues=i,
             covered_count=len(covered),
-            covered_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            covered_sha256=cov_sha,
+            design1_covered_sha256=ref_sha,
+            design1_covered_parity=d1_parity,
+            scoring_ready=not stop_reasons,
+            stop_reasons=stop_reasons,
         )
+        (meta_dir / "build.json").write_text(json.dumps(out, indent=1) + "\n")
+        if stop_reasons:
+            raise BuildRefusedError("scoring handoff blocked: " + "; ".join(stop_reasons))
     else:
-        out.update(n_issues=i)
-    (meta_dir / "build.json").write_text(json.dumps(out, indent=1) + "\n")
+        if not out["arm_c2"]:
+            raise BuildRefusedError("partial Track A replay produced zero monthly stores")
+        out.update(build_kind="partial_replay", n_issues=i, scoring_ready=False)
+        (meta_dir / "build.json").write_text(json.dumps(out, indent=1) + "\n")
     return out
 
 
@@ -421,10 +473,12 @@ def build_track_b(
     stations_csv: Path = loao_qc.STATIONS_CSV,
     verify_extract: bool = True,
     run_relay_audit: bool = False,
+    min_covered: int = MIN_COVERED_STATIONS,
     min_free_bytes: int = STOP_FREE_BYTES,
 ) -> dict:
     """Build Track B 5-fold outer-excluded arms B_LOAO and C2_LOAO (plus optional post-freeze audit)."""
     check_free_space(data, min_free_bytes)
+    _require_isolated_partial_out(data, out_root, stop_after_month)
     start, _ = v2.year_bounds(year)
     start = np.datetime64(start, "ns")
     issues = loao_qc.issue_times(year) if issues is None else np.asarray(issues, dtype="datetime64[ns]")
@@ -542,10 +596,16 @@ def build_track_b(
         covered = arms.covered_stations(truth.station_id.values, cov_counts, len(issues))
         cov_text = "station_id\n" + "".join(f"{s}\n" for s in covered)
         (meta_dir / "covered_stations_loao.csv").write_text(cov_text)
+        stop_reasons = []
+        if len(covered) < min_covered:
+            stop_reasons.append(f"covered_loao_count {len(covered)} < {min_covered}")
         out.update(
+            build_kind="full_year",
             n_issues=len(used_issues),
             covered_loao_count=len(covered),
             covered_loao_sha256=hashlib.sha256(cov_text.encode()).hexdigest(),
+            scoring_ready=not stop_reasons,
+            stop_reasons=stop_reasons,
         )
         if run_relay_audit:
             # Post-freeze aggregate relay diagnostics ONLY (after stores and coverage are written).
@@ -581,9 +641,14 @@ def build_track_b(
             )
             (meta_dir / "relay_audit.json").write_text(json.dumps(audit, indent=2) + "\n")
             out["relay_audit"] = audit
+        (meta_dir / "build.json").write_text(json.dumps(out, indent=1) + "\n")
+        if stop_reasons:
+            raise BuildRefusedError("scoring handoff blocked: " + "; ".join(stop_reasons))
     else:
-        out.update(n_issues=len(used_issues))
-    (meta_dir / "build.json").write_text(json.dumps(out, indent=1) + "\n")
+        if not out["arm_b_loao"] or not out["arm_c2_loao"]:
+            raise BuildRefusedError("partial Track B replay produced zero monthly stores")
+        out.update(build_kind="partial_replay", n_issues=len(used_issues), scoring_ready=False)
+        (meta_dir / "build.json").write_text(json.dumps(out, indent=1) + "\n")
     return out
 
 

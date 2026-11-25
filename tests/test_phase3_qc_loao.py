@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-import pandas as pd  # noqa: F401
+import pandas as pd
 import pytest
 import xarray as xr
 
@@ -245,7 +245,7 @@ def test_loao_digest_binds_all_dependencies_and_timing_folder_refused(tmp_path, 
         save_table(tbl, citizen / "conus" / "2024" / f"{day}.nc", attrs={"day": day, "hours_missing": ""})
     manifest = qc_std.partition(citizen, 2024)
     stations_csv = tmp_path / "stations.csv"
-    stations_csv.write_text("station_id,latitude,longitude,elevation_m\n00000000001,40.0,-100.0,500.0\n")
+    stations_csv.write_text("station_id,lat,lon,elevation_m\n00000000001,40.0,-100.0,500.0\n")
     gefs_means = {"t2m": np.zeros((2, 1))}
     cycle = np.array(["2024-01-01T00"], dtype="datetime64[ns]")
     fake_fc = SimpleNamespace(issued=cycle, valid=cycle + 3 * H, means=gefs_means)
@@ -253,10 +253,10 @@ def test_loao_digest_binds_all_dependencies_and_timing_folder_refused(tmp_path, 
     monkeypatch.setattr(loao, "load_loao_inputs", lambda *args, **kwargs: (None, sites, fake_fc))
     rec0 = loao.current_run_record(tmp_path, 2024, stations_csv=stations_csv)
     # Changing stations_csv changes digest.
-    stations_csv.write_text("station_id,latitude,longitude,elevation_m\n00000000001,40.0,-100.0,510.0\n")
+    stations_csv.write_text("station_id,lat,lon,elevation_m\n00000000001,40.0,-100.0,510.0\n")
     rec_st = loao.current_run_record(tmp_path, 2024, stations_csv=stations_csv)
     assert rec_st["digest"] != rec0["digest"]
-    stations_csv.write_text("station_id,latitude,longitude,elevation_m\n00000000001,40.0,-100.0,500.0\n")
+    stations_csv.write_text("station_id,lat,lon,elevation_m\n00000000001,40.0,-100.0,500.0\n")
     # Changing frozen QC_CODE digest changes LOAO digest.
     orig_code_digest = p3.code_digest
     monkeypatch.setattr(p3, "code_digest", lambda: "changed-frozen-digest")
@@ -303,3 +303,116 @@ def test_loao_digest_binds_all_dependencies_and_timing_folder_refused(tmp_path, 
         assert int(ds.attrs["official_observations_used"]) == 0
         assert "truth_sha256" not in ds.attrs
         assert ds.attrs["stations_sha256"] == rec0["stations_sha256"]
+
+
+def test_default_load_static_sites_reads_registered_stations_conus(tmp_path):
+    """Default LOAO loader must work against checked-in configs/stations_conus.csv (lat/lon schema)."""
+    sites = loao.load_static_sites()
+    csv_df = pd.read_csv(loao.STATIONS_CSV, dtype={"station_id": str})
+    assert len(sites.station_id) == 500
+    assert sites.station_id.tolist() == csv_df["station_id"].tolist()
+    assert np.array_equal(np.sort(sites.station_id), sites.station_id)
+    assert np.isfinite(sites.lat).all() and np.isfinite(sites.lon).all() and np.isfinite(sites.height).all()
+    bad_csv = tmp_path / "bad_stations.csv"
+    bad_csv.write_text("station_id,latitude,longitude,elevation_m\n00000000001,40.0,-100.0,500.0\n")
+    with pytest.raises(ValueError, match="missing required columns"):
+        loao.load_static_sites(bad_csv)
+
+
+@TILE_NAMES_ON_WINDOWS
+def test_loao_qc_logs_and_summaries_contain_no_tokens_or_coordinate_tile_labels(
+    tmp_path, monkeypatch, capsys
+):
+    """Operational logs, summaries, stdout/stderr, and errors must carry opaque tile ordinals only."""
+    import re
+
+    from wrfcomp.assimilation.madis_archive import ReportTable, save_table
+
+    qc_std = _load_script("run_phase3_qc")
+    qc_loao = _load_script("run_phase3_qc_loao")
+    days = ("2024-01-01", "2024-01-02")
+    monkeypatch.setattr(qc_std, "expected_days", lambda year: list(days))
+    citizen = tmp_path / "citizen"
+    for day in days:
+        base = np.datetime64(day + "T11:50:00", "s")
+        tbl = ReportTable(
+            station_id=np.array(["CW000000001", "CW000000002", "CW000000003", "CW000000004"]),
+            obs_time=(base + np.arange(4) * 60 * np.timedelta64(1, "s")).astype("datetime64[ns]"),
+            received_time=(base + (np.arange(4) * 60 + 30) * np.timedelta64(1, "s")).astype("datetime64[ns]"),
+            lat=np.float32([40.0, 40.1, 40.0, 40.1]),
+            lon=np.float32([-100.0, -100.0, -100.1, -100.1]),
+            elevation_m=np.float32([500.0, 500.0, 500.0, 500.0]),
+            t2m=np.float32([280.0, 280.1, 279.9, 280.0]),
+            td2m=np.float32([275.0, 275.1, 274.9, 275.0]),
+            wind_speed=np.float32([2.0, 2.0, 2.0, 2.0]),
+            wind_dir=np.float32([90.0, 90.0, 90.0, 90.0]),
+        )
+        save_table(tbl, citizen / "conus" / "2024" / f"{day}.nc", attrs={"day": day, "hours_missing": ""})
+    manifest = qc_std.partition(citizen, 2024)
+    stations_csv = tmp_path / "stations.csv"
+    stations_csv.write_text("station_id,lat,lon,elevation_m\n00000000001,40.0,-100.0,500.0\n")
+    sites = loao.load_static_sites(stations_csv)
+    trial = p3.load_trial_module(np.datetime64("2024-01-01T00", "ns"))
+    issues = np.array(
+        ["2024-01-01T00", "2024-01-01T12", "2024-01-02T00", "2024-01-02T12"], dtype="datetime64[ns]"
+    )
+    f_iss, f_val = [], []
+    f_means = {var: [] for var in (*trial.DIRECT, "wind_speed")}
+    for cyc in issues:
+        for lead in (3, 6, 12, 24, 48):
+            f_iss.append(cyc)
+            f_val.append(cyc + lead * H)
+            f_means["t2m"].append(np.array([280.0]))
+            f_means["td2m"].append(np.array([275.0]))
+            f_means["u10"].append(np.array([2.0]))
+            f_means["v10"].append(np.array([0.0]))
+            f_means["wind_speed"].append(np.array([2.0]))
+    fc = p3.archive_from_arrays(
+        np.array(f_iss), np.array(f_val), {k: np.array(v) for k, v in f_means.items()}, trial
+    )
+    monkeypatch.setattr(loao, "issue_times", lambda year: issues)
+    monkeypatch.setattr(loao, "load_loao_inputs", lambda *args, **kwargs: (trial, sites, fc))
+    rec = loao.run_record(2024, manifest, fc, stations_csv=stations_csv)
+    out = citizen / "conus" / "2024-qc-loao"
+    out.mkdir()
+    (out / "run.json").write_text(json.dumps(rec, indent=1) + "\n")
+    qc_loao._G.update(
+        trial=trial,
+        sites=sites,
+        forecasts=fc,
+        issues=issues,
+        tiles=citizen / "conus" / "2024-tiles",
+        out=out,
+        digest=rec["digest"],
+        start=np.datetime64("2024-01-01T00", "ns"),
+    )
+    jsonl_lines = []
+    for ordinal, name in enumerate(manifest["tiles"]):
+        row = qc_loao.run_tile((ordinal, name))
+        assert "tile" not in row and row["tile_ordinal"] == ordinal
+        jsonl_lines.append(json.dumps(row))
+    (out / "run.jsonl").write_text("\n".join(jsonl_lines) + "\n")
+    qc_loao.merge(tmp_path, 2024, stations_csv=stations_csv, min_free_bytes=0)
+    captured = capsys.readouterr()
+
+    # Check digest-mismatch error message uses opaque tile ordinal, never coordinate label.
+    qc_loao._G["digest"] = "different-digest"
+    with pytest.raises(p3.IncompleteError) as exc_info:
+        qc_loao.run_tile((0, manifest["tiles"][0]))
+    err_msg = str(exc_info.value)
+    assert "tile ordinal 0" in err_msg
+
+    # Verify zero citizen tokens and zero coordinate-derived tile labels across every log/summary/output.
+    coord_tile_re = re.compile(r"[+-]\d{2,3}_[+-]\d{3,4}")
+    token_re = re.compile(r"CW\d{9}")
+    surfaces = [
+        (out / "run.jsonl").read_text(),
+        (out / "run.json").read_text(),
+        (citizen / "conus" / "issue_extract_loao_2024.summary.json").read_text(),
+        captured.out,
+        captured.err,
+        err_msg,
+    ]
+    for text in surfaces:
+        assert not coord_tile_re.search(text), f"coordinate-derived tile label leaked: {text}"
+        assert not token_re.search(text), f"citizen token leaked: {text}"

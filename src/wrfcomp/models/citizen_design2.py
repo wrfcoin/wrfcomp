@@ -367,7 +367,8 @@ class TrackAReplay:
         b, c2 = a.copy(deep=False), a.copy(deep=False)
         b.attrs = {**a.attrs, "model_id": arms.MODEL_OWN, "model_version": VERSION}
         c2.attrs = {**a.attrs, "model_id": MODEL_CITIZEN_D2, "model_version": VERSION}
-        new = {}
+        new_b: dict[str, np.ndarray] = {}
+        shifts_c: dict[str, list[np.ndarray]] = {}
         for var in VARIABLES:
             members = a[var].values[0].astype(np.float64)
             mean = members.mean(axis=-1)
@@ -377,9 +378,9 @@ class TrackAReplay:
             value, weight = np.asarray(value, float), np.asarray(weight, float)
             age = np.asarray(rest[0]).astype(np.int64) if rest else np.zeros(len(value), dtype=np.int64)
             citizen, difference = self._neighbourhood(var, t, reading, value, weight, age, u10, v10, diag)
-            out_b, out_c = members.copy(), members.copy()
-            mean_b = np.empty((len(LEAD_HOURS), size))
+            out_b = members.copy()
             diag.phi[var], diag.gamma[var] = [], []
+            shifts_c[var] = []
             for k, (j, hours) in enumerate(zip(lead_index, LEAD_HOURS, strict=True)):
                 phi = gamma = 0.0
                 records = self._records(var, t, k, hours * HOUR)
@@ -390,29 +391,41 @@ class TrackAReplay:
                     use = ok & np.isfinite(past_citizen)
                     gamma = arms.gain(past_citizen[use], error_b[use], size)
                 shift_b = np.where(np.isfinite(own), phi * own, 0.0)
-                shift_c = shift_b + np.where(np.isfinite(citizen[k]), gamma * citizen[k], 0.0)
+                shift_cit = np.where(np.isfinite(citizen[k]), gamma * citizen[k], 0.0)
                 out_b[j] = members[j] + shift_b[:, None]
-                out_c[j] = members[j] + shift_c[:, None]
+                shifts_c[var].append(shift_cit)
                 diag.phi[var].append(phi)
                 diag.gamma[var].append(gamma)
-            new[var] = (out_b.astype(np.float32), out_c.astype(np.float32))
-            for k, j in enumerate(lead_index):
-                mean_b[k] = new[var][0][j].astype(np.float64).mean(axis=-1)
+            new_b[var] = out_b.astype(np.float32)
             record.own[var], record.citizen[var], record.difference[var] = own, citizen, difference
             record.mean_a[var] = mean[lead_index]
-            record.mean_b[var] = mean_b
             record.mean_own_lead[var] = mean[own_index]
             diag.own_defined[var] = int(np.isfinite(own).sum())
             diag.citizen_defined[var] = int(np.isfinite(citizen[1]).sum())  # 3 h lead
-        for arm_idx in (0, 1):
-            td, t2 = new["td2m"][arm_idx], new["t2m"][arm_idx]
-            for j in lead_index:
-                td[j] = np.minimum(td[j], t2[j])
-        for k, j in enumerate(lead_index):
-            record.mean_b["td2m"][k] = new["td2m"][0][j].astype(np.float64).mean(axis=-1)
+        # Finish control B first (including td2m <= t2m cap), then add citizen shifts to finished B.
+        for j in lead_index:
+            new_b["td2m"][j] = np.minimum(new_b["td2m"][j], new_b["t2m"][j])
         for var in VARIABLES:
-            b[var] = a[var].copy(data=new[var][0][None])
-            c2[var] = a[var].copy(data=new[var][1][None])
+            mean_b = np.empty((len(LEAD_HOURS), size))
+            for k, j in enumerate(lead_index):
+                mean_b[k] = new_b[var][j].astype(np.float64).mean(axis=-1)
+            record.mean_b[var] = mean_b
+        new_c: dict[str, np.ndarray] = {}
+        for var in VARIABLES:
+            out_c = new_b[var].copy()
+            for k, j in enumerate(lead_index):
+                sc = shifts_c[var][k]
+                moved = sc != 0.0
+                if moved.any():
+                    out_c[j, moved] = (new_b[var][j, moved].astype(np.float64) + sc[moved, None]).astype(
+                        np.float32
+                    )
+            new_c[var] = out_c
+        for j in lead_index:
+            new_c["td2m"][j] = np.minimum(new_c["td2m"][j], new_c["t2m"][j])
+        for var in VARIABLES:
+            b[var] = a[var].copy(data=new_b[var][None])
+            c2[var] = a[var].copy(data=new_c[var][None])
         self.history.append(record)
         defined = np.isfinite(record.citizen["t2m"][1]).astype(int)  # 3 h lead
         self.citizen_defined_count = (
@@ -761,7 +774,8 @@ class TrackBFoldReplay:
         b_ds, c_ds = g_base.copy(deep=False), g_base.copy(deep=False)
         b_ds.attrs = {**g_base.attrs, "model_id": MODEL_LOAO_BASE, "model_version": VERSION}
         c_ds.attrs = {**g_base.attrs, "model_id": MODEL_LOAO_CITIZEN, "model_version": VERSION}
-        new = {}
+        new_b: dict[str, np.ndarray] = {}
+        shifts_c: dict[str, list[np.ndarray]] = {}
         for var in VARIABLES:
             members = g_base[var].values[0].astype(np.float64)  # (lead, station, member)
             mean_g = members.mean(axis=-1)
@@ -772,10 +786,10 @@ class TrackBFoldReplay:
             value, weight = np.asarray(value, float), np.asarray(weight, float)
             age = np.asarray(rest[0]).astype(np.int64) if rest else np.zeros(len(value), dtype=np.int64)
             cit_all, diff_cit = self._citizen_loao(var, t, gefs_prev_mean, value, weight, age, u10, v10)
-            out_b, out_c = members.copy(), members.copy()
+            out_b = members.copy()
             mean_g_bias_in = np.empty((len(LEAD_HOURS), self.n_in))
-            mean_b_in = np.empty((len(LEAD_HOURS), self.n_in))
             diag.g_loao[var], diag.phi_off[var], diag.gamma_loao[var] = [], [], []
+            shifts_c[var] = []
             for k, (j, hours) in enumerate(zip(lead_index, LEAD_HOURS, strict=True)):
                 bias_off = self._bias_off(var, t, k, hours * HOUR)
                 g_gain, phi_off, gamma_loao = 1.0, 0.0, 0.0
@@ -799,19 +813,15 @@ class TrackBFoldReplay:
                 centre_b = centre_gb + shift_off
                 b_mem = centre_b[:, None] + g_gain * (members[j] - mean_g[j][:, None])
                 shift_cit = np.where(np.isfinite(cit_all[k]), gamma_loao * cit_all[k], 0.0)
-                c_mem = b_mem + shift_cit[:, None]
                 out_b[j] = b_mem
-                out_c[j] = c_mem
+                shifts_c[var].append(shift_cit)
                 diag.g_loao[var].append(g_gain)
                 diag.phi_off[var].append(phi_off)
                 diag.gamma_loao[var].append(gamma_loao)
-            new[var] = (out_b.astype(np.float32), out_c.astype(np.float32))
-            for k, j in enumerate(lead_index):
-                mean_b_in[k] = new[var][0][j, self.in_idx].astype(np.float64).mean(axis=-1)
+            new_b[var] = out_b.astype(np.float32)
             rec.mean_g_in[var] = mean_g[lead_index][:, self.in_idx]
             rec.var_g_in[var] = var_g[lead_index][:, self.in_idx]
             rec.mean_g_bias_in[var] = mean_g_bias_in
-            rec.mean_b_in[var] = mean_b_in
             rec.off_in[var] = off_all[:, self.in_idx]
             rec.cit_in[var] = cit_all[:, self.in_idx]
             rec.err12_in[var] = err12_in
@@ -820,15 +830,30 @@ class TrackBFoldReplay:
             diag.citizen_defined_out[var] = int(np.isfinite(cit_all[1, self.out_idx]).sum())
             if var == "t2m":
                 self.last_cit_defined_out_t2m_3h = np.isfinite(cit_all[1, self.out_idx]).astype(int)
-        for arm_idx in (0, 1):
-            td, t2 = new["td2m"][arm_idx], new["t2m"][arm_idx]
-            for j in lead_index:
-                td[j] = np.minimum(td[j], t2[j])
-        for k, j in enumerate(lead_index):
-            rec.mean_b_in["td2m"][k] = new["td2m"][0][j, self.in_idx].astype(np.float64).mean(axis=-1)
+        # Finish control B_LOAO first (including td2m <= t2m cap), then add citizen shifts to finished B_LOAO.
+        for j in lead_index:
+            new_b["td2m"][j] = np.minimum(new_b["td2m"][j], new_b["t2m"][j])
         for var in VARIABLES:
-            b_ds[var] = g_base[var].copy(data=new[var][0][None])
-            c_ds[var] = g_base[var].copy(data=new[var][1][None])
+            mean_b_in = np.empty((len(LEAD_HOURS), self.n_in))
+            for k, j in enumerate(lead_index):
+                mean_b_in[k] = new_b[var][j, self.in_idx].astype(np.float64).mean(axis=-1)
+            rec.mean_b_in[var] = mean_b_in
+        new_c: dict[str, np.ndarray] = {}
+        for var in VARIABLES:
+            out_c = new_b[var].copy()
+            for k, j in enumerate(lead_index):
+                sc = shifts_c[var][k]
+                moved = sc != 0.0
+                if moved.any():
+                    out_c[j, moved] = (new_b[var][j, moved].astype(np.float64) + sc[moved, None]).astype(
+                        np.float32
+                    )
+            new_c[var] = out_c
+        for j in lead_index:
+            new_c["td2m"][j] = np.minimum(new_c["td2m"][j], new_c["t2m"][j])
+        for var in VARIABLES:
+            b_ds[var] = g_base[var].copy(data=new_b[var][None])
+            c_ds[var] = g_base[var].copy(data=new_c[var][None])
         self.history.append(rec)
         return b_ds, c_ds, diag
 

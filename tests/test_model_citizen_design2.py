@@ -220,8 +220,9 @@ def _track_b_world(*, mutate_s_shift: float = 0.0, mutate_j_shift: float = 0.0, 
         truth["t2m"].values[:, target_s] += mutate_s_shift
         truth["td2m"].values[:, target_s] += mutate_s_shift
     if mutate_j_shift != 0.0:
-        truth["t2m"].values[:, train_j] += mutate_j_shift
-        truth["td2m"].values[:, train_j] += mutate_j_shift
+        wave = mutate_j_shift * (0.5 + np.sin(2.0 * np.pi * hours / 41.0))
+        truth["t2m"].values[:, train_j] += wave.astype(np.float32)
+        truth["td2m"].values[:, train_j] += wave.astype(np.float32)
 
     # Build raw GEFS cycles (5 leads: 3, 6, 12, 24, 48 h; westerly u10 = +6 m/s)
     gefs_cycles = []
@@ -349,6 +350,9 @@ def _track_b_world(*, mutate_s_shift: float = 0.0, mutate_j_shift: float = 0.0, 
         "pairs_loao": pairs_loao,
         "truth": truth,
         "gefs_cycles": gefs_cycles,
+        "snapshots": snapshots,
+        "prev_means_list": prev_means_list,
+        "replay": replay,
         "b": b_list,
         "c": c_list,
         "diags": diag_list,
@@ -383,18 +387,31 @@ def test_track_b_non_vacuous_mutation_and_positive_control():
     s_cell = cells(base["truth"].latitude.values[s], base["truth"].longitude.values[s])
     assert not np.any(p.cell[p.official == s] == s_cell)
 
-    # 2. Negative control: mutating all s observations leaves fold f_s gains, coverage, and bytes identical!
+    # 2. Negative control: mutating all s observations leaves fold f_s training predictors, gains,
+    # coverage, and output bytes identical!
     assert mut_s["covered"] == base["covered"]
     for d0, d1 in zip(base["diags"], mut_s["diags"], strict=True):
         assert d0[f_s] == d1[f_s]
+    h0 = list(base["replay"].fold_replays[f_s].history)
+    h1 = list(mut_s["replay"].fold_replays[f_s].history)
+    assert len(h0) == len(h1) and len(h0) > 0
+    for rec0, rec1 in zip(h0, h1, strict=True):
+        for var in d2.VARIABLES:
+            np.testing.assert_array_equal(rec0.mean_g_bias_in[var], rec1.mean_g_bias_in[var])
+            np.testing.assert_array_equal(rec0.off_in[var], rec1.off_in[var])
+            np.testing.assert_array_equal(rec0.cit_in[var], rec1.cit_in[var])
+            np.testing.assert_array_equal(rec0.mean_b_in[var], rec1.mean_b_in[var])
     out_mask = np.flatnonzero(base["folds"] == f_s)
     for b0, b1, c0, c1 in zip(base["b"], mut_s["b"], base["c"], mut_s["c"], strict=True):
         for var in UNITS:
             assert b0[var].values[:, :, out_mask, :].tobytes() == b1[var].values[:, :, out_mask, :].tobytes()
             assert c0[var].values[:, :, out_mask, :].tobytes() == c1[var].values[:, :, out_mask, :].tobytes()
 
-    # 3. Positive control: mutating in-fold training O(j) moves fold f_s gains and s's forecast!
-    assert mut_j["diags"][-1][f_s] != base["diags"][-1][f_s]
+    # 3. Positive control: mutating in-fold training O(j) moves fold f_s regression gains (phi_off /
+    # gamma_loao, not just spread gain g_loao) and changes s's forecast!
+    d_base = base["diags"][-1][f_s]
+    d_mut = mut_j["diags"][-1][f_s]
+    assert d_mut.phi_off != d_base.phi_off or d_mut.gamma_loao != d_base.gamma_loao
     assert (
         mut_j["b"][-1]["t2m"].values[0, 1, s].tobytes() != base["b"][-1]["t2m"].values[0, 1, s].tobytes()
         or mut_j["c"][-1]["t2m"].values[0, 1, s].tobytes() != base["c"][-1]["t2m"].values[0, 1, s].tobytes()
@@ -411,6 +428,336 @@ def test_track_b_non_vacuous_mutation_and_positive_control():
                 # Leads 12, 24, 48 h (indices 3, 4, 5 in 6-lead store == indices 2, 3, 4 in 5-lead GEFS)
                 assert b0[var].values[:, 3:].tobytes() == g0[var].values[:, 2:].tobytes()
                 assert c0[var].values[:, 3:].tobytes() == g0[var].values[:, 2:].tobytes()
+
+
+def test_zero_citizen_dewpoint_shift_preserves_capped_control_bytes():
+    """When control B caps td2m <= t2m and citizen td2m shift is zero while citizen t2m shift is
+    positive, C2.td2m must equal finished B.td2m byte-for-byte on both Track A and Track B."""
+    # --- Track A ---
+    d1 = _load_d1_test()
+    _, truth, issues, snapshots = d1.world()
+    p2 = d2.oriented_citizen_pairs(
+        *d1.CITIZEN.T, truth.latitude.values, truth.longitude.values, truth.elevation_m.values
+    )
+    r_a = d2.TrackAReplay(2024, truth, p2)
+    for a, snap in zip(issues[:-1], snapshots[:-1], strict=True):
+        r_a.issue(a, snap, wind_prev=(np.full(4, 6.0), np.zeros(4)))
+    a_last = issues[-1].copy(deep=True)
+    # Force uncapped control td2m > t2m at station 0, lead 3 h (index 1) so B caps td2m to t2m.
+    a_last["t2m"].values[0, 1, 0, :] = np.float32(280.0)
+    a_last["td2m"].values[0, 1, 0, :] = np.float32(283.0)
+    snap_a = {
+        "t2m": (snapshots[-1]["t2m"][0] + 6.0, snapshots[-1]["t2m"][1]),
+        "td2m": (np.full_like(snapshots[-1]["td2m"][0], np.nan), np.zeros_like(snapshots[-1]["td2m"][1])),
+    }
+    b_a, c2_a, diag_a = r_a.issue(a_last, snap_a, wind_prev=(np.full(4, 6.0), np.zeros(4)))
+    assert diag_a.gamma["t2m"][1] > 0.0
+    assert np.all(b_a["td2m"].values[0, 1, 0] == b_a["t2m"].values[0, 1, 0])
+    assert np.all(c2_a["t2m"].values[0, 1, 0] > b_a["t2m"].values[0, 1, 0] + 0.1)
+    assert c2_a["td2m"].values[0, 1, 0].tobytes() == b_a["td2m"].values[0, 1, 0].tobytes()
+
+    # --- Track B ---
+    world = _track_b_world(days=38)
+    s = world["target_s"]
+    f_s = world["fold_s"]
+    g_base = d2.make_g_base(world["gefs_cycles"][-1], world["gefs_cycles"][-2]).copy(deep=True)
+    g_base["t2m"].values[0, 1, s, :] = np.float32(280.0)
+    g_base["td2m"].values[0, 1, s, :] = np.float32(285.0)
+    next_t = g_base.init_time.values[0] + 12 * H
+    g_base = g_base.assign_coords(init_time=[next_t])
+    snap_prev = world["snapshots"][-1]
+    snap_b = {
+        "t2m": (snap_prev["t2m"][0] + 6.0, snap_prev["t2m"][1], snap_prev["t2m"][2]),
+        "td2m": (
+            np.full_like(snap_prev["td2m"][0], np.nan),
+            np.zeros_like(snap_prev["td2m"][1]),
+            snap_prev["td2m"][2],
+        ),
+    }
+    b_b, c2_b, f_diags = world["replay"].issue(g_base, world["prev_means_list"][-1], snap_b)
+    assert f_diags[f_s].gamma_loao["t2m"][1] > 0.0
+    assert np.all(b_b["td2m"].values[0, 1, s] == b_b["t2m"].values[0, 1, s])
+    assert np.all(c2_b["t2m"].values[0, 1, s] > b_b["t2m"].values[0, 1, s] + 0.1)
+    assert c2_b["td2m"].values[0, 1, s].tobytes() == b_b["td2m"].values[0, 1, s].tobytes()
+
+
+def test_track_b_end_to_end_post_T_truth_and_late_arrival_citizen_reports(tmp_path, monkeypatch):
+    """End-to-end Track B causality & Amendment 1 late-arrival regression (partition -> LOAO QC ->
+    merge -> build_track_b + relay audit + default min_covered stop + zero token/coord leaks)."""
+    import re
+
+    from wrfcomp.assimilation.madis_archive import ReportTable, save_table
+
+    qc_std = _load_script("run_phase3_qc")
+    qc_loao = _load_script("run_phase3_qc_loao")
+    builder = _load_script("build_phase3_design2")
+
+    days = 26  # 52 issues in 2024-01 (covers USUAL_MIN=7 + active gains)
+    day_strs = [str(np.datetime_as_string(START + d * D, unit="D")) for d in range(days)]
+    monkeypatch.setattr(qc_std, "expected_days", lambda year: list(day_strs))
+    inits = np.arange(START, START + days * D, 12 * H)
+    monkeypatch.setattr(loao_qc, "issue_times", lambda year: inits)
+    t_cut = START + 20 * D  # 2024-01-21T00Z
+
+    airport_coords = [
+        (40.00, -100.00, 500.0),
+        (40.00, -99.06, 510.0),
+        (40.00, -98.12, 490.0),
+        (40.72, -100.00, 520.0),
+        (40.72, -99.06, 505.0),
+        (40.72, -98.12, 495.0),
+        (41.44, -100.00, 530.0),
+        (41.44, -99.06, 515.0),
+        (41.44, -98.12, 500.0),
+        (39.28, -99.53, 480.0),
+    ]
+    n_air = len(airport_coords)
+    sids = [f"{i + 1:011d}" for i in range(n_air)]
+    lats = np.array([c[0] for c in airport_coords], dtype=np.float64)
+    lons = np.array([c[1] for c in airport_coords], dtype=np.float64)
+    elevs = np.array([c[2] for c in airport_coords], dtype=np.float64)
+    stations_csv = tmp_path / "stations_10.csv"
+    stations_csv.write_text(
+        "station_id,lat,lon,elevation_m\n"
+        + "".join(f"{sid},{la},{lo},{el}\n" for sid, la, lo, el in zip(sids, lats, lons, elevs, strict=True))
+    )
+
+    cit_rows, cit_tokens = [], []
+    tok_id = 0
+    for k in range(n_air):
+        for dlat, dlon in ((-0.2, -0.2), (-0.2, 0.2), (0.2, -0.2), (0.2, 0.2)):
+            cl, cn = round(lats[k] + dlat, 1), round(lons[k] + dlon, 1)
+            if cells(cl, cn) == cells(lats[k], lons[k]):
+                cl = round(cl + 0.2, 1)
+            cit_rows.append((cl, cn, round(elevs[k] / 10.0) * 10.0))
+            cit_tokens.append(f"CW{tok_id:09d}")
+            tok_id += 1
+    cit_geo = np.array(cit_rows, dtype=np.float64)
+
+    labels = np.arange(START, START + (days + 3) * D, H)
+    hours = np.arange(len(labels), dtype=np.float64)
+    stations_ds = xr.Dataset(
+        coords={
+            "station_id": sids,
+            "latitude": ("station_id", lats.astype(np.float32)),
+            "longitude": ("station_id", lons.astype(np.float32)),
+            "elevation_m": ("station_id", elevs.astype(np.float32)),
+        }
+    )
+
+    def run_pipeline(root: Path, *, perturb: bool) -> dict:
+        rng = np.random.default_rng(77)
+        diurnal = 282.0 + 5.0 * np.sin(2.0 * np.pi * hours / 24.0)
+        syn = 2.2 * np.sin(2.0 * np.pi * hours / 67.0)
+        meso = 2.8 * np.cos(2.0 * np.pi * hours / 29.0)
+        truth = xr.Dataset(coords={"valid_time": labels, **dict(stations_ds.coords)})
+        for k_var in UNITS:
+            scale = 100.0 if k_var == "msl" else 1.0
+            centre = 100000.0 if k_var == "msl" else (275.0 if k_var == "td2m" else 282.0)
+            base = centre + scale * (diurnal - 282.0)[:, None] + np.zeros((1, n_air))
+            if k_var in d2.VARIABLES:
+                sig = np.zeros((len(labels), n_air))
+                sig[3:, :] = 0.6 * syn[:-3, None] + 0.7 * meso[:-3, None]
+                base = base + sig + 1.5 + rng.normal(0.0, 0.12, base.shape)
+                if perturb:
+                    # Perturb strictly post-T_cut truth (valid_time > T_cut)
+                    post = labels > t_cut
+                    base[post, :] += 10.0 * np.sin(2.0 * np.pi * hours[post, None] / 19.0) + 6.0
+            else:
+                base = base + scale * rng.normal(0.0, 0.2, base.shape)
+            truth[k_var] = (("valid_time", "station_id"), base.astype(np.float32))
+            truth[k_var + "_offset_min"] = xr.full_like(truth[k_var], -5, dtype=np.int16)
+        truth["td2m"].values[:] = np.minimum(truth["td2m"].values, truth["t2m"].values)
+        (root / "truth").mkdir(parents=True)
+        truth.to_netcdf(root / "truth" / "isd_conus_2024.nc")
+
+        # Write raw GEFS cycles (identical between base and perturbed)
+        for t in inits:
+            g = layout(stations_ds, [t], GEFS_LEADS, 31, "noaa-gefs")
+            i0 = int((t - START) / H)
+            for k_var in UNITS:
+                scale = 100.0 if k_var == "msl" else 1.0
+                centre = 100000.0 if k_var == "msl" else (275.0 if k_var == "td2m" else 282.0)
+                for j_l, lead in enumerate(GEFS_LEADS):
+                    if k_var == "u10":
+                        lvl = np.full(n_air, 6.0)
+                    elif k_var == "v10":
+                        lvl = np.zeros(n_air)
+                    else:
+                        lvl = centre + scale * (diurnal[i0 + lead] - 282.0) + np.zeros(n_air)
+                    g[k_var].values[0, j_l] = (
+                        lvl[:, None] + scale * rng.normal(0.0, 0.6, (n_air, 31))
+                    ).astype(np.float32)
+            g["td2m"].values[:] = np.minimum(g["td2m"].values, g["t2m"].values)
+            stamp = np.datetime_as_string(t, unit="h").replace("-", "").replace("T", "")
+            write(g, root / "baselines" / "gefs" / f"{stamp}.zarr")
+
+        # Write daily MADIS citizen NetCDFs (with Amendment 1 received_time)
+        citizen = root / "citizen"
+        for d_idx, day in enumerate(day_strs):
+            day_start = START + d_idx * D
+            obs_list, rec_list, tok_list, la_list, lo_list, el_list, t_list, td_list = (
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
+            # Two on-time reports per day: 11:50Z (before 12Z) and 23:50Z (before next day 00Z)
+            for slot_h in (11, 23):
+                obs_t = day_start + slot_h * H + 50 * M
+                rec_t = obs_t + 30 * np.timedelta64(1, "s")
+                hr = int((obs_t - START) / H)
+                for c_idx, (cl, cn, ch) in enumerate(cit_geo):
+                    val = (
+                        282.0
+                        + 5.0 * np.sin(2.0 * np.pi * hr / 24.0)
+                        + 1.5
+                        + 0.25 * (c_idx % 5 - 2)
+                        + meso[np.clip(hr, 0, len(meso) - 1)]
+                        + rng.normal(0.0, 0.08)
+                    )
+                    if perturb and obs_t > t_cut:
+                        val += 8.0
+                    obs_list.append(obs_t)
+                    rec_list.append(rec_t)
+                    tok_list.append(cit_tokens[c_idx])
+                    la_list.append(cl)
+                    lo_list.append(cn)
+                    el_list.append(ch)
+                    t_list.append(val)
+                    td_list.append(val - 7.0)
+            n_rows = len(obs_list)
+            tbl = ReportTable(
+                station_id=np.array(tok_list),
+                obs_time=np.array(obs_list, dtype="datetime64[ns]"),
+                received_time=np.array(rec_list, dtype="datetime64[ns]"),
+                lat=np.array(la_list, dtype=np.float32),
+                lon=np.array(lo_list, dtype=np.float32),
+                elevation_m=np.array(el_list, dtype=np.float32),
+                t2m=np.array(t_list, dtype=np.float32),
+                td2m=np.array(td_list, dtype=np.float32),
+                wind_speed=np.full(n_rows, 2.0, dtype=np.float32),
+                wind_dir=np.full(n_rows, 90.0, dtype=np.float32),
+            )
+            save_table(tbl, citizen / "conus" / "2024" / f"{day}.nc", attrs={"day": day, "hours_missing": ""})
+
+        manifest = qc_std.partition(citizen, 2024)
+        if perturb:
+            # Inject a late-arriving pre-T_cut citizen report (obs = T_cut - 5 min, received = T_cut + 60 s)
+            # directly into every partitioned tile .npz to exercise run_phase3_qc_loao's and
+            # load_full_resolution_streams_from_tiles's independent Amendment 1 arrival gates.
+            late_obs_ns = int((t_cut - 5 * M).astype("datetime64[ns]").astype(np.int64))
+            late_rec_ns = int((t_cut + 60 * np.timedelta64(1, "s")).astype("datetime64[ns]").astype(np.int64))
+            tiles_dir = citizen / "conus" / "2024-tiles"
+            for rel in list(manifest["parts"]):
+                part_path = tiles_dir / rel
+                with np.load(part_path) as z:
+                    d = {k: z[k] for k in z.files}
+                n_id = len(d["ident_token"])
+                extra_ident = np.arange(n_id, dtype=np.int32)
+                d["row_ident"] = np.concatenate([d["row_ident"], extra_ident])
+                d["obs_time"] = np.concatenate([d["obs_time"], np.full(n_id, late_obs_ns, dtype=np.int64)])
+                d["received_time"] = np.concatenate(
+                    [d["received_time"], np.full(n_id, late_rec_ns, dtype=np.int64)]
+                )
+                d["t2m"] = np.concatenate([d["t2m"], np.full(n_id, 315.0, dtype=np.float32)])
+                d["td2m"] = np.concatenate([d["td2m"], np.full(n_id, 305.0, dtype=np.float32)])
+                d["wind_speed"] = np.concatenate([d["wind_speed"], np.full(n_id, 2.0, dtype=np.float32)])
+                d["wind_dir"] = np.concatenate([d["wind_dir"], np.full(n_id, 90.0, dtype=np.float32)])
+                order = np.lexsort((d["obs_time"], d["row_ident"]))
+                for col in (
+                    "row_ident",
+                    "obs_time",
+                    "received_time",
+                    "t2m",
+                    "td2m",
+                    "wind_speed",
+                    "wind_dir",
+                ):
+                    d[col] = d[col][order]
+                np.savez_compressed(part_path, **d)
+                manifest["parts"][rel] = p3.sha256_file(part_path)
+            (tiles_dir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+        trial, sites, fc = loao_qc.load_loao_inputs(root, 2024, stations_csv=stations_csv)
+        rec = loao_qc.run_record(2024, manifest, fc, stations_csv=stations_csv)
+        qc_out = citizen / "conus" / "2024-qc-loao"
+        qc_out.mkdir(parents=True)
+        (qc_out / "run.json").write_text(json.dumps(rec, indent=1) + "\n")
+        qc_loao._G.update(
+            trial=trial,
+            sites=sites,
+            forecasts=fc,
+            issues=inits,
+            tiles=citizen / "conus" / "2024-tiles",
+            out=qc_out,
+            digest=rec["digest"],
+            start=START,
+        )
+        for ordinal, name in enumerate(manifest["tiles"]):
+            qc_loao.run_tile((ordinal, name))
+        qc_loao.merge(root, 2024, stations_csv=stations_csv, min_free_bytes=0)
+
+        return builder.build_track_b(
+            root,
+            2024,
+            issues=inits,
+            stations=sids,
+            stations_csv=stations_csv,
+            verify_extract=True,
+            run_relay_audit=True,
+            min_covered=1,
+            min_free_bytes=0,
+        )
+
+    base_out = run_pipeline(tmp_path / "base", perturb=False)
+    pert_out = run_pipeline(tmp_path / "pert", perturb=True)
+    assert base_out["build_kind"] == "full_year" and base_out["scoring_ready"] is True
+    assert pert_out["build_kind"] == "full_year" and pert_out["scoring_ready"] is True
+    assert base_out["covered_loao_count"] == n_air
+
+    with (
+        xr.open_zarr(tmp_path / "base" / "candidates" / d2.MODEL_LOAO_BASE / "2024-01.zarr") as b0,
+        xr.open_zarr(tmp_path / "pert" / "candidates" / d2.MODEL_LOAO_BASE / "2024-01.zarr") as b1,
+        xr.open_zarr(tmp_path / "base" / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c0,
+        xr.open_zarr(tmp_path / "pert" / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c1,
+    ):
+        pre = b0.init_time.values <= t_cut
+        post = b0.init_time.values > t_cut
+        assert pre.any() and post.any()
+        for var in UNITS:
+            assert b0[var].values[pre].tobytes() == b1[var].values[pre].tobytes()
+            assert c0[var].values[pre].tobytes() == c1[var].values[pre].tobytes()
+        # Non-vacuous check: post-T_cut perturbation actually changes post-T_cut forecasts!
+        assert b0["t2m"].values[post].tobytes() != b1["t2m"].values[post].tobytes()
+        assert c0["t2m"].values[post].tobytes() != c1["t2m"].values[post].tobytes()
+
+    # Default min_covered=50 must refuse scoring handoff on this 10-station build!
+    with pytest.raises(builder.BuildRefusedError, match="covered_loao_count 10 < 50"):
+        builder.build_track_b(
+            tmp_path / "base",
+            2024,
+            issues=inits,
+            stations=sids,
+            stations_csv=stations_csv,
+            verify_extract=True,
+            min_free_bytes=0,
+        )
+    blocked_meta = json.loads(
+        (tmp_path / "base" / "phase3-design2" / "2024" / "track_b" / "build.json").read_text()
+    )
+    assert blocked_meta["scoring_ready"] is False and blocked_meta["stop_reasons"]
+
+    # Privacy check: Track B metadata & relay audit never leak citizen tokens or coordinate tile labels.
+    coord_tile_re = re.compile(r"[+-]\d{2,3}_[+-]\d{3,4}")
+    token_re = re.compile(r"CW\d{9}")
+    meta_b = tmp_path / "base" / "phase3-design2" / "2024" / "track_b"
+    for fname in ("build.json", "folds.csv", "covered_stations_loao.csv", "relay_audit.json"):
+        txt = (meta_b / fname).read_text()
+        assert not coord_tile_re.search(txt) and not token_re.search(txt)
 
 
 # ------------------------------------------------------------------ post-freeze target-paired relay audit
@@ -546,26 +893,102 @@ def test_design1_2023_wrapper_isolated_replay_matches_reference_hashes(tmp_path)
         verify_extract=False,
     )
     ref_json = tmp_path / "ref_live" / "build.json"
-    replay_jan = wrapper.build_design1_arms(
+    ref_bytes = ref_json.read_bytes()
+    replay_jan_feb = wrapper.build_design1_arms(
         tmp_path,
         2024,
         out_dir=tmp_path / "scratch_replay",
+        stop_after_month="2024-02",
+        verify_against=ref_json,
+        issues=times,
+        stations=ids,
+        verify_extract=False,
+    )
+    assert [m["period"] for m in replay_jan_feb["arm_b"]] == ["2024-01", "2024-02"]
+    assert replay_jan_feb["frozen_code_digest"] == p3.code_digest()
+    assert replay_jan_feb["parity"]["verified_months"] == ["2024-01", "2024-02"]
+
+    # Empty replay and truncated one-month replay (missing 2024-02) must BOTH be refused!
+    with pytest.raises(wrapper.BuildRefusedError, match="empty replay"):
+        wrapper.verify_against_build_json({"arm_b": [], "arm_c": []}, ref_json)
+    replay_jan = wrapper.build_design1_arms(
+        tmp_path,
+        2024,
+        out_dir=tmp_path / "scratch_jan_only",
         stop_after_month="2024-01",
         issues=times,
         stations=ids,
         verify_extract=False,
     )
-    assert [m["period"] for m in replay_jan["arm_b"]] == ["2024-01"]
-    assert replay_jan["frozen_code_digest"] == p3.code_digest()
-    ver = wrapper.verify_against_build_json(replay_jan, ref_json)
-    assert ver["verified_months"] == ["2024-01"]
+    with pytest.raises(wrapper.BuildRefusedError, match="replay periods incomplete"):
+        wrapper.verify_against_build_json(replay_jan, ref_json)
+
+    # Overlapping destination must be refused BEFORE overwriting reference build.json or live stores!
+    with pytest.raises(wrapper.BuildRefusedError, match="must not overlap"):
+        wrapper.build_design1_arms(
+            tmp_path,
+            2024,
+            out_dir=ref_json.parent,
+            stop_after_month="2024-02",
+            verify_against=ref_json,
+            issues=times,
+            stations=ids,
+            verify_extract=False,
+        )
+    assert ref_json.read_bytes() == ref_bytes
+    with pytest.raises(wrapper.BuildRefusedError, match="isolated from <data-dir>/candidates"):
+        wrapper.build_design1_arms(
+            tmp_path,
+            2024,
+            out_dir=tmp_path / "candidates" / "bad_replay",
+            stop_after_month="2024-02",
+            issues=times,
+            stations=ids,
+            verify_extract=False,
+        )
+
     # Tampered reference hash must refuse!
     bad = json.loads(ref_json.read_text())
     bad["arm_c"][0]["content_sha256"] = "0" * 64
     bad_json = tmp_path / "bad_build.json"
     bad_json.write_text(json.dumps(bad))
     with pytest.raises(wrapper.BuildRefusedError, match="hash mismatch"):
-        wrapper.verify_against_build_json(replay_jan, bad_json)
+        wrapper.verify_against_build_json(replay_jan_feb, bad_json)
+
+    # 2023 provenance verification must refuse explicitly rather than silently skipping!
+    times_2023 = times - np.timedelta64(365, "D")
+    qc_std.write_extract(
+        tmp_path / "citizen" / "conus" / "issue_extract_2023.nc",
+        cat,
+        times_2023,
+        ids,
+        {
+            "complete": 1,
+            "year": 2023,
+            "run_digest": "syn",
+            "tiles_digest": "syn",
+            "truth_sha256": p3.sha256_file(tmp_path / "truth" / "isd_conus_2024.nc"),
+        },
+    )
+    with pytest.raises(wrapper.BuildRefusedError, match="provenance verification for 2023"):
+        wrapper.build_design1_arms(
+            tmp_path,
+            2023,
+            out_dir=tmp_path / "scratch_2023",
+            issues=times_2023,
+            stations=ids,
+            verify_extract=True,
+        )
+    builder = _load_script("build_phase3_design2")
+    with pytest.raises(builder.BuildRefusedError, match="provenance verification for 2023"):
+        builder.build_track_a(
+            tmp_path,
+            2023,
+            issues=times_2023,
+            stations=ids,
+            verify_extract=True,
+            min_free_bytes=0,
+        )
 
 
 def test_design2_causality_year_isolation_and_isolated_scratch_replay(tmp_path):
@@ -643,9 +1066,49 @@ def test_design2_causality_year_isolation_and_isolated_scratch_replay(tmp_path):
         },
     )
     builder = _load_script("build_phase3_design2")
+    # Default min_covered=50 must block scoring handoff on this 4-station fixture (1 covered)!
+    with pytest.raises(builder.BuildRefusedError, match="covered_count 1 < 50"):
+        builder.build_track_a(
+            tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_free_bytes=0
+        )
+    blocked = json.loads((tmp_path / "phase3-design2" / "2024" / "track_a" / "build.json").read_text())
+    assert blocked["build_kind"] == "full_year" and blocked["scoring_ready"] is False
+    assert blocked["stop_reasons"] == ["covered_count 1 < 50"]
+
+    # With min_covered=1, full run succeeds and records scoring_ready=True; partial replay records False.
     full_a = builder.build_track_a(
-        tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_free_bytes=0
+        tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_covered=1, min_free_bytes=0
     )
+    assert full_a["build_kind"] == "full_year" and full_a["scoring_ready"] is True
+    assert full_a["covered_count"] == 1
+
+    # Track A 2024 COVERED parity check against frozen Design 1 phase3/2024/build.json.
+    d1_meta = tmp_path / "phase3" / "2024"
+    d1_meta.mkdir(parents=True)
+    (d1_meta / "build.json").write_text(json.dumps({"covered_sha256": "0" * 64}))
+    with pytest.raises(builder.BuildRefusedError, match="COVERED sha256 differs"):
+        builder.build_track_a(
+            tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_covered=1, min_free_bytes=0
+        )
+    mismatch_meta = json.loads((tmp_path / "phase3-design2" / "2024" / "track_a" / "build.json").read_text())
+    assert mismatch_meta["design1_covered_parity"] is False and mismatch_meta["scoring_ready"] is False
+    (d1_meta / "build.json").write_text(json.dumps({"covered_sha256": full_a["covered_sha256"]}))
+    matched = builder.build_track_a(
+        tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_covered=1, min_free_bytes=0
+    )
+    assert matched["design1_covered_parity"] is True and matched["scoring_ready"] is True
+
+    # Partial replay must require isolated out_root and mark scoring_ready=False.
+    with pytest.raises(builder.BuildRefusedError, match="requires an isolated --out-dir"):
+        builder.build_track_a(
+            tmp_path,
+            2024,
+            stop_after_month="2024-01",
+            issues=times,
+            stations=ids,
+            verify_extract=False,
+            min_free_bytes=0,
+        )
     replay_a = builder.build_track_a(
         tmp_path,
         2024,
@@ -656,6 +1119,6 @@ def test_design2_causality_year_isolation_and_isolated_scratch_replay(tmp_path):
         verify_extract=False,
         min_free_bytes=0,
     )
+    assert replay_a["build_kind"] == "partial_replay" and replay_a["scoring_ready"] is False
     assert [m["period"] for m in replay_a["arm_c2"]] == ["2024-01"]
     assert replay_a["arm_c2"][0]["content_sha256"] == full_a["arm_c2"][0]["content_sha256"]
-    assert full_a["covered_count"] == 1

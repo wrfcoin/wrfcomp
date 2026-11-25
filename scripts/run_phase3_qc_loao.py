@@ -8,8 +8,8 @@ Two steps:
 ``merge``  merge all tile outputs into ``citizen/conus/issue_extract_loao_<year>.nc``
            (format ``phase3-extract-loao.v1``) and write an aggregate-only summary JSON.
 
-Logs carry one-degree tile labels, counts, and aggregates only. No citizen identifier or
-position is ever printed or logged.
+Logs carry opaque tile ordinals, counts, and aggregates only. No citizen identifier or
+coordinate-derived tile label is ever printed or logged.
 """
 
 from __future__ import annotations
@@ -74,15 +74,16 @@ def write_tile_output(path: Path, run_digest: str, token, lat, lon, height, stat
     tmp.replace(path)
 
 
-def run_tile(name: str) -> dict:
+def run_tile(task: tuple[int, str]) -> dict:
+    tile_ordinal, name = task
     ti, tj = int(name[:3]), int(name[4:])
     t0 = time.monotonic()
     out_path = _G["out"] / f"{name}.npz"
     if out_path.exists():
         with np.load(out_path) as z:
             if str(z["run_digest"]) != _G["digest"]:
-                raise p3.IncompleteError(f"tile output {name} was made from other inputs")
-        return {"tile": name, "skipped": True}
+                raise p3.IncompleteError(f"tile ordinal {tile_ordinal} output was made from other inputs")
+        return {"tile_ordinal": tile_ordinal, "skipped": True}
     trial, sites, forecasts, issues = _G["trial"], _G["sites"], _G["forecasts"], _G["issues"]
     start_ns = int(_G["start"].astype("datetime64[ns]").astype(np.int64))
     index: dict[tuple, int] = {}
@@ -188,7 +189,7 @@ def run_tile(name: str) -> dict:
         {k: (np.concatenate(v) if v else np.empty(0)) for k, v in rec.items()},
     )
     return {
-        "tile": name,
+        "tile_ordinal": tile_ordinal,
         "stations": int(len(core)),
         "first_pass_stations": len(needed),
         "channel_reports": n_reports,
@@ -238,10 +239,11 @@ def run(
         start=start,
     )
     tiles = manifest["tiles"] if only is None else manifest["tiles"][:only]
+    tasks = list(enumerate(tiles))
     t0 = time.monotonic()
     total = 0
     with mp.get_context("fork").Pool(processes) as pool, (out / "run.jsonl").open("a") as log:
-        for record in pool.imap_unordered(run_tile, tiles):
+        for record in pool.imap_unordered(run_tile, tasks):
             log.write(json.dumps(record) + "\n")
             log.flush()
             total += record.get("channel_reports", 0)
@@ -321,10 +323,10 @@ def merge(
     )
     parts: dict[str, list] = {k: [] for k in names}
     offset = 0
-    for name in manifest["tiles"]:
+    for tile_ordinal, name in enumerate(manifest["tiles"]):
         with np.load(out / f"{name}.npz") as z:
             if str(z["run_digest"]) != record["digest"]:
-                raise p3.IncompleteError(f"tile output {name} was made from other inputs")
+                raise p3.IncompleteError(f"tile ordinal {tile_ordinal} output was made from other inputs")
             if not len(z["token"]):
                 continue
             for k in names:

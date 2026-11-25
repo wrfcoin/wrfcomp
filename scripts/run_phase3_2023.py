@@ -53,25 +53,50 @@ def wrapper_digest() -> str:
     )
 
 
+DEFAULT_REPLAY_MONTHS = ("2024-01", "2024-02")
+
+
+def _paths_overlap(a: Path, b: Path) -> bool:
+    ra, rb = a.resolve(), b.resolve()
+    return ra == rb or ra in rb.parents or rb in ra.parents
+
+
 def build_design1_arms(
     data: Path,
     year: int,
     *,
     out_dir: Path,
     stop_after_month: str | None = None,
+    verify_against: Path | None = None,
+    expected_months: tuple[str, ...] | None = None,
     issues=None,
     stations=None,
     verify_extract: bool = True,
 ) -> dict:
     """Replay untouched ``citizen_arms.Replay`` into isolated ``out_dir`` (read-only live stores)."""
+    out_dir = out_dir.resolve()
+    if _paths_overlap(out_dir, data / "candidates"):
+        raise BuildRefusedError("out_dir must be isolated from <data-dir>/candidates")
+    if verify_against is not None:
+        ref_path = verify_against.resolve()
+        if not ref_path.is_file():
+            raise BuildRefusedError("reference build.json does not exist")
+        if _paths_overlap(out_dir, ref_path.parent) or (out_dir / "build.json").resolve() == ref_path:
+            raise BuildRefusedError("out_dir must not overlap the reference build.json directory")
     start, _ = v2.year_bounds(year)
     start = np.datetime64(start, "ns")
     issues = loao_qc.issue_times(year) if issues is None else np.asarray(issues, dtype="datetime64[ns]")
     stations = phase3_frozen.registered_stations() if stations is None else list(stations)
     extract_path = data / "citizen" / "conus" / f"issue_extract_{year}.nc"
     extract, snapshot = phase3_frozen.load_extract(extract_path, year, issues, stations)
-    if verify_extract and year == 2024:
-        phase3_frozen.verify_extract_is_current(data, year, extract_path, extract)
+    if verify_extract:
+        if year == 2024:
+            phase3_frozen.verify_extract_is_current(data, year, extract_path, extract)
+        else:
+            raise BuildRefusedError(
+                f"standard extract provenance verification for {year} is not yet implemented "
+                "(deferred until Stage 2 after manager GO)"
+            )
     months = sorted((data / "candidates" / phase3_frozen.A_DIR).glob(f"{year}-??.zarr"))
     seen = []
     for path in months:
@@ -123,27 +148,50 @@ def build_design1_arms(
         out["arm_b"].append(phase3_frozen.publish(parts_b, out_dir / arms.MODEL_OWN, path.stem))
         out["arm_c"].append(phase3_frozen.publish(parts_c, out_dir / arms.MODEL_CITIZEN, path.stem))
     out["n_issues"] = i
+    out["build_kind"] = "partial_replay" if stop_after_month is not None else "full_year"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "build.json").write_text(json.dumps(out, indent=1) + "\n")
+    if verify_against is not None:
+        exp = expected_months if expected_months is not None else DEFAULT_REPLAY_MONTHS
+        out["parity"] = verify_against_build_json(out, verify_against, expected_months=exp)
     return out
 
 
-def verify_against_build_json(replayed: dict, reference_build_json: Path) -> dict:
-    """Compare replayed monthly B/C1 content hashes against read-only ``phase3/2024/build.json``."""
+def verify_against_build_json(
+    replayed: dict,
+    reference_build_json: Path,
+    *,
+    expected_months: tuple[str, ...] = DEFAULT_REPLAY_MONTHS,
+) -> dict:
+    """Compare replayed monthly B/C1 content hashes against read-only ``phase3/2024/build.json``.
+
+    Refuses empty or truncated replays and requires the exact expected period sets for both B and C1.
+    """
+    if not expected_months:
+        raise BuildRefusedError("expected_months must be non-empty")
+    exp_list = list(expected_months)
+    got_b = [m["period"] for m in replayed.get("arm_b", ())]
+    got_c = [m["period"] for m in replayed.get("arm_c", ())]
+    if not got_b or not got_c:
+        raise BuildRefusedError("empty replay: no monthly stores were produced for B or C1")
+    if got_b != exp_list or got_c != exp_list:
+        raise BuildRefusedError(
+            f"replay periods incomplete: expected {exp_list}, got arm_b={got_b}, arm_c={got_c}"
+        )
     ref = json.loads(reference_build_json.read_text())
-    ref_b = {m["period"]: m["content_sha256"] for m in ref["arm_b"]}
-    ref_c = {m["period"]: m["content_sha256"] for m in ref["arm_c"]}
+    ref_b = {m["period"]: m["content_sha256"] for m in ref.get("arm_b", ())}
+    ref_c = {m["period"]: m["content_sha256"] for m in ref.get("arm_c", ())}
     mismatches = []
     for entry in replayed["arm_b"]:
-        if ref_b.get(entry["period"]) != entry["content_sha256"]:
-            mismatches.append(f"arm_b {entry['period']}: hash mismatch")
+        if entry["period"] not in ref_b or ref_b[entry["period"]] != entry["content_sha256"]:
+            mismatches.append(f"arm_b {entry['period']}: hash mismatch or missing reference")
     for entry in replayed["arm_c"]:
-        if ref_c.get(entry["period"]) != entry["content_sha256"]:
-            mismatches.append(f"arm_c {entry['period']}: hash mismatch")
+        if entry["period"] not in ref_c or ref_c[entry["period"]] != entry["content_sha256"]:
+            mismatches.append(f"arm_c {entry['period']}: hash mismatch or missing reference")
     if mismatches:
         raise BuildRefusedError("; ".join(mismatches))
     return {
-        "verified_months": [m["period"] for m in replayed["arm_b"]],
+        "verified_months": exp_list,
         "arm_b_sha256": {m["period"]: m["content_sha256"] for m in replayed["arm_b"]},
         "arm_c_sha256": {m["period"]: m["content_sha256"] for m in replayed["arm_c"]},
     }
@@ -173,10 +221,10 @@ def main() -> None:
         args.year,
         out_dir=args.out_dir.resolve(),
         stop_after_month=args.stop_after_month,
+        verify_against=None if args.verify_against is None else args.verify_against.resolve(),
     )
-    if args.verify_against is not None:
-        summary = verify_against_build_json(out, args.verify_against.resolve())
-        print(json.dumps(summary), flush=True)
+    if "parity" in out:
+        print(json.dumps(out["parity"]), flush=True)
     else:
         print(
             json.dumps(

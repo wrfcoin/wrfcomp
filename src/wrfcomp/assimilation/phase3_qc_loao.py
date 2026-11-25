@@ -68,12 +68,16 @@ def issue_times(year: int) -> np.ndarray:
 
 
 def load_static_sites(stations_csv: Path = STATIONS_CSV) -> StaticSites:
-    """Read static station ids, latitudes, longitudes, and elevations (no observations)."""
+    """Read static station ids, latitudes, longitudes, and elevations (registered schema, no obs)."""
     df = pd.read_csv(stations_csv, dtype={"station_id": str})
+    required = ("station_id", "lat", "lon", "elevation_m")
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"station table missing required columns: {missing}")
     return StaticSites(
         station_id=df["station_id"].to_numpy(dtype=str),
-        lat=df["latitude"].to_numpy(dtype=np.float64),
-        lon=df["longitude"].to_numpy(dtype=np.float64),
+        lat=df["lat"].to_numpy(dtype=np.float64),
+        lon=df["lon"].to_numpy(dtype=np.float64),
         height=df["elevation_m"].to_numpy(dtype=np.float64),
     )
 
