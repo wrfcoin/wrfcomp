@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -51,3 +53,38 @@ def test_extract_and_resume(monkeypatch, tmp_path, humidity):
     xr.testing.assert_identical(out, gefs.extract(stations, "2024-01-01", tmp_path, None))
     with pytest.raises(ValueError, match="sealed"):
         gefs.extract(stations, "2024-12-31", tmp_path, None)
+
+
+def test_points_missing_grib_extra_message(monkeypatch):
+    monkeypatch.setitem(sys.modules, "eccodes", None)
+    stations = xr.Dataset(
+        coords={
+            "station_id": ["00123456789"],
+            "longitude": ("station_id", [-104.0]),
+            "latitude": ("station_id", [40.0]),
+            "elevation_m": ("station_id", [1100.0]),
+        }
+    )
+    with pytest.raises(ImportError, match=r"grib"):
+        gefs.points(b"", stations)
+
+
+def test_points_decodes_grib_message():
+    ec = pytest.importorskip("eccodes", reason="requires the optional 'grib' extra (eccodes)")
+    grib = ec.codes_grib_new_from_samples("regular_ll_sfc_grib2")
+    try:
+        ni, nj = ec.codes_get(grib, "Ni"), ec.codes_get(grib, "Nj")
+        ec.codes_set_values(grib, np.full(ni * nj, 285.0, dtype=np.float64))
+        message = ec.codes_get_message(grib)
+    finally:
+        ec.codes_release(grib)
+
+    stations = xr.Dataset(
+        coords={
+            "station_id": ["00123456789"],
+            "longitude": ("station_id", [2.0]),
+            "latitude": ("station_id", [58.0]),
+            "elevation_m": ("station_id", [0.0]),
+        }
+    )
+    np.testing.assert_allclose(gefs.points(message, stations), [285.0])

@@ -9,7 +9,7 @@ All data lives outside the repository, in `$WRFCOMP_DATA_DIR` (default `~/wrfcom
 
 ```sh
 export WRFCOMP_DATA_DIR="${WRFCOMP_DATA_DIR:-$HOME/wrfcomp-data}"
-uv sync --extra dev
+uv sync --extra dev --extra grib  # --extra grib is required for step 2 (GEFS downloads)
 ```
 
 ## 1. What must be in the data directory
@@ -35,6 +35,7 @@ Other file names work too: pass `--train-truth` and `--truth` (and `--thresholds
 
 ## 2. GEFS cycles (the only step that uses the network)
 
+Requires the optional `grib` extra (`uv sync --extra grib`; on Windows, run this step under WSL2).
 For every init time to be scored, once (see `docs/BASELINES.md` for size and time):
 
 ```sh

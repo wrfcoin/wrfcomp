@@ -45,7 +45,19 @@ uv run ruff check
 uv run pytest
 ```
 
+To download and decode NOAA GEFS GRIB2 baselines (`wrfcomp.baselines.gefs`), install the optional `grib` extra:
+
+```bash
+uv sync --extra dev --extra grib
+```
+
 The `ai` extra (Earth2Studio, torch) needs an NVIDIA GPU and is not required for the harness or the tests.
+
+## Platforms
+
+- **Linux:** Full support for scoring, tests, and NOAA GEFS GRIB2 downloads (`uv sync --extra dev --extra grib`).
+- **macOS:** Full support for scoring and tests (`uv sync --extra dev`). The prebuilt `eccodeslib` wheels for the `grib` extra require **macOS 15 (Sequoia)** or newer (`macosx_15_0` on Apple Silicon and Intel); earlier macOS releases can still run scoring and tests without `--extra grib`.
+- **Windows:** Native Windows is supported for the scoring harness, tests, station QC, and shadow ledger (`uv sync --extra dev`, without `--extra grib`). Because `eccodeslib` does not publish native Windows wheels, use **WSL2** (Linux) for the NOAA GEFS GRIB2 download path.
 
 ## Harness lock
 

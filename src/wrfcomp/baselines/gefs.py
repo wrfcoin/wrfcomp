@@ -11,11 +11,22 @@ from time import sleep
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-import eccodes as ec
 import numpy as np
 import pandas as pd
 
 from .io import STATION, UNITS, layout
+
+
+def _require_eccodes():
+    try:
+        import eccodes as ec
+    except ImportError as exc:
+        raise ImportError(
+            "NOAA GEFS GRIB2 decoding requires the optional 'grib' extra "
+            "(eccodes and eccodeslib). Install it with `uv sync --extra grib` "
+            "or `pip install 'wrfcomp[grib]'`. On Windows, use WSL2 for NOAA GEFS downloads."
+        ) from exc
+    return ec
 
 LEADS = (3, 6, 12, 24, 48)
 FIELDS = {
@@ -99,6 +110,7 @@ def bilinear(grid, x, y):
 
 
 def points(data, stations):
+    ec = _require_eccodes()
     grib = ec.codes_new_from_message(data)
     try:
 

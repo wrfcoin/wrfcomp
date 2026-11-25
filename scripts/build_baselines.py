@@ -1,4 +1,8 @@
-"""Build one init in the configured external data directory."""
+"""Build one init in the configured external data directory.
+
+The `gefs` subcommand decodes NOAA GRIB2 files and requires the optional `grib` extra
+(`uv sync --extra grib`; on Windows, use WSL2).
+"""
 
 import argparse
 import os

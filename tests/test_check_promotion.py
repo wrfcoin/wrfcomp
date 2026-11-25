@@ -661,7 +661,8 @@ def test_runs_are_staged_privately_and_published_whole(
     assert [target.name for target, _, _ in seen] == list(tool.STAGED_NAMES.values())
     for target, mode, published in seen:
         assert target.parent.name.startswith(".promotion-run-") and target.parent.parent == out.resolve()
-        assert mode == 0o700  # private while the run is in progress
+        if os.name != "nt":
+            assert mode == 0o700  # private while the run is in progress
         assert published == [target.parent.name]  # nothing is published before the run is complete
     assert [p.name for p in out.iterdir()] == [first.directory.name]  # staging is gone, one result
 
@@ -681,6 +682,11 @@ def test_runs_are_staged_privately_and_published_whole(
     with pytest.raises(RuntimeError, match="evaluator crashed"):
         tool.evaluate(good, root / "data", PERIOD, out, root)
     assert [p.name for p in out.iterdir()] == [first.directory.name]
+    if os.name == "nt":
+        pytest.skip(
+            "atomic staging and publication verified; POSIX 0o700 staging-directory privacy "
+            "cannot be asserted on Windows because tempfile.mkdtemp ignores mode bits"
+        )
 
 
 def test_every_input_must_come_from_the_one_checked_tree(
@@ -720,7 +726,10 @@ def test_origin_and_lock_checks_look_at_the_given_root(base_world: dict, tmp_pat
 
 def test_evaluations_run_through_uv_locked_on_the_checked_tree(tmp_path: Path) -> None:
     command = tool._eval_command(ROOT, ["--help"])
-    assert Path(command[0]).name == "uv"
+    if os.name == "nt":
+        assert Path(command[0]).name.lower() == "uv.exe"
+    else:
+        assert Path(command[0]).name == "uv"
     script = str(ROOT / "scripts" / "check_promotion.py")
     assert command[1:] == [
         "run",
