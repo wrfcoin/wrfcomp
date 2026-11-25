@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-from .io import UNITS, boundaries, historical_layout, train_truth
+from .io import UNITS, calibration_cutoff, historical_layout, train_truth
 
 
 def calendar_day(times):
@@ -11,11 +11,18 @@ def calendar_day(times):
     return np.array([t.replace(year=2000).day_of_year for t in times])
 
 
-def forecast(truth, inits, leads, members=None):
-    """Use the narrowest eligible seasonal pool at each point."""
+def forecast(truth, inits, leads, members=None, train_end=None):
+    """Use the narrowest eligible seasonal pool at each point.
+
+    `train_end` fixes the calibration cutoff (see `io.calibration_cutoff`) and is recorded in the
+    output attributes. Without it the output is exactly what it was before the argument existed.
+    """
     out = historical_layout(truth, inits, leads, members, "climatology")
-    archive = train_truth(truth, out)
-    fill_missing_members(out, archive, min(boundaries()[0], out.init_time.values.min()))
+    cutoff = calibration_cutoff(out, train_end)
+    archive = train_truth(truth, out, train_end)
+    fill_missing_members(out, archive, cutoff)
+    if train_end is not None:
+        out.attrs["train_end_utc"] = str(cutoff)
     return out
 
 

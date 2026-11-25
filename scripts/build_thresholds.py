@@ -9,6 +9,11 @@ The input is refused, before any weather value is read, if any `valid_time` lies
 end in `configs/splits.yaml` (or is not a valid time at all). Cut the store to the train split first.
 A station with no observation in a calendar month gets a NaN threshold; the counts are printed.
 
+`--train-end <UTC time>` builds thresholds for a confirmation period that lies inside the train split:
+only truth at or before that time is used, and the file's `train_end_utc` attribute is that time. It
+must be earlier than the train split end; it can never move the cutoff later. The input is still
+refused if it has anything after the train split end.
+
 Exit codes: 0 written, 2 refused (bad or post-train input, existing output).
 """
 
@@ -20,6 +25,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from wrfcomp.harness.config import DEFAULT_CONFIG_PATH, HarnessConfig, load_config
@@ -65,10 +71,31 @@ def check_train_times(ds: xr.Dataset, what: str, train_end: np.datetime64) -> No
         )
 
 
-def build(train_paths: list[Path], cfg: HarnessConfig) -> xr.Dataset:
-    """Thresholds in the contract shape: dims (station_id, month), one variable per primary variable."""
+def parse_utc(text: str) -> np.datetime64:
+    """A UTC time from the command line, with or without a zone suffix, as timezone-naive ns."""
+    try:
+        stamp = pd.Timestamp(text)
+    except (ValueError, TypeError) as exc:
+        raise Refused(f"not a time: {text!r}") from exc
+    if stamp is pd.NaT:
+        raise Refused(f"not a time: {text!r}")
+    if stamp.tz is not None:
+        stamp = stamp.tz_convert("UTC").tz_localize(None)
+    return stamp.to_datetime64().astype("datetime64[ns]")
+
+
+def build(train_paths: list[Path], cfg: HarnessConfig, cutoff: np.datetime64 | None = None) -> xr.Dataset:
+    """Thresholds in the contract shape: dims (station_id, month), one variable per primary variable.
+
+    `cutoff` (earlier than the train split end) leaves out every truth time after it.
+    """
     variables = list(cfg.evaluation.variables.primary)
     train_end = cfg.splits.train.end
+    if cutoff is not None and not cutoff < train_end:
+        raise Refused(
+            f"--train-end {cutoff} is not earlier than the train split end ({train_end}); "
+            "it can only move the cutoff earlier"
+        )
     parts = []
     for path in train_paths:
         ds = open_store(path, "train truth")
@@ -88,6 +115,11 @@ def build(train_paths: list[Path], cfg: HarnessConfig) -> xr.Dataset:
         if not truth.indexes["valid_time"].is_unique:
             raise Refused("train truth: the stores overlap in valid_time")
         truth = truth.sortby("valid_time")
+    if cutoff is not None:
+        keep = truth["valid_time"].values <= cutoff  # coordinates only
+        if not keep.any():
+            raise Refused(f"train truth: no time at or before --train-end {cutoff}")
+        truth = truth.isel(valid_time=np.flatnonzero(keep))
     try:
         out = xr.Dataset(
             {
@@ -106,7 +138,7 @@ def build(train_paths: list[Path], cfg: HarnessConfig) -> xr.Dataset:
     )
     out.attrs = {
         "tail_quantile": float(cfg.gate.tail_quantile),
-        "train_end_utc": str(train_end),
+        "train_end_utc": str(train_end if cutoff is None else cutoff),
         "protocol_version": cfg.protocol_version,
     }
     validate_thresholds(out, variables=variables)
@@ -136,6 +168,12 @@ def main(argv: list[str] | None = None) -> int:
         "--config", type=Path, default=DEFAULT_CONFIG_PATH, help="splits.yaml (default: this checkout's)"
     )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output file")
+    parser.add_argument(
+        "--train-end",
+        metavar="UTC",
+        help="use truth at or before this time only (earlier than the train split end), "
+        "for a confirmation period",
+    )
     args = parser.parse_args(argv)
     try:
         if args.out.exists() and not args.overwrite:
@@ -145,13 +183,17 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, FileNotFoundError) as exc:
             raise Refused(f"config: {exc}") from exc
         variables = list(cfg.evaluation.variables.primary)
-        thresholds = build(list(args.train_truth), cfg)
+        cutoff = None if args.train_end is None else parse_utc(args.train_end)
+        thresholds = build(list(args.train_truth), cfg, cutoff)
         write(thresholds, args.out, variables)
     except (Refused, SchemaError) as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
     cells = thresholds.sizes["station_id"] * 12
-    print(f"wrote {args.out}: {thresholds.sizes['station_id']} stations, quantile {cfg.gate.tail_quantile}")
+    print(
+        f"wrote {args.out}: {thresholds.sizes['station_id']} stations, quantile {cfg.gate.tail_quantile}, "
+        f"truth up to {thresholds.attrs['train_end_utc']}"
+    )
     for name in variables:
         missing = int(np.isnan(thresholds[name].values).sum())
         print(f"  {name}: {missing} of {cells} station-months have no threshold (no training data)")
