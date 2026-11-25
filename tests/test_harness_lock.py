@@ -56,7 +56,8 @@ def test_manifest_records_tree_entries_version_scope_and_dependencies() -> None:
             for k in range(1, 13)
         ),
         *(
-            f"experiments/{m}_2024-Q{q}.json"
+            f"experiments/{m}_{year}-Q{q}.json"
+            for year in (2024, 2023)
             for m in ("climatology", "gefs", "persistence")
             for q in range(1, 5)
         ),
@@ -66,8 +67,9 @@ def test_manifest_records_tree_entries_version_scope_and_dependencies() -> None:
         assert entry["mode"] == "100644", path
         assert len(entry["blob"]) == 40 and int(entry["blob"], 16) >= 0, path
     pins = manifest["scoring_dependencies"]
-    # 36 monthly and 12 quarterly reference scorecards, and the inventory
-    assert sum(path.startswith("experiments/") for path in entries) == 49
+    # 36 monthly and 12 quarterly reference scorecards of 2024, the 12 quarterly ones of the 2023
+    # confirmation year, and the inventory
+    assert sum(path.startswith("experiments/") for path in entries) == 61
     assert set(pins) == {"scores", "numpy", "xarray", "scipy", "pandas"}
     assert all(isinstance(v, list) and v for v in pins.values())
     assert pins == tool.resolved_dependencies()

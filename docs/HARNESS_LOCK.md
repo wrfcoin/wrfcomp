@@ -21,7 +21,7 @@ from an easier test instead of a better forecast. Scores from different harness 
 | `configs/` (split boundaries, station list, gate thresholds) | yes | yes |
 | `src/wrfcomp/__init__.py` (the package initializer and its version) | yes | yes |
 | `docs/VERIFICATION_PROTOCOL.md`, `scripts/check_promotion.py` | yes | yes |
-| `experiments/REFERENCES.json`, the 36 monthly Gate 1 reference scorecards (climatology, GEFS, persistence; every month of 2024) and the 12 quarterly ones (the same three models, `2024-Q1` to `2024-Q4`) | yes | yes |
+| `experiments/REFERENCES.json`, the 36 monthly Gate 1 reference scorecards (climatology, GEFS, persistence; every month of 2024) and the 12 quarterly ones (the same three models, `2024-Q1` to `2024-Q4`), and the 12 quarterly reference scorecards of the 2023 confirmation year (`2023-Q1` to `2023-Q4`) | yes | yes |
 | Versions of `scores`, `numpy`, `xarray`, `scipy`, `pandas` in `uv.lock` | yes (as versions) | yes, through the manifest |
 | The lock itself: `HARNESS_LOCK.json`, `scripts/harness_lock.py`, `tests/test_harness_lock.py`, `tests/test_check_promotion.py`, `docs/HARNESS_LOCK.md`, everything under `.github/` | no | yes |
 
@@ -152,6 +152,15 @@ is ONE period: its reference forecasts are the monthly reference stores joined a
 reference scorecards are one evaluation over the whole quarter, not an average of months. Q4 ends with the init
 of 2024-12-17T12Z, as December does. The twelve months `2024-01` to `2024-12` stay pinned for diagnosis: **a
 monthly result is diagnostic only** and counts for nothing in a promotion.
+
+**The 2023 confirmation periods (owner ruling 2026-11-24).** `2023-Q1` to `2023-Q4` are pinned for the
+confirmation run, `promote --year 2023`, which the manager runs once for a candidate that was promoted on 2024.
+They lie inside the train split, so they have their own truth file (`truth/isd_conus_2023.nc`, a slice of the
+train truth) and their own thresholds (`thresholds/tail_p95_to_2022-12-17.nc`), and their climatology and
+persistence stores are built from truth at or before 2022-12-17T18Z only
+(`scripts/run_gate1.py --confirmation-train-end`, see `docs/CONFIRMATION_2023.md`). Q4 ends with the init of
+2023-12-15T12Z. Months of 2023 are not pinned, so they cannot be scored through this program. The check itself
+is unchanged: it prints `PROMOTED` for 2023, which is read as confirmed and is not a promotion.
 
 **A candidate given as several stores.** For a quarter, `--forecast` takes one store or several (for example
 the three monthly stores). Several stores must be one model id and version, with the same variables,

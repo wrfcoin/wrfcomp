@@ -67,6 +67,13 @@ LOCKED_FILES = (
         for quarter in range(1, 5)
         for model in ("climatology", "gefs", "persistence")
     ),
+    # the 2023 confirmation references (owner ruling 2026-11-24): three models, the four quarters of
+    # 2023, built from truth at or before 2022-12-17T18Z only
+    *(
+        f"experiments/{model}_2023-Q{quarter}.json"
+        for quarter in range(1, 5)
+        for model in ("climatology", "gefs", "persistence")
+    ),
 )
 # Packages whose versions decide the numbers in a scorecard.
 SCORING_DEPENDENCIES = ("numpy", "pandas", "scipy", "scores", "xarray")

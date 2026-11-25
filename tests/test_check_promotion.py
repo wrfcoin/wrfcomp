@@ -899,12 +899,16 @@ def test_scoring_packages_must_come_from_the_environment(monkeypatch: pytest.Mon
 
 MONTHS = [f"2024-{month:02d}" for month in range(1, 13)]
 QUARTERS = [f"2024-Q{quarter}" for quarter in range(1, 5)]
+# The 2023 confirmation year (owner ruling 2026-11-24): quarters only, with their own truth slice and
+# thresholds built from truth at or before 2022-12-17T18Z.
+CONFIRMATION = [f"2023-Q{quarter}" for quarter in range(1, 5)]
 
 
 def test_committed_inventory_pins_the_committed_reference_scorecards() -> None:
     inventory = tool.load_inventory(ROOT)
     # every month of the 2024 validation split (diagnostic) and its four quarters (promotion)
-    assert sorted(inventory["periods"]) == sorted(MONTHS + QUARTERS)
+    # and the four quarters of the 2023 confirmation year
+    assert sorted(inventory["periods"]) == sorted(MONTHS + QUARTERS + CONFIRMATION)
     assert inventory["harness_version"] == {"scores": "2.7.0", "wrfcomp": "0.1.0"}
     periods = {
         label: {
@@ -924,14 +928,60 @@ def test_committed_inventory_pins_the_committed_reference_scorecards() -> None:
         }
         for label in MONTHS + QUARTERS
     }
+    for label in CONFIRMATION:
+        periods[label] = {
+            "truth": "truth/isd_conus_2023.nc",
+            "thresholds": "thresholds/tail_p95_to_2022-12-17.nc",
+            "references": {
+                "climatology": {
+                    "scorecard": f"experiments/climatology_{label}.json",
+                    "store": f"gate1/{label}_h00-12/climatology.zarr",
+                },
+                "noaa-gefs": {
+                    "scorecard": f"experiments/gefs_{label}.json",
+                    "store": f"gate1/{label}_h00-12/gefs.zarr",
+                },
+            },
+            "others": [f"experiments/persistence_{label}.json"],
+        }
     assert tool.build_inventory(ROOT, periods) == json.loads((ROOT / tool.INVENTORY).read_text())
-    truth = {r["truth_sha256"] for e in inventory["periods"].values() for r in e["references"].values()}
-    thresholds = {
-        r["thresholds_sha256"] for e in inventory["periods"].values() for r in e["references"].values()
-    }
-    assert len(truth) == 1 and len(thresholds) == 1  # one truth file and one thresholds file for the year
+
+    def hashes(labels: list[str], key: str) -> set[str]:
+        return {r[key] for m in labels for r in inventory["periods"][m]["references"].values()}
+
+    # one truth file and one thresholds file for each year, and never the same file for both years:
+    # 2023 lies inside the train split, so the 2024 thresholds would contain the period they score
+    truth = hashes(MONTHS + QUARTERS, "truth_sha256")
+    thresholds = hashes(MONTHS + QUARTERS, "thresholds_sha256")
+    assert len(truth) == 1 and len(thresholds) == 1
+    truth_2023 = hashes(CONFIRMATION, "truth_sha256")
+    thresholds_2023 = hashes(CONFIRMATION, "thresholds_sha256")
+    assert len(truth_2023) == 1 and len(thresholds_2023) == 1
+    assert not truth & truth_2023 and not thresholds & thresholds_2023
+    # 00Z and 12Z of every day of 2023 up to 2023-12-15T12Z, the last init whose 48 h lead verifies
+    # inside the truth held (which ends with the train split, 2023-12-17T18Z)
+    for label, n_init, end in zip(
+        CONFIRMATION,
+        (180, 182, 184, 152),
+        ("2023-03-31T12:00:00", "2023-06-30T12:00:00", "2023-09-30T12:00:00", "2023-12-15T12:00:00"),
+        strict=True,
+    ):
+        entry = inventory["periods"][label]
+        assert len(entry["other_reference_forecasts"]) == 1, label
+        assert entry["references"]["climatology"]["leads_scored"] == [1, 3, 6, 12, 24, 48]
+        assert entry["references"]["noaa-gefs"]["leads_scored"] == [3, 6, 12, 24, 48]
+        for baseline, record in entry["references"].items():
+            assert (record["n_stations"], record["init_hours_scored"]) == (500, [0, 12])
+            assert (record["n_init_times"], record["period_end"]) == (n_init, end)
+            assert record["period_start"] == f"2023-{3 * int(label[-1]) - 2:02d}-01T00:00:00"
+            assert (
+                record["store"]
+                == f"gate1/{label}_h00-12/{'gefs' if baseline == 'noaa-gefs' else baseline}.zarr"
+            )
     init_times = {}
     for label, entry in inventory["periods"].items():
+        if label in CONFIRMATION:
+            continue
         references = entry["references"]
         assert references["climatology"]["leads_scored"] == [1, 3, 6, 12, 24, 48]  # all v1 leads
         assert references["noaa-gefs"]["leads_scored"] == [3, 6, 12, 24, 48]  # 3 h and longer
@@ -970,7 +1020,7 @@ def test_committed_inventory_pins_the_committed_reference_scorecards() -> None:
                     ]
                     assert entry["n_pairs"] == sum(c["metrics"][variable][lead]["n_pairs"] for c in monthly)
     assert inventory["periods"]["2024-Q4"]["references"]["noaa-gefs"]["period_end"] == "2024-12-17T12:00:00"
-    assert len(tool.reference_forecast_hashes(inventory)) == 48  # no forecast is shared between periods
+    assert len(tool.reference_forecast_hashes(inventory)) == 60  # no forecast is shared between periods
     # the inventory pins exactly the reference scorecards the manifest locks
     pinned = {r["scorecard"] for e in inventory["periods"].values() for r in e["references"].values()}
     pinned |= {
