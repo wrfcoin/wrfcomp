@@ -530,3 +530,27 @@ def test_a_timing_run_has_its_own_folder_and_merge_never_reads_it(tmp_path, monk
     with pytest.raises(script.IncompleteError, match="no manifest"):
         script.merge(tmp_path, 2024)
     assert not (tmp_path / "citizen" / "conus" / "issue_extract_2024.nc").exists()
+
+
+def test_tile_part_names_use_forward_slashes_on_every_system(tmp_path, monkeypatch):
+    """The manifest names a part ``<tile>/<month>.npz``; the check must build the same name on Windows."""
+    import json
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    win = PureWindowsPath(r"C:\data\citizen\conus\2024-tiles")
+    assert str((win / "+40_-100" / "2024-01.npz").relative_to(win)) == "+40_-100\\2024-01.npz"  # the bug
+    assert p3.part_name(win / "+40_-100" / "2024-01.npz", win) == "+40_-100/2024-01.npz"
+    posix = PurePosixPath("/data/citizen/conus/2024-tiles")
+    assert p3.part_name(posix / "+40_-100" / "2024-01.npz", posix) == "+40_-100/2024-01.npz"
+    # verify_tiles compares the manifest with these names, so a set of tiles written with "/" is
+    # accepted; names built the Windows way would all be refused as missing and unlisted.
+    tiles = tmp_path / "2024-tiles"
+    (tiles / "+40_-100").mkdir(parents=True)
+    (tiles / "+40_-100" / "2024-01.npz").write_bytes(b"part")
+    parts = {"+40_-100/2024-01.npz": p3.sha256_file(tiles / "+40_-100" / "2024-01.npz")}
+    (tiles / "manifest.json").write_text(json.dumps({"digest": "d", "parts": parts}))
+    assert p3.verify_tiles(tiles)["parts"] == parts
+    windows_style = lambda path, root: str(PureWindowsPath(path.relative_to(root)))  # noqa: E731
+    monkeypatch.setattr(p3, "part_name", windows_style)
+    with pytest.raises(p3.IncompleteError, match="1 tile-month files are missing and 1 are not"):
+        p3.verify_tiles(tiles)

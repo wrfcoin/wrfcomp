@@ -18,7 +18,7 @@ import importlib.util
 import json
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import numpy as np
 import pandas as pd
@@ -82,11 +82,16 @@ def read_manifest(path: Path, what: str) -> dict:
     return json.loads(Path(path).read_text())
 
 
+def part_name(path: PurePath, tiles_dir: PurePath) -> str:
+    """A tile-month file's name in the manifest: ``<tile>/<month>.npz``, with ``/`` on every system."""
+    return path.relative_to(tiles_dir).as_posix()
+
+
 def verify_tiles(tiles_dir: Path) -> dict:
     """The tile manifest, after checking that every tile-month file it lists is present and unchanged
     and that there is no file it does not list. A tile set with a missing or altered part is refused."""
     manifest = read_manifest(Path(tiles_dir) / "manifest.json", "tiles")
-    present = {str(p.relative_to(tiles_dir)) for p in Path(tiles_dir).glob("*/*.npz")}
+    present = {part_name(p, Path(tiles_dir)) for p in Path(tiles_dir).glob("*/*.npz")}
     listed = manifest["parts"]
     if present != set(listed):
         missing, extra = len(set(listed) - present), len(present - set(listed))
