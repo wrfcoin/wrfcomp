@@ -965,3 +965,105 @@ def test_slice_truth_copies_a_time_range_unchanged(
     assert slice_truth.main([*other, "--start", "2030-01-01", "--end", "2030-02-01"]) == 2  # nothing there
     assert slice_truth.main([*other, "--start", "2023-03-01", "--end", "2023-02-01"]) == 2
     assert not (tmp_path / "x.nc").exists()
+
+
+def _write_month_stores(root: Path, labels: list[str], model: str, cutoff, attr: str | None) -> list[Path]:
+    """Small finished month stores for `assemble_quarter`, with or without a `train_end_utc`."""
+    cfg = load_config()
+    stations = xr.Dataset(coords={"station_id": station_ids(N_STATIONS).astype(str), **_station_coords()})
+    stores = []
+    for label in labels:
+        month = run_gate1.parse_period(label, [0, 12], cfg, cutoff)
+        ds = run_gate1.baseline_io.layout(
+            stations, month.init_times, [3], GEFS_MEMBERS, run_gate1.MODEL_IDS[model]
+        )
+        for name in UNITS:
+            ds[name].values[:] = 280.0
+        if attr is not None:
+            ds.attrs["train_end_utc"] = attr
+        store = root / label / f"{model}.zarr"
+        run_gate1.baseline_io.write(ds, store)
+        stores.append(store)
+    return stores
+
+
+@pytest.mark.parametrize(
+    ("year", "confirmation", "model", "attr", "accepted"),
+    [
+        # confirmation run: climatology and persistence months must carry exactly this run's cutoff
+        (2023, True, "climatology", "2022-12-17T18:00:00.000000000", True),
+        (2023, True, "persistence", "2022-12-17T18:00:00.000000000", True),
+        (2023, True, "climatology", "2022-12-31T18:00:00.000000000", False),  # a later cutoff
+        (2023, True, "persistence", "2022-12-10T00:00:00.000000000", False),  # another cutoff
+        (2023, True, "climatology", None, False),  # built with the rolling default cutoff
+        (2023, True, "gefs", None, True),  # GEFS learns nothing: never a cutoff
+        (2023, True, "gefs", "2022-12-17T18:00:00.000000000", False),
+        # ordinary run: no month store may carry a cutoff
+        (2024, False, "climatology", None, True),
+        (2024, False, "climatology", "2022-12-17T18:00:00.000000000", False),
+        (2024, False, "gefs", "2022-12-17T18:00:00.000000000", False),
+    ],
+)
+def test_quarter_assembly_checks_the_training_cutoff_of_every_month_store(
+    tmp_path: Path, year: int, confirmation: bool, model: str, attr: str | None, accepted: bool
+) -> None:
+    """Review of #33: a quarter was joined from month stores built with another cutoff, or with none,
+    and scored in the same run. Only a later rerun noticed."""
+    cfg = load_config()
+    cutoff = np.datetime64("2022-12-17T18", "ns") if confirmation else None
+    labels = [f"{year}-01", f"{year}-02", f"{year}-03"]
+    period = run_gate1.parse_period(f"{year}-Q1", [0, 12], cfg, cutoff)
+    months = [run_gate1.parse_period(m, [0, 12], cfg, cutoff) for m in labels]
+    stores = _write_month_stores(tmp_path / "months", labels, model, cutoff, attr)
+    target = tmp_path / "quarter" / f"{model}.zarr"
+    args = (target, period, stores, months, model, cfg.splits.sealed_test.start, cutoff)
+    if accepted:
+        run_gate1.assemble_quarter(*args)
+        with xr.open_zarr(target) as joined:
+            assert joined.sizes["init_time"] == period.init_times.size
+            assert joined.attrs.get("train_end_utc") == attr
+    else:
+        with pytest.raises(run_gate1.ModelFailed, match="training cutoff"):
+            run_gate1.assemble_quarter(*args)
+        assert not target.exists()
+
+
+def test_quarter_assembly_refuses_one_month_with_another_cutoff(tmp_path: Path) -> None:
+    cfg = load_config()
+    cutoff = np.datetime64("2022-12-17T18", "ns")
+    labels = ["2023-01", "2023-02", "2023-03"]
+    period = run_gate1.parse_period("2023-Q1", [0, 12], cfg, cutoff)
+    months = [run_gate1.parse_period(m, [0, 12], cfg, cutoff) for m in labels]
+    good = _write_month_stores(tmp_path / "a", labels[:2], "climatology", cutoff, str(cutoff))
+    bad = _write_month_stores(tmp_path / "a", labels[2:], "climatology", cutoff, None)
+    target = tmp_path / "quarter.zarr"
+    with pytest.raises(run_gate1.ModelFailed, match="2023-03.*training cutoff"):
+        run_gate1.assemble_quarter(
+            target, period, good + bad, months, "climatology", cfg.splits.sealed_test.start, cutoff
+        )
+    assert not target.exists()
+
+
+def test_slice_truth_refuses_a_malformed_source_without_a_traceback(
+    confirmation_world: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    slice_truth = load_script("slice_truth")
+    config = ["--config", str(confirmation_world["config"])]
+    window = ["--start", "2023-02-01", "--end", "2023-02-02"]
+    # no valid_time at all (a thresholds file), and a valid_time that is not a time
+    no_time = confirmation_world["data"] / "thresholds" / "tail_p95.nc"
+    numbers = tmp_path / "numbers.nc"
+    xr.Dataset(
+        {"t2m": (("valid_time", "station_id"), np.zeros((3, 1), dtype="f4"))},
+        coords={"valid_time": np.arange(3), "station_id": ["00000000001"]},
+    ).to_netcdf(numbers, engine="h5netcdf")
+    for source, message in ((no_time, "no valid_time coordinate"), (numbers, "not a time coordinate")):
+        out = tmp_path / f"{source.stem}_out.nc"
+        assert slice_truth.main(["--source", str(source), "--out", str(out), *window, *config]) == 2
+        assert message in capsys.readouterr().err
+        assert not out.exists()
+    good = confirmation_world["data"] / "truth" / "isd_conus_train.nc"
+    out = tmp_path / "x.nc"
+    assert slice_truth.main(["--source", str(good), "--out", str(out), "--start", "soon", "--end", "x"]) == 2
+    assert slice_truth.main(["--source", str(tmp_path / "nope.nc"), "--out", str(out), *window]) == 2
+    assert not out.exists()

@@ -413,14 +413,20 @@ def assemble_quarter(
     months: list[Period],
     model: str,
     sealed_start: np.datetime64,
+    train_end: np.datetime64 | None = None,
 ) -> None:
     """A quarter's forecast store: the stores of its months joined along init_time, nothing else.
+
+    Every month store must have been built with this run's training cutoff, as `existing_store_ok`
+    requires of a finished store: `train_end_utc` is the confirmation cutoff on a climatology or
+    persistence store of a confirmation run, and absent otherwise (ordinary runs, and GEFS always).
 
     Every month store must already exist and hold exactly that month's scorable init times, so the
     quarter is made of the same forecasts as the monthly references. Init times end up in time order.
     A month store whose init or valid times reach `sealed_start` is refused from its coordinates,
     before any of its values is read.
     """
+    cutoff = None if train_end is None or model == "gefs" else str(train_end)
     parts = []
     for store, month in zip(month_stores, months, strict=True):
         if not store.is_dir():
@@ -438,6 +444,11 @@ def assemble_quarter(
                 raise ModelFailed(f"{store} does not hold exactly the init times of {month.label}")
             if ds.attrs.get("model_id") != MODEL_IDS[model]:
                 raise ModelFailed(f"{store} is not a {MODEL_IDS[model]} forecast")
+            if ds.attrs.get("train_end_utc") != cutoff:
+                raise ModelFailed(
+                    f"{store} was built with training cutoff {ds.attrs.get('train_end_utc')!r}, "
+                    f"this run needs {cutoff!r}. Delete it to rebuild."
+                )
             parts.append(ds.assign_coords(station_id=ds["station_id"].values.astype(str)).load())
     first = parts[0]
     for store, part in zip(month_stores, parts, strict=True):
@@ -613,7 +624,13 @@ def run(args: argparse.Namespace) -> int:
                         data_dir / "gate1" / f"{m}_h{hour_tag}" / f"{model}.zarr" for m in period.months
                     ]
                     assemble_quarter(
-                        stores[model], period, month_stores, months, model, cfg.splits.sealed_test.start
+                        stores[model],
+                        period,
+                        month_stores,
+                        months,
+                        model,
+                        cfg.splits.sealed_test.start,
+                        cutoff,
                     )
                     print(f"[{period.label}] {model}: joined the stores of {', '.join(period.months)}")
                 elif model == "gefs":

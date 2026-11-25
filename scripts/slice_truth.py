@@ -50,7 +50,11 @@ def main(argv: list[str] | None = None) -> int:
         if not start <= end:
             raise ValueError("--start is after --end")
         with xr.open_dataset(args.source) as source:
+            if "valid_time" not in source.coords or source["valid_time"].dims != ("valid_time",):
+                raise ValueError(f"{args.source.name}: no valid_time coordinate")
             times = source["valid_time"].values
+            if times.size == 0 or not np.issubdtype(times.dtype, np.datetime64):
+                raise ValueError(f"{args.source.name}: valid_time is empty or not a time coordinate")
             if np.isnat(times).any() or times.max() >= cfg.splits.sealed_test.start:
                 raise ValueError(f"{args.source.name}: invalid or sealed times")
             keep = np.flatnonzero((times >= start) & (times <= end))
