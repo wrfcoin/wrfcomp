@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from wrfcomp.bundle_references import MANIFEST_VERSION, periods_sha256, year_periods
 from wrfcomp.harness.align import check_forecast_not_sealed, check_not_sealed
 from wrfcomp.harness.config import HarnessConfig, load_config
 from wrfcomp.harness.hashing import content_sha256
@@ -69,7 +70,6 @@ DEFAULT_MAX_METADATA_BYTES = 1 * 1024**2
 DEFAULT_MAX_CHUNK_BYTES = 256 * 1024**2
 DEFAULT_MAX_DATASET_BYTES = 2 * 1024**3
 DEFAULT_MIN_FREE_BYTES = 256 * 1024**2
-MANIFEST_VERSION = 1
 REQUIRED_BASELINES = ("climatology", "noaa-gefs")
 FORBIDDEN_PATH_PARTS = frozenset(
     {
@@ -92,7 +92,6 @@ WINDOWS_RESERVED_NAMES = frozenset(
         *(f"lpt{i}" for i in range(1, 10)),
     }
 )
-PERIOD_RE = re.compile(r"^(?P<year>[0-9]{4})-(?:[0-9]{2}|Q[1-4])$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 CHUNK_INDEX_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 ZARR_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
@@ -969,21 +968,24 @@ def expected_pins(
     references_path: Path,
     year: int,
     cfg: HarnessConfig,
-) -> tuple[list[str], dict[str, tuple[str, str, str | None]]]:
-    """Return ``(periods, {relpath: (kind, expected_content_sha256, model_id)})`` from ``REFERENCES.json``."""
+    *,
+    manifest_version: int = MANIFEST_VERSION,
+) -> tuple[list[str], dict[str, tuple[str, str, str | None]], tuple[str, ...]]:
+    """Read the periods, dataset pins and accepted reference digests from one inventory snapshot."""
     sealed_dt = cfg.splits.sealed_test.start_utc
     if year >= sealed_dt.year:
         raise FetchError(
             f"Refusing year {year}: sealed split starts at {sealed_dt.replace(tzinfo=None).isoformat()}"
         )
     try:
-        inventory = json.loads(references_path.read_text(encoding="utf-8"))
+        raw = references_path.read_bytes()
+        inventory = json.loads(raw.decode("utf-8"))
     except (OSError, ValueError) as exc:
         raise FetchError(f"Cannot read references inventory: {exc}") from exc
     if not isinstance(inventory, dict) or not isinstance(inventory.get("periods"), dict):
         raise FetchError("Invalid REFERENCES.json structure")
 
-    periods: list[str] = []
+    selected = year_periods(inventory, year)
     pins: dict[str, tuple[str, str, str | None]] = {}
 
     def record(relpath: str, kind: str, digest: str, model_id: str | None = None) -> None:
@@ -994,12 +996,7 @@ def expected_pins(
         else:
             pins[relpath] = (kind, digest, model_id)
 
-    for period in sorted(inventory["periods"]):
-        m = PERIOD_RE.fullmatch(period)
-        if not m or int(m.group("year")) != year:
-            continue
-        periods.append(period)
-        entry = inventory["periods"][period]
+    for period, entry in selected.items():
         refs = entry.get("references")
         if not isinstance(refs, dict) or set(refs) != set(REQUIRED_BASELINES):
             raise FetchError(f"Period {period} must pin exactly {', '.join(REQUIRED_BASELINES)}")
@@ -1009,9 +1006,16 @@ def expected_pins(
             record(entry["thresholds"], "thresholds", rec["thresholds_sha256"])
             record(rec["store"], "reference_forecast", rec["forecast_sha256"], str(rec["model_id"]))
 
-    if not periods:
+    if not selected:
         raise FetchError(f"No periods pinned for year {year} in {references_path.name}")
-    return periods, pins
+    if manifest_version == 1:
+        # v1 hashed the inventory file. The release preceding the 2023 addition
+        # used the repo's pretty-printed JSON and contained only 2024 periods.
+        original = json.dumps({**inventory, "periods": selected}, sort_keys=True, indent=2) + "\n"
+        digests = (hashlib.sha256(raw).hexdigest(), hashlib.sha256(original.encode("utf-8")).hexdigest())
+    else:
+        digests = (periods_sha256(selected),)
+    return list(selected), pins, digests
 
 
 def _check_url_scheme(url: str) -> urllib.parse.ParseResult:
@@ -1274,19 +1278,19 @@ def verify_staged_bundle(
     except (UnicodeDecodeError, ValueError) as exc:
         raise FetchError(f"Cannot parse MANIFEST.json: {exc}") from exc
 
-    if manifest.get("manifest_version") != MANIFEST_VERSION:
+    version = manifest.get("manifest_version")
+    if type(version) is not int or version not in (1, MANIFEST_VERSION):
         raise FetchError(f"Unsupported manifest_version: {manifest.get('manifest_version')!r}")
     if manifest.get("year") != year:
         raise FetchError(f"Manifest year {manifest.get('year')!r} does not match requested year {year}")
 
-    actual_ref_sha = _sha256_file(references_path)
-    if manifest.get("references_sha256") != actual_ref_sha:
+    expected_periods, pins, digests = expected_pins(references_path, year, cfg, manifest_version=version)
+    if manifest.get("references_sha256") not in digests:
         raise FetchError(
             f"MANIFEST.json references_sha256 ({manifest.get('references_sha256')}) "
-            f"does not match {references_path.name} ({actual_ref_sha})"
+            f"does not match the {year} references in {references_path.name}"
         )
 
-    expected_periods, pins = expected_pins(references_path, year, cfg)
     if manifest.get("periods") != expected_periods:
         raise FetchError(
             f"Manifest periods {manifest.get('periods')!r} do not match REFERENCES.json {expected_periods!r}"

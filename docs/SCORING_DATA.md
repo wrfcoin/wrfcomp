@@ -47,7 +47,11 @@ directory and checks:
 
 1. **Physical archive pinning:** requires an independently trusted `--expected-sha256`,
    `--expected-sha256-file`, or `--expected-manifest` by default, and checks `MANIFEST.json`'s
-   `references_sha256` against the repository's `experiments/REFERENCES.json`.
+   `references_sha256` against the repository's `experiments/REFERENCES.json`. For manifest v2,
+   this is SHA-256 of the bundle year's full month and quarter entries, keyed by period name and
+   serialized as UTF-8 JSON with sorted keys and compact separators. Other years can be added
+   independently. The installer also recognizes v1's whole-file digest, including the original
+   single-year 2024 inventory in its repository serialization.
 2. **Bounded streaming download & extraction:** enforces download size, member count, per-member
    size, manifest size, total expanded bytes, staging free space, and decoded Zarr chunk/dataset
    size limits before hashing.
