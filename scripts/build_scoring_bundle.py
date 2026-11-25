@@ -39,6 +39,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from wrfcomp.bundle_references import MANIFEST_VERSION, periods_sha256, year_periods
 from wrfcomp.harness.align import check_forecast_not_sealed, check_not_sealed
 from wrfcomp.harness.config import HarnessConfig, load_config
 from wrfcomp.harness.hashing import content_sha256
@@ -61,7 +62,6 @@ DEFAULT_COMPRESS_LEVEL = 1
 DEFAULT_MAX_CHUNK_BYTES = 256 * 1024**2
 DEFAULT_MAX_DATASET_BYTES = 2 * 1024**3
 DEFAULT_MAX_METADATA_BYTES = 1 * 1024**2
-MANIFEST_VERSION = 1
 RECOMMENDED_LICENSE = "CC0-1.0"
 REQUIRED_BASELINES = ("climatology", "noaa-gefs")
 FORBIDDEN_PATH_PARTS = frozenset(
@@ -85,7 +85,6 @@ WINDOWS_RESERVED_NAMES = frozenset(
         *(f"lpt{i}" for i in range(1, 10)),
     }
 )
-PERIOD_RE = re.compile(r"^(?P<year>[0-9]{4})-(?:[0-9]{2}|Q[1-4])$")
 CHUNK_INDEX_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
 ZARR_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 NETCDF_MAGICS = (b"\x89HDF\r\n\x1a\n", b"CDF\x01", b"CDF\x02")
@@ -890,7 +889,7 @@ def collect_pinned_items(
     if not isinstance(inventory, dict) or not isinstance(inventory.get("periods"), dict):
         raise BundleError("Invalid REFERENCES.json structure")
 
-    periods: list[str] = []
+    selected = year_periods(inventory, year)
     seen: dict[str, tuple[str, str, list[dict[str, str]], str | None]] = {}
 
     def record(
@@ -911,12 +910,7 @@ def collect_pinned_items(
         else:
             seen[relpath] = (kind, digest, [citation], model_id)
 
-    for period in sorted(inventory["periods"]):
-        m = PERIOD_RE.fullmatch(period)
-        if not m or int(m.group("year")) != year:
-            continue
-        periods.append(period)
-        entry = inventory["periods"][period]
+    for period, entry in selected.items():
         refs = entry.get("references")
         if not isinstance(refs, dict) or set(refs) != set(REQUIRED_BASELINES):
             raise BundleError(f"Period {period} must pin exactly {', '.join(REQUIRED_BASELINES)}")
@@ -964,7 +958,7 @@ def collect_pinned_items(
                 model_id=str(rec["model_id"]),
             )
 
-    if not periods:
+    if not selected:
         raise BundleError(f"No periods pinned for year {year} in {references_path.name}")
 
     items = [
@@ -977,7 +971,7 @@ def collect_pinned_items(
         )
         for relpath, (kind, digest, citations, model_id) in sorted(seen.items())
     ]
-    return inventory, periods, items
+    return inventory, list(selected), items
 
 
 def _check_free_space(path: Path, min_free_gb: float, required_extra_bytes: int = 0) -> float:
@@ -1216,7 +1210,7 @@ def build_bundle(
         "manifest_version": MANIFEST_VERSION,
         "periods": periods,
         "protocol_version": inventory.get("protocol_version", ""),
-        "references_sha256": _sha256_file(references_path),
+        "references_sha256": periods_sha256(year_periods(inventory, year)),
         "total_size_bytes": total_input_bytes,
         "year": year,
     }

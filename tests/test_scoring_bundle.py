@@ -1360,3 +1360,56 @@ def test_existing_destination_physical_byte_hash_and_inventory_verified(syntheti
         overwrite=True,
     )
     assert not stray.exists()
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["year-scoped", "v1-single-year"])
+def test_install_after_inventory_gains_another_year(synthetic_env, tmp_path, monkeypatch, legacy):
+    path = synthetic_env["ref_path"]
+    original = path.read_bytes()
+    inventory = json.loads(original)
+    canonical = json.dumps(inventory["periods"], sort_keys=True, separators=(",", ":")).encode()
+    expected_digest = hashlib.sha256(original if legacy else canonical).hexdigest()
+    if legacy:
+        # Model the old producer's manifest fields; use the normal archive and install paths.
+        monkeypatch.setattr(builder, "MANIFEST_VERSION", 1)
+        monkeypatch.setattr(builder, "periods_sha256", lambda _: expected_digest)
+    bundle = builder.build_bundle(
+        year=2024,
+        data_dir=synthetic_env["data_dir"],
+        out_dir=synthetic_env["out_dir"],
+        references_path=path,
+        config_path=CONFIG_PATH,
+        min_free_gb=0,
+    )
+    manifest = json.loads(Path(bundle["manifest_sidecar"]).read_bytes())
+    assert manifest["references_sha256"] == expected_digest
+    assert manifest["manifest_version"] == (1 if legacy else 2)
+
+    for label, entry in list(inventory["periods"].items()):
+        inventory["periods"][label.replace("2024", "2023")] = json.loads(
+            json.dumps(entry).replace("2024", "2023")
+        )
+    path.write_text(json.dumps(inventory, indent=4), encoding="utf-8")
+    install_args = dict(
+        year=2024,
+        archive=Path(bundle["archive_path"]),
+        expected_sha256=bundle["archive_sha256"],
+        references_path=path,
+        config_path=CONFIG_PATH,
+    )
+    installed = fetcher.fetch_scoring_data(data_dir=tmp_path / "valid", **install_args)
+    assert installed["entries_verified"] == 6
+    assert len(installed["installed"]) == 6
+
+    # Change period metadata that does not alter any of the dataset pins. This
+    # must still invalidate the digest, for a monthly or a quarterly reference.
+    for label in manifest["periods"]:
+        entry = inventory["periods"][label]
+        entry["other_reference_forecasts"]["0" * 64] += ".changed"
+        path.write_text(json.dumps(inventory), encoding="utf-8")
+        with pytest.raises(fetcher.FetchError, match="references_sha256"):
+            fetcher.fetch_scoring_data(data_dir=tmp_path / label, **install_args)
+        assert not (tmp_path / label / "gate1").exists()
+        entry["other_reference_forecasts"]["0" * 64] = entry["other_reference_forecasts"][
+            "0" * 64
+        ].removesuffix(".changed")
