@@ -33,11 +33,14 @@ reference forecasts (raw NOAA GEFS plus every public promoted candidate; for the
 that is `gefs-station-corrected` v3), treating them as earlier entries in the clone check. Any
 relay matching a public reference (by digest or within the Wasserstein tolerance) is marked
 `public_clone`, excluded from the Meta-Ensemble and earns zero. A wallet that is a clone of a
-public reference in two or more consecutive epochs incurs a small nuisance slash (`public_clone_slash`,
-default 2% of stake, one-fifth of `max_slash_cap`)—high enough to make automated public-model spam
-strictly unprofitable while staying gentle against an accidental single-epoch collision; an honest
-epoch resets the streak. Among remaining eligible wallets, receipt time determines priority, with
-wallet ID breaking exact ties; subsequent miner-to-miner clones earn zero.
+public reference in two or more consecutive submitted epochs incurs a small nuisance slash
+(`public_clone_slash`, default 2% of stake, one-fifth of `max_slash_cap`)—high enough to make
+automated public-model spam strictly unprofitable while staying gentle against an accidental
+single-epoch collision. Skipping an epoch (no submission, or a non-admitted late, below-floor or
+faulty entry) preserves the wallet's streak rather than resetting it, so relaying every other epoch
+still triggers the nuisance slash; only a valid submitted non-clone forecast resets the streak.
+Among remaining eligible wallets, receipt time determines priority, with wallet ID breaking exact
+ties; subsequent miner-to-miner clones earn zero.
 
 For raw ensembles, each member in a row has mass 1/M. The ledger takes the exact 1-Wasserstein
 distance between the two empirical distributions at each observation, then averages over rows.
@@ -49,10 +52,18 @@ only; they contain no arrays for a distance test.
 
 Eligible representatives combine into the Meta-Ensemble with linear stake weights (proportional to
 `K_i`, matching `stake_exponent = 1.0`), so splitting one stake across multiple wallets never changes
-the ensemble mixture even if copies are perturbed just outside the clone tolerance. The excluded
-miner's own diagnostic downside may be computed by adding it to this fixed pool; its presence never
-changes an eligible miner's marginal score. The scorecard approximation uses the stake-weighted mean
-of normalized losses across eligible models; it cannot measure physical ensemble diversity.
+the ensemble mixture even if copies are perturbed just outside the clone tolerance. To prevent a
+negative-`Delta` miner from splitting stake into many minimum-stake wallets to shrink its leave-one-out
+penalty and dodge slashing, each eligible miner's marginal contribution is normalized by its
+stake-share odds when other eligible winners exist:
+`Delta_CRPS_i = ((1 - p_i) / p_i) * (L(M_{-i}) - L(M_all)) / L_base`, where `p_i = K_i / sum_j K_j`
+(reducing exactly to `(L(M_all) - L_i) / L_base` in linear scorecard mode and remaining strictly
+split-resistant for both positive and negative `Delta` in quadratic CRPS array mode; a lone winner
+falls back to `(L_base - L(M_all)) / L_base`). An excluded `gefs_gate` miner's own diagnostic
+downside is evaluated at a fixed 50/50 reference weight against the fixed eligible pool so splitting
+stake cannot dilute its negative-skill slash either, and its presence never changes an eligible
+miner's marginal score. The scorecard approximation uses the stake-weighted mean of normalized losses
+across eligible models; it cannot measure physical ensemble diversity.
 
 Eligible wallets with positive composite score share the compute pool in proportion to stake times
 score at the default exponent. For a fixed forecast and total stake K, at most one of m copies can earn.
@@ -72,11 +83,14 @@ separately from emissions. The station and validator pool rules are unchanged.
 ### Residual risks
 
 A distance cutoff can accept an independent but similar forecast as a clone and can miss a copy just
-above the cutoff. Linear stake weighting limits a Sybil flood of minimum-stake perturbed copies to
-their combined stake share, but scorecard-only settlement cannot distinguish near-copies with
-different hashes: a one-bit numerical change changes the digest. Keeping forecasts confidential
-until init time through pre-init timelock encryption is the intended defense against live copying;
-the paper recorder does not implement encryption.
+above the cutoff. **Known limit for public-reference relays:** submitting a subset of a public
+reference's ensemble members (for example, 20 of 31 members) or shifting a public reference just past
+`clone_relative_tolerance` avoids the Wasserstein clone check—and scorecard-only settlement checks
+digests only, so any re-hashed modification avoids it—the same tolerance limit that applies to
+miner-to-miner clones. Linear stake weighting and odds-normalized `Delta_CRPS` prevent a Sybil flood
+of minimum-stake perturbed copies from diluting honest miners or dodging negative-`Delta` slashes.
+Keeping forecasts confidential until init time through pre-init timelock encryption is the intended
+defense against live copying; the paper recorder does not implement encryption.
 
 The locked spread-skill gate pools squared errors and ensemble variances across observations for
 each variable. A forecast can meet the global band while remaining overconfident during extreme events
@@ -93,7 +107,7 @@ The owner may change these research defaults. Ledger settings are centralized in
 | Minimum wallet stake | 10 paper units | One tenth of the illustrative 100-unit stake; dust wallets cannot participate. |
 | Stake exponent & Meta-Ensemble weight | 1 (linear in `K_i`) | Linear stake weight in both `M_all` and payout gives each unit equal leverage and makes splitting one stake across wallets mixture-invariant. Exponents below 1 are rejected. |
 | Raw clone distance tolerance | 0.05 times field scale | A single member carries about 3% of a 31-member empirical distribution. A 5% allowance covers small distribution changes from a missing member or numerical jitter. This is a shadow policy choice, not a universal similarity threshold. |
-| Public-reference repeat nuisance slash | 2% of stake after 2+ consecutive epochs | At most half of `max_slash_cap` (default 2% = 1/5 of 10%). Makes automated relaying of raw GEFS or public promoted candidates strictly unprofitable on repeat epochs without punishing a single-epoch coincidence; resets on any non-clone epoch. |
+| Public-reference repeat nuisance slash | 2% of stake after 2+ consecutive submitted epochs | At most half of `max_slash_cap` (default 2% = 1/5 of 10%). Makes automated relaying of raw GEFS or public promoted candidates strictly unprofitable on repeat epochs without punishing a single-epoch coincidence; skipped epochs preserve the streak, and only a valid non-clone submission resets it. |
 | Maximum slash | 10% | Same ceiling for the worst honest loss and a failed reveal. |
 | Negative-score multiplier | Caller-supplied | The replay uses 0.50; this rate has no owner-set default. |
 | Compute/data/validator shares | 55% / 35% / 10% | Existing shadow emission split. |

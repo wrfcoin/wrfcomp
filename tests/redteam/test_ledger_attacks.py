@@ -776,3 +776,207 @@ def test_consecutive_public_reference_relays_incur_nuisance_slash_and_reset_on_h
     assert _by_id(gefs_ep2)["gefs_spam"].reward == 0.0
     assert _by_id(gefs_ep2)["gefs_spam"].slash == pytest.approx(expected_nuisance)
     assert gefs_ep2.public_clone_streaks == {"gefs_spam": 2}
+
+
+def test_negative_delta_splitter_cannot_dodge_slash_or_gain_reward_array_mode() -> None:
+    """Array mode: splitting a negative-Delta miner into 10 or 50 wallets cannot raise pay or cut slash."""
+    n_obs = 256
+    fx = _make_synoptic_fixture(n_obs=n_obs, n_members=31)
+    gefs, obs, thr = fx["gefs_fc"], fx["obs"], fx["tail_thr"]
+
+    field_scale = max(float(np.sqrt(gefs.var(axis=1).mean())), float(np.std(obs)))
+    clone_tol = DEFAULT_PARAMS.clone_relative_tolerance * field_scale
+    hadamard = _walsh_hadamard(n_obs)
+
+    # Shifted forecast: beats GEFS (passes gates) but is worse than the honest Meta-Ensemble (Delta < 0).
+    att_fc = fx["innov1_fc"] + 0.7
+    honest_1 = MinerEntry("honest_1", stake=2500.0, forecast=fx["innov1_fc"])
+    honest_2 = MinerEntry("honest_2", stake=2500.0, forecast=fx["innov2_fc"])
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=gefs,
+        obs=obs,
+        tail_threshold=thr,
+    )
+
+    total_stake = 500.0
+    unsplit = recorded_epoch(
+        [honest_1, honest_2, MinerEntry("attacker", stake=total_stake, forecast=att_fc)],
+        **kwargs,
+    )
+    by_unsplit = _by_id(unsplit)
+    assert by_unsplit["attacker"].status == "eligible"
+    assert by_unsplit["attacker"].delta_crps is not None and by_unsplit["attacker"].delta_crps < 0.0
+    unsplit_honest_total = by_unsplit["honest_1"].reward + by_unsplit["honest_2"].reward
+
+    for n_wallets in (10, 50):
+        copies = [att_fc + (1.05 * clone_tol) * hadamard[i + 1, :, None] for i in range(n_wallets)]
+        sybils = [
+            MinerEntry(f"sybil_{i:02d}", stake=total_stake / n_wallets, forecast=copies[i])
+            for i in range(n_wallets)
+        ]
+        split = recorded_epoch([honest_1, honest_2, *sybils], **kwargs)
+        by_split = _by_id(split)
+        admitted = [p for p in split.payouts if p.miner_id.startswith("sybil_") and p.status == "eligible"]
+        assert len(admitted) == n_wallets
+        split_reward = sum(p.reward for p in admitted)
+        split_slash = sum(p.slash for p in admitted)
+        split_honest_total = by_split["honest_1"].reward + by_split["honest_2"].reward
+        assert split_reward <= by_unsplit["attacker"].reward + 1e-12
+        assert split_slash >= by_unsplit["attacker"].slash - 1e-12
+        assert split_honest_total >= unsplit_honest_total - 1e-12
+
+
+def test_negative_delta_splitter_cannot_dodge_slash_or_gain_reward_scorecard_mode() -> None:
+    """Scorecard mode: splitting a negative-Delta whale into 10 or 50 wallets gives identical pay & slash."""
+    from pathlib import Path
+
+    from wrfcomp.pofs_shadow import Commitment, EpochEvidence, load_scorecard, settle_from_scorecards
+
+    ref = load_scorecard(Path(__file__).resolve().parents[2] / "experiments" / "gefs_2024-Q1.json")
+
+    def _make_card(model_id: str, digest: str, loss_scale: float):
+        d = ref.model_dump()
+        d["model_id"] = model_id
+        d["forecast_sha256"] = digest
+        d["baseline_id"] = "noaa-gefs"
+        d["baseline_sha256"] = ref.forecast_sha256
+        d["passed_gate"] = True
+        for var, leads in d["metrics"].items():
+            d["gates"][var] = dict.fromkeys(d["gates"][var], True)
+            row = leads["all"]
+            row["crpss_vs_baseline"] = 1.0 - loss_scale
+            row["crpss_vs_baseline_ecdf"] = 1.0 - loss_scale
+            row["spread_skill_ratio"] = 1.0
+            row["dm_pvalue"] = 0.001
+            row["twcrps_p95"] = 0.1
+            row["baseline_twcrps_p95"] = 0.2
+            for h in d["leads_scored"]:
+                leads[str(h)]["loss"] *= loss_scale
+        return type(ref).model_validate(d)
+
+    t = np.datetime64(ref.period_start)
+    honest = _make_card("honest", "a" * 64, 0.50)
+
+    for whale_loss, whale_stake, n_wallets in ((0.80, 100.0, 10), (0.60, 100.0, 10), (0.95, 500.0, 50)):
+        whale = _make_card("whale", "b" * 64, whale_loss)
+        ev_single = EpochEvidence(
+            t,
+            ref.forecast_sha256,
+            {
+                "honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s")),
+                "whale": Commitment(whale.forecast_sha256, t - np.timedelta64(9, "s")),
+            },
+        )
+        res_single = settle_from_scorecards(
+            {"gefs": ref, "honest": honest, "whale": whale},
+            baseline_key="gefs",
+            pool_amount=POOL_AMOUNT,
+            params=DEFAULT_PARAMS,
+            stakes={"gefs": 100.0, "honest": 500.0, "whale": whale_stake},
+            evidence=ev_single,
+        )
+
+        split_cards = {"gefs": ref, "honest": honest}
+        split_stakes = {"gefs": 100.0, "honest": 500.0}
+        split_receipts = {"honest": Commitment(honest.forecast_sha256, t - np.timedelta64(10, "s"))}
+        for idx in range(n_wallets):
+            key = f"sybil_{idx:02d}"
+            card = _make_card(key, f"{idx + 100:064x}", whale_loss)
+            split_cards[key] = card
+            split_stakes[key] = whale_stake / n_wallets
+            split_receipts[key] = Commitment(card.forecast_sha256, t - np.timedelta64(8, "s"))
+
+        res_split = settle_from_scorecards(
+            split_cards,
+            baseline_key="gefs",
+            pool_amount=POOL_AMOUNT,
+            params=DEFAULT_PARAMS,
+            stakes=split_stakes,
+            evidence=EpochEvidence(t, ref.forecast_sha256, split_receipts),
+        )
+        by_single, by_split = _by_id(res_single), _by_id(res_split)
+        assert by_single["whale"].status == "eligible"
+        assert by_single["whale"].delta_crps is not None and by_single["whale"].delta_crps < 0.0
+        sybil_payouts = [p for p in res_split.payouts if p.miner_id.startswith("sybil_")]
+        assert len(sybil_payouts) == n_wallets and all(p.status == "eligible" for p in sybil_payouts)
+        assert sum(p.reward for p in sybil_payouts) == pytest.approx(
+            by_single["whale"].reward, rel=1e-11, abs=1e-11
+        )
+        assert sum(p.slash for p in sybil_payouts) == pytest.approx(
+            by_single["whale"].slash, rel=1e-11, abs=1e-11
+        )
+        assert by_split["honest"].reward == pytest.approx(by_single["honest"].reward, rel=1e-11, abs=1e-11)
+
+
+def test_skipping_epochs_does_not_reset_public_clone_streak() -> None:
+    """Relaying a public reference every other epoch (skipping in between) still triggers nuisance slash."""
+    fx = _make_synoptic_fixture()
+    v3_public_fc = fx["innov2_fc"]
+    honest_fc = fx["innov1_fc"]
+    kwargs = dict(
+        pool_amount=POOL_AMOUNT,
+        params=DEFAULT_PARAMS,
+        baseline_forecast=fx["gefs_fc"],
+        obs=fx["obs"],
+        tail_threshold=fx["tail_thr"],
+        public_references=[v3_public_fc],
+    )
+    expected_nuisance = 100.0 * DEFAULT_PARAMS.public_clone_slash
+
+    # Epoch 1: relayer submits v3 -> streak 1, no slash yet.
+    ep1 = recorded_epoch(
+        [
+            MinerEntry("honest", stake=100.0, forecast=honest_fc),
+            MinerEntry("relayer", stake=100.0, forecast=v3_public_fc),
+        ],
+        **kwargs,
+    )
+    assert _by_id(ep1)["relayer"].status == "public_clone"
+    assert _by_id(ep1)["relayer"].slash == 0.0
+    assert ep1.public_clone_streaks == {"relayer": 1}
+
+    # Epoch 2: relayer skips the epoch entirely -> streak MUST NOT reset.
+    ep2 = recorded_epoch(
+        [MinerEntry("honest", stake=100.0, forecast=honest_fc)],
+        prior_public_clone_streaks=ep1.public_clone_streaks,
+        **kwargs,
+    )
+    assert ep2.public_clone_streaks == {"relayer": 1}
+
+    # Epoch 3: relayer submits v3 again (every-other-epoch pattern) -> streak 2, nuisance slash fires!
+    ep3 = recorded_epoch(
+        [
+            MinerEntry("honest", stake=100.0, forecast=honest_fc),
+            MinerEntry("relayer", stake=100.0, forecast=v3_public_fc),
+        ],
+        prior_public_clone_streaks=ep2.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(ep3)["relayer"].status == "public_clone"
+    assert _by_id(ep3)["relayer"].reward == 0.0
+    assert _by_id(ep3)["relayer"].slash == pytest.approx(expected_nuisance)
+    assert ep3.public_clone_streaks == {"relayer": 2}
+
+    # Epoch 4: attempting a below-minimum dust submission does NOT reset the streak either.
+    ep4 = recorded_epoch(
+        [
+            MinerEntry("honest", stake=100.0, forecast=honest_fc),
+            MinerEntry("relayer", stake=1.0, forecast=honest_fc),
+        ],
+        prior_public_clone_streaks=ep3.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(ep4)["relayer"].status == "below_minimum"
+    assert ep4.public_clone_streaks == {"relayer": 2}
+
+    # Epoch 5: submitting an actual valid non-clone forecast resets the streak.
+    ep5 = recorded_epoch(
+        [MinerEntry("relayer", stake=100.0, forecast=honest_fc)],
+        prior_public_clone_streaks=ep4.public_clone_streaks,
+        **kwargs,
+    )
+    assert _by_id(ep5)["relayer"].status == "eligible"
+    assert _by_id(ep5)["relayer"].slash == 0.0
+    assert ep5.public_clone_streaks == {}

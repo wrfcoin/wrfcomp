@@ -591,9 +591,13 @@ def settle_compute_pool(
 
     stakes_by_id = {m.miner_id: float(m.stake) for m in miners}
 
-    def mixture(ids):
-        weights = np.array([stakes_by_id[k] for k in ids], dtype=np.float64)
-        return meta_ensemble_loss([arrays[k] for k in ids], weights, y, params, tail_threshold)
+    def mixture(ids, weights=None):
+        w = (
+            np.array([stakes_by_id[k] for k in ids], dtype=np.float64)
+            if weights is None
+            else np.asarray(weights, dtype=np.float64)
+        )
+        return meta_ensemble_loss([arrays[k] for k in ids], w, y, params, tail_threshold)
 
     clone_distance = 0.0
     if gefs is not None:
@@ -722,8 +726,10 @@ def _settle(
             status[k] = "eligible"
             winners.append(k)
     winners.sort()
+    stakes_by_id = {m.miner_id: float(m.stake) for m in ordered}
+    total_winner_stake = math.fsum(stakes_by_id[j] for j in winners)
     meta = mixture(winners) if winners else None
-    next_streaks: dict[str, int] = {}
+    next_streaks: dict[str, int] = dict(prior_streaks)
     payouts = []
     weights = []
     for m in ordered:
@@ -736,13 +742,23 @@ def _settle(
             slash = m.stake * params.max_slash_cap
         elif status[k] == "eligible":
             others = [j for j in winners if j != k]
-            delta = ((mixture(others) if others else baseline) - meta) / baseline
+            if others:
+                share = stakes_by_id[k] / total_winner_stake
+                delta = ((1.0 - share) / share) * (mixture(others) - meta) / baseline
+            else:
+                delta = (baseline - meta) / baseline
             score = (1 - params.w_delta) * crpss + params.w_delta * delta
             weight = m.stake**params.stake_exponent * max(0.0, score)
         elif status[k] == "gefs_gate" and loss is not None:
-            # Measure harm against the already-fixed eligible pool only for the
-            # excluded miner's own downside. It never affects a winner's Delta.
-            delta = min(0.0, (meta - mixture(sorted([*winners, k]))) / baseline) if winners else 0.0
+            # Measure harm against the already-fixed eligible pool at a fixed 50/50
+            # reference weight (independent of k's stake) so splitting stake cannot
+            # dilute the excluded miner's downside; it never affects a winner's Delta.
+            if winners:
+                diag_ids = sorted([*winners, k])
+                diag_weights = [total_winner_stake if j == k else stakes_by_id[j] for j in diag_ids]
+                delta = min(0.0, (meta - mixture(diag_ids, diag_weights)) / baseline)
+            else:
+                delta = 0.0
             score = min(0.0, (1 - params.w_delta) * crpss + params.w_delta * delta)
         if score is not None and score < 0:
             slash = m.stake * min(params.max_slash_cap, params.alpha_slash * abs(score))
@@ -751,6 +767,8 @@ def _settle(
             next_streaks[k] = streak
             if streak >= params.public_clone_consecutive_epochs:
                 slash = max(slash, m.stake * params.public_clone_slash)
+        elif status[k] in ("eligible", "clone", "gefs_gate"):
+            next_streaks.pop(k, None)
         weights.append(weight)
         payouts.append(
             MinerPayout(
@@ -1211,8 +1229,12 @@ def settle_from_scorecards(
 
     stakes_by_id = {m.miner_id: float(m.stake) for m in miners}
 
-    def mixture(ids):
-        w = np.array([stakes_by_id[k] for k in ids], dtype=np.float64)
+    def mixture(ids, weights=None):
+        w = (
+            np.array([stakes_by_id[k] for k in ids], dtype=np.float64)
+            if weights is None
+            else np.asarray(weights, dtype=np.float64)
+        )
         vals = np.array([losses[k] for k in ids], dtype=np.float64)
         return float(np.average(vals, weights=w))
 
