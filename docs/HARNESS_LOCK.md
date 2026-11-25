@@ -21,7 +21,7 @@ from an easier test instead of a better forecast. Scores from different harness 
 | `configs/` (split boundaries, station list, gate thresholds) | yes | yes |
 | `src/wrfcomp/__init__.py` (the package initializer and its version) | yes | yes |
 | `docs/VERIFICATION_PROTOCOL.md`, `scripts/check_promotion.py` | yes | yes |
-| `experiments/REFERENCES.json`, the 36 monthly Gate 1 reference scorecards (climatology, GEFS, persistence; every month of 2024) and the 12 quarterly ones (the same three models, `2024-Q1` to `2024-Q4`) | yes | yes |
+| `experiments/REFERENCES.json`, the 36 monthly Gate 1 reference scorecards (climatology, GEFS, persistence; every month of 2024) and the 12 quarterly ones (the same three models, `2024-Q1` to `2024-Q4`), and the 12 quarterly reference scorecards of the 2023 confirmation year (`2023-Q1` to `2023-Q4`) | yes | yes |
 | Versions of `scores`, `numpy`, `xarray`, `scipy`, `pandas` in `uv.lock` | yes (as versions) | yes, through the manifest |
 | The lock itself: `HARNESS_LOCK.json`, `scripts/harness_lock.py`, `tests/test_harness_lock.py`, `tests/test_check_promotion.py`, `docs/HARNESS_LOCK.md`, everything under `.github/` | no | yes |
 
@@ -153,6 +153,15 @@ reference scorecards are one evaluation over the whole quarter, not an average o
 of 2024-12-17T12Z, as December does. The twelve months `2024-01` to `2024-12` stay pinned for diagnosis: **a
 monthly result is diagnostic only** and counts for nothing in a promotion.
 
+**The 2023 confirmation periods (owner ruling 2026-11-24).** `2023-Q1` to `2023-Q4` are pinned for the
+confirmation run, `promote --year 2023`, which the manager runs once for a candidate that was promoted on 2024.
+They lie inside the train split, so they have their own truth file (`truth/isd_conus_2023.nc`, a slice of the
+train truth) and their own thresholds (`thresholds/tail_p95_to_2022-12-17.nc`), and their climatology and
+persistence stores are built from truth at or before 2022-12-17T18Z only
+(`scripts/run_gate1.py --confirmation-train-end`, see `docs/CONFIRMATION_2023.md`). Q4 ends with the init of
+2023-12-15T12Z. Months of 2023 are not pinned, so they cannot be scored through this program. The check itself
+is unchanged: it prints `PROMOTED` for 2023, which is read as confirmed and is not a promotion.
+
 **A candidate given as several stores.** For a quarter, `--forecast` takes one store or several (for example
 the three monthly stores). Several stores must be one model id and version, with the same variables,
 coordinates, variable attributes (units), leads, stations and members, and their init times must not overlap
@@ -231,11 +240,11 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
   the owner writes an `APPROVE-HARNESS-CHANGE` comment; agents never write one, never ask a tool to write
   one, not even as a test, and never merge a pull request that has one without the owner's explicit yes.**
   Separate accounts for agents would turn this rule into a control.
-- **Nothing is enforced until the repository rules exist.** As of this change, `main` is not protected.
-  Both `harness-lock` and `test` must be **required status checks** on `main`, with pull requests required,
-  no direct pushes and no bypass. The manager sets that rule after this change merges and verifies it through
-  the API. Until then the checks report but do not block. A pull request must also be up to date with `main`
-  before merging for the `test` result to describe what lands.
+- **The repository rule on `main`.** Since 2026-11-24 a GitHub ruleset requires pull requests, makes
+  `harness-lock` and `test` **required status checks**, requires the branch to be up to date with `main`,
+  blocks force-pushes and deletion, and has no bypass list. It was verified with a test pull request that
+  changed a locked file without approval and was refused. The rule is a repository setting, not code in
+  this repository, so it is only as durable as the organisation's admin settings.
 - **The pull request that introduces or changes the gate is not judged by the new gate.** `harness-lock` runs
   the base branch's version. The first installation, and any later change to the gate, is reviewed by people.
 - **A comment does not re-run the check, and neither does editing or deleting one.** Until someone re-runs
@@ -277,7 +286,8 @@ exist. It prints `CONSISTENT` or `INCONSISTENT`, never `PROMOTED`.
   deterministic, so the bytes must match.
 - **The truth and thresholds files are pinned by content hash only through the scorecards.** A wrong file is
   caught after scoring, not before.
-- **The git tag `harness-v0.1.0` does not exist yet.** The owner or manager creates it on the merge commit.
+- **Tags.** `harness-v0.1.0` marks the merge that locked the harness; `promotion-rule-v2` marks the merge that
+  added the three-of-four-quarters rule (harness still 0.1.0). Tags can be moved by a repository admin.
 - **A scorecard value exactly on a gate boundary** can be judged differently after rounding to 10 significant
   digits; the promotion check then refuses, it never promotes.
 

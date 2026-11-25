@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -135,7 +136,8 @@ def test_station_tokens_depend_on_the_secret_key(tmp_path: Path) -> None:
     key = load_or_create_station_key(tmp_path / "citizen")
     path = tmp_path / "citizen" / STATION_KEY_FILENAME
     assert len(key) == 32 and path.read_bytes() == key
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert load_or_create_station_key(tmp_path / "citizen") == key  # stable on this machine
     assert load_or_create_station_key(tmp_path / "elsewhere") != key  # and different anywhere else
     path.write_bytes(b"too short")

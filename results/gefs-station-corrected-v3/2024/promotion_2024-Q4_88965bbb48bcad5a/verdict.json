@@ -1,0 +1,47 @@
+{
+  "baselines": [
+    "climatology",
+    "noaa-gefs"
+  ],
+  "candidate": {
+    "forecast_sha256": "d9ded5704f146372158d4c6fb7149a77497aed400413e740d30002269dc85746",
+    "model_id": "gefs-station-corrected",
+    "model_version": "3"
+  },
+  "forecast_inputs": [
+    {
+      "content_sha256": "4a3736f7441a58acfdf5e79c53d15c1ccf7cc7454bbf39c5694e6c7a8233975e",
+      "init_first": "2024-10-01T00:00:00",
+      "init_last": "2024-10-31T12:00:00",
+      "n_init_times": 62
+    },
+    {
+      "content_sha256": "e7c933ea78231a8909fb5d7ecc0d35ebf2ff6dba96036d72c3d3bc990602f891",
+      "init_first": "2024-11-01T00:00:00",
+      "init_last": "2024-11-30T12:00:00",
+      "n_init_times": 60
+    },
+    {
+      "content_sha256": "2c0bbd3ac0c709dc7cc52501fdf84d0cd6ad5cc8cdf472a848dce76ac5029ddb",
+      "init_first": "2024-12-01T00:00:00",
+      "init_last": "2024-12-17T12:00:00",
+      "n_init_times": 34
+    }
+  ],
+  "harness_version": {
+    "scores": "2.7.0",
+    "wrfcomp": "0.1.0"
+  },
+  "period": "2024-Q4",
+  "promotion_rule_version": 2,
+  "protocol_version": "0.1.0",
+  "reasons": [
+    "gate not passed against noaa-gefs"
+  ],
+  "references_sha256": "e47dea56f70717a01ac45b714fd836f54980953a846ab631e19415d6af38dbf6",
+  "scorecards": {
+    "candidate_vs_climatology.json": "e369d6e68f0a1fc1a4ea4271fa241b1bd78273b8aa497d7ce3ca9ce6515c07cb",
+    "candidate_vs_noaa-gefs.json": "5a4f2b304bdfa1538e7047bb979d53badf8a538fe0e77a4f7d3f6f443413c463"
+  },
+  "verdict": "NOT PASSED"
+}

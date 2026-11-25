@@ -1,0 +1,53 @@
+{
+  "baselines": [
+    "climatology",
+    "noaa-gefs"
+  ],
+  "candidate": {
+    "model_id": "gefs-station-corrected",
+    "model_version": "3"
+  },
+  "decision": "PROMOTED",
+  "harness_version": {
+    "scores": "2.7.0",
+    "wrfcomp": "0.1.0"
+  },
+  "promotion_rule_version": 2,
+  "protocol_version": "0.1.0",
+  "quarters": [
+    {
+      "period": "2024-Q1",
+      "reasons": [],
+      "result": "promotion_2024-Q1_f08e67d5e910725b",
+      "verdict": "PASSED",
+      "verdict_sha256": "f08e67d5e910725b960d4cb138c5cc1d28a7cd053f8df74f867f74491380da44"
+    },
+    {
+      "period": "2024-Q2",
+      "reasons": [],
+      "result": "promotion_2024-Q2_dbd1f8cfca9dd927",
+      "verdict": "PASSED",
+      "verdict_sha256": "dbd1f8cfca9dd9279ea4f57ef9483fcdfc7323004b0f5cb37c65316329207d1d"
+    },
+    {
+      "period": "2024-Q3",
+      "reasons": [],
+      "result": "promotion_2024-Q3_40d3991da4191763",
+      "verdict": "PASSED",
+      "verdict_sha256": "40d3991da4191763ea680b6e1479b09d409fbd141036cdda8d6d4013d96a7ad6"
+    },
+    {
+      "period": "2024-Q4",
+      "reasons": [
+        "gate not passed against noaa-gefs"
+      ],
+      "result": "promotion_2024-Q4_88965bbb48bcad5a",
+      "verdict": "NOT PASSED",
+      "verdict_sha256": "88965bbb48bcad5a1de18b351848c847dbbfc8446dd4c3b2b63abe399fba09c8"
+    }
+  ],
+  "quarters_passed": 3,
+  "quarters_required": 3,
+  "references_sha256": "e47dea56f70717a01ac45b714fd836f54980953a846ab631e19415d6af38dbf6",
+  "year": 2024
+}

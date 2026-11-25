@@ -1,7 +1,8 @@
 # Station forecast baselines
 
-Run from the checkout with `uv sync --extra dev`. The following command builds one
-initialization across all configured stations. Outputs go under
+Run from the checkout with `uv sync --extra dev --extra grib` (the `grib` extra is
+required for `gefs`; `climatology` and `persistence` only need `uv sync --extra dev`).
+The following command builds one initialization across all configured stations. Outputs go under
 `$WRFCOMP_DATA_DIR/baselines` (default `~/wrfcomp-data/baselines`).
 
 ```sh
@@ -21,6 +22,10 @@ Climatology and persistence write `model_version="3"` and cover leads of 1, 3, 6
 cutoff is the earlier of the configured training end and the earliest initialization in
 the request. A report's measurement time is its hourly label plus its variable-specific
 `X_offset_min`, which must lie within ±15 minutes.
+
+For a request before the training end, that default cutoff follows the request. A confirmation period
+inside the training years passes a fixed cutoff instead (`train_end` in `forecast`, recorded in the
+store's `train_end_utc` attribute); see `docs/CONFIRMATION_2023.md`.
 
 Both models use the same member rule. For `M` members, member `i` uses the empirical
 quantile at `(i + 0.5) / M`, for `i = 0, …, M − 1`. This selects the smallest sampled
@@ -56,7 +61,8 @@ variable and valid time. If climatology also exhausts its pools, the point remai
 Read the NOAA public S3 bucket using unsigned HTTPS range requests. The half-degree
 `atmos/pgrb2ap5` A files cover c00 and p01 through p30 at 3, 6, 12, 24 and 48 hours.
 Index offsets delimit individual GRIB2 messages. The decoder uses `eccodes` and the
-native `eccodeslib` wheel on CPU. The table follows the archived 2024-01-01 00Z inventories.
+native `eccodeslib` wheel on CPU via the optional `grib` extra (`uv sync --extra grib`;
+Linux, macOS 15+, or WSL2 on Windows). The table follows the archived 2024-01-01 00Z inventories.
 [Control f003 index](https://noaa-gefs-pds.s3.amazonaws.com/gefs.20240101/00/atmos/pgrb2ap5/gec00.t00z.pgrb2a.0p50.f003.idx)
 and [control analysis index](https://noaa-gefs-pds.s3.amazonaws.com/gefs.20240101/00/atmos/pgrb2ap5/gec00.t00z.pgrb2a.0p50.f000.idx).
 

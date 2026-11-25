@@ -45,7 +45,19 @@ uv run ruff check
 uv run pytest
 ```
 
+To download and decode NOAA GEFS GRIB2 baselines (`wrfcomp.baselines.gefs`), install the optional `grib` extra:
+
+```bash
+uv sync --extra dev --extra grib
+```
+
 The `ai` extra (Earth2Studio, torch) needs an NVIDIA GPU and is not required for the harness or the tests.
+
+## Platforms
+
+- **Linux:** Full support for scoring, tests, and NOAA GEFS GRIB2 downloads (`uv sync --extra dev --extra grib`).
+- **macOS:** Full support for scoring and tests (`uv sync --extra dev`). The prebuilt `eccodeslib` wheels for the `grib` extra require **macOS 15 (Sequoia)** or newer (`macosx_15_0` on Apple Silicon and Intel); earlier macOS releases can still run scoring and tests without `--extra grib`.
+- **Windows:** Native Windows is supported for the scoring harness, tests, station QC, and shadow ledger (`uv sync --extra dev`, without `--extra grib`). Because `eccodeslib` does not publish native Windows wheels, use **WSL2** (Linux) for the NOAA GEFS GRIB2 download path.
 
 ## Harness lock
 
@@ -63,10 +75,26 @@ maintainer. Changes to the harness were reviewed by an agent from a different pr
 locked changes need the project owner's approval on the exact commit. Pull request comments are posted
 through the maintainer's GitHub account, so a comment's author is not always the person who wrote it.
 
-## Data
+## How to get the scoring data
 
 Downloaded data lives outside the repo (default `~/wrfcomp-data/`, override with `WRFCOMP_DATA_DIR`).
 Never commit data files.
+
+To score a candidate locally against the locked harness (`scripts/check_promotion.py`), download the
+per-year scoring data bundle from Zenodo ([doi:10.5281/zenodo.24520171](https://doi.org/10.5281/zenodo.24520171) for 2024; truth, p95 tail thresholds, and the pinned monthly and
+quarterly climatology and GEFS reference stores — no citizen data and no sealed 2025+ data):
+
+```bash
+uv run python -P scripts/fetch_scoring_data.py \
+  --url https://zenodo.org/records/24520171 \
+  --expected-sha256 108e36f91d4400d1b4d94e964f51c6c70a1a471a20a02825c6c3eae047d19605 \
+  --year 2024
+```
+
+`scripts/fetch_scoring_data.py` verifies every unpacked file against both the archive's
+`MANIFEST.json` and the pinned content hashes in `experiments/REFERENCES.json` before installing
+into `$WRFCOMP_DATA_DIR`. See [docs/SCORING_DATA.md](docs/SCORING_DATA.md) for bundle contents,
+rebuilding instructions (`scripts/build_scoring_bundle.py`), data sources, and licensing.
 
 ## License
 

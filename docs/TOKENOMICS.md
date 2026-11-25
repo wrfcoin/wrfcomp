@@ -79,14 +79,14 @@ A miner that merely matches the free baseline scores `CRPSS_i = 0`. A miner wors
 
 To prevent thousands of nodes from farming rewards by relaying identical copies of free public models, WRFCoin adapts [Numerai's Meta Model Contribution (MMC)](https://docs.numer.ai/numerai-tournament/scoring/meta-model-contribution-mmc) to probabilistic weather ensembles.
 
-Let `M_all` be the equal-weight mixture across distinct eligible forecasts, and let `M_{-i}` be the Meta-Ensemble with miner `i` removed. Miner `i`'s marginal contribution is:
+Let `M_all` be the linearly stake-weighted mixture (by `K_i`, matching `stake_exponent = 1.0`) across distinct eligible forecasts so splitting one stake across wallets cannot alter the ensemble, and let `M_{-i}` be the Meta-Ensemble with miner `i` removed. Miner `i`'s marginal contribution is:
 
 ```text
 Delta_CRPS_i = (L(M_{-i}) - L(M_all)) / L_base
 ```
 
 - **Unique signal:** If removing miner `i` makes the Meta-Ensemble worse (`L(M_{-i}) > L(M_all)`), then `Delta_CRPS_i > 0`.
-- **Clone / copycat:** GEFS relays and later clones are excluded before forming the mixture.
+- **Clone / copycat:** Configured public references (raw GEFS and public promoted candidates) are treated as earlier clone entries so relays earn zero and incur a 2% nuisance slash after two or more consecutive epochs; later miner clones are also excluded before forming the mixture.
 
 ### 4.3 Composite Score, Payout & Slashing Cap
 

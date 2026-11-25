@@ -335,7 +335,10 @@ def test_thresholds_nan_means_no_training_data_and_inf_is_refused() -> None:
 def test_thresholds_must_be_float32_or_float64() -> None:
     validate_thresholds(make_thresholds().astype(np.float64), variables=VARIABLES)
     validate_thresholds(make_thresholds().astype(np.float32), variables=VARIABLES)
-    for dtype in (np.longdouble, np.float16, np.int64):
+    bad_dtypes: list[type] = [np.float16, np.int64]
+    if np.dtype(np.longdouble) != np.dtype(np.float64):
+        bad_dtypes.insert(0, np.longdouble)
+    for dtype in bad_dtypes:
         with pytest.raises(SchemaError, match="expected float32 or float64"):
             validate_thresholds(make_thresholds().astype(dtype), variables=VARIABLES)
     # The case behind the rule: finite as long double, infinity once scoring casts it to float64.
