@@ -1,0 +1,65 @@
+{
+  "built_from_commit": "4eb752af5b82d18ae4b9209c5e9dacbb340e7c52",
+  "stores": [
+    {
+      "period": "2023-01",
+      "store": "candidates/gefs-station-corrected-v3/2023-01.zarr",
+      "content_sha256": "4bc74d7ea00ace3e85d0634907416c2f3d4f47f60769092c3795deae0bf454fe"
+    },
+    {
+      "period": "2023-02",
+      "store": "candidates/gefs-station-corrected-v3/2023-02.zarr",
+      "content_sha256": "9c33d90a3c15099f9fa2ddcb8cabc5b6a2e761ec5ec572fb3b4360ccdcf08e1c"
+    },
+    {
+      "period": "2023-03",
+      "store": "candidates/gefs-station-corrected-v3/2023-03.zarr",
+      "content_sha256": "a563d2ec03318ad64e54da4622b39ed844a16a6e7027ad3751dad2de9190f4e9"
+    },
+    {
+      "period": "2023-04",
+      "store": "candidates/gefs-station-corrected-v3/2023-04.zarr",
+      "content_sha256": "c7e37701c311e4c7dda4584fe4ee7b4a3bf2138d3e77355fe51c0ba98bd80f3c"
+    },
+    {
+      "period": "2023-05",
+      "store": "candidates/gefs-station-corrected-v3/2023-05.zarr",
+      "content_sha256": "ca45a827bc78227825062549fc33ce6b44a3703f883a4b6c69dbca7a07160669"
+    },
+    {
+      "period": "2023-06",
+      "store": "candidates/gefs-station-corrected-v3/2023-06.zarr",
+      "content_sha256": "42e9983a97697cefb98c789c33df2c529d926d09f533fbd9e4ef11fa6c9700a7"
+    },
+    {
+      "period": "2023-07",
+      "store": "candidates/gefs-station-corrected-v3/2023-07.zarr",
+      "content_sha256": "3eba91e5eca6b4bf56e65936e19d07379e2c68ca99860b7f5abb1e792af863e9"
+    },
+    {
+      "period": "2023-08",
+      "store": "candidates/gefs-station-corrected-v3/2023-08.zarr",
+      "content_sha256": "ff38979973b1ba57f67ed4def2ae4bcb91b05c274dc05f876a3855b5409cdcf7"
+    },
+    {
+      "period": "2023-09",
+      "store": "candidates/gefs-station-corrected-v3/2023-09.zarr",
+      "content_sha256": "028fd5f226570c1d4b62e103cbfd9a97ef8fb2214e645ef2c0aec289035fbeb5"
+    },
+    {
+      "period": "2023-10",
+      "store": "candidates/gefs-station-corrected-v3/2023-10.zarr",
+      "content_sha256": "0c5a0feb79e88fe73a117e1e80bc4350ed7d2bd0f9ea5ef2fdf3300e01d874f3"
+    },
+    {
+      "period": "2023-11",
+      "store": "candidates/gefs-station-corrected-v3/2023-11.zarr",
+      "content_sha256": "9195681f5ea22f19a610f69347cbb08a703333ebf183e7803de57c1a2a750d06"
+    },
+    {
+      "period": "2023-12",
+      "store": "candidates/gefs-station-corrected-v3/2023-12.zarr",
+      "content_sha256": "25cb04317c763e3988a6cab74ce9086a93ad4222ef4ba52a056c7f46328e0abf"
+    }
+  ]
+}
