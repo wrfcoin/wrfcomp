@@ -35,6 +35,25 @@ Rules
 Exit codes: 0 every requested scorecard is in place; 1 at least one model failed or a scorecard
 would change; 2 the request or an input was refused.
 
+Confirmation mode (`--confirmation-train-end <UTC time>`) scores a period that lies INSIDE the train
+split, for the rule that a candidate which passes on the validation year must also pass on an earlier,
+untouched year. Scoring such a period against the ordinary references would leak: climatology, the
+persistence error sample and the tail thresholds are all built from the train split, which contains
+the period. In this mode
+
+  * the given time is the one cutoff for everything a reference learns from. It must be earlier than
+    the train split end, and the period must start at least the train split's embargo
+    (`embargo_days_after`) after it and before the validation split;
+  * train truth after the cutoff is left out for climatology and for the persistence error sample
+    (persistence still starts from the latest observation at init), and the cutoff is recorded in the
+    `train_end_utc` attribute of both stores;
+  * `--truth` and `--thresholds` must be given, and the thresholds file must carry exactly this
+    cutoff in its `train_end_utc` attribute (`scripts/build_thresholds.py --train-end`);
+  * the last init is the last one whose longest scored lead verifies at or before the train split
+    end, because truth after it is embargoed.
+
+Nothing else differs: the same builders, the same `wrfcomp-eval`, the same scorecard names.
+
 A second command prints the monthly tables of a year from the scorecards alone (no data needed):
 
     uv run python scripts/run_gate1.py summary --scorecards experiments/ --year 2024
@@ -94,8 +113,35 @@ class Period:
 # --------------------------------------------------------------------------- request checks
 
 
-def scorable_init_times(inits: np.ndarray, cfg: HarnessConfig) -> np.ndarray:
+def parse_utc(text: str) -> np.datetime64:
+    """A UTC time from the command line, with or without a zone suffix, as timezone-naive ns."""
+    try:
+        stamp = pd.Timestamp(text)
+    except (ValueError, TypeError) as exc:
+        raise Refused(f"not a time: {text!r}") from exc
+    if stamp is pd.NaT:
+        raise Refused(f"not a time: {text!r}")
+    if stamp.tz is not None:
+        stamp = stamp.tz_convert("UTC").tz_localize(None)
+    return stamp.to_datetime64().astype("datetime64[ns]")
+
+
+def check_confirmation_cutoff(train_end: np.datetime64, cfg: HarnessConfig) -> None:
+    if not train_end < cfg.splits.train.end:
+        raise Refused(
+            f"--confirmation-train-end {train_end} is not earlier than the train split end "
+            f"({cfg.splits.train.end}); a confirmation cutoff can only be earlier"
+        )
+
+
+def scorable_init_times(
+    inits: np.ndarray, cfg: HarnessConfig, train_end: np.datetime64 | None = None
+) -> np.ndarray:
     """The init times of a period that may be scored.
+
+    Confirmation mode (`train_end` given): the period lies inside the train split, and an init time
+    is kept if its longest scored lead verifies at or before the train split end. Truth after that
+    is embargoed before validation. The rest of this text is the ordinary rule.
 
     Rule: the last init of a period is the last one that is inside the validation split and whose
     longest scored lead stays before the sealed split. Both limits come from `configs/splits.yaml`.
@@ -108,6 +154,8 @@ def scorable_init_times(inits: np.ndarray, cfg: HarnessConfig) -> np.ndarray:
     allow 2024-12-29T12Z.
     """
     longest = np.timedelta64(max(cfg.evaluation.lead_hours), "h")
+    if train_end is not None:
+        return inits[inits + longest <= cfg.splits.train.end]
     keep = (inits <= cfg.splits.validation.end) & (inits + longest < cfg.splits.sealed_test.start)
     return inits[keep]
 
@@ -119,8 +167,13 @@ def _month_init_times(year: int, month: int, init_hours: list[int]) -> np.ndarra
     return evaluation_init_times(start, end, init_hours)
 
 
-def parse_period(label: str, init_hours: list[int], cfg: HarnessConfig) -> Period:
+def parse_period(
+    label: str, init_hours: list[int], cfg: HarnessConfig, train_end: np.datetime64 | None = None
+) -> Period:
     """A calendar month `YYYY-MM` or a calendar quarter `YYYY-Qn`, cut by `scorable_init_times`.
+
+    With `train_end` (confirmation mode) the period must lie between that cutoff plus the train
+    split's embargo and the validation split, instead of inside the validation split.
 
     A quarter is ONE period: its init times are those of its three months together, so its scorecard
     is one evaluation over the whole quarter, not an average of three monthly scorecards.
@@ -143,11 +196,30 @@ def parse_period(label: str, init_hours: list[int], cfg: HarnessConfig) -> Perio
     per_month = {f"{year:04d}-{m:02d}": _month_init_times(year, m, init_hours) for m in month_numbers}
     all_inits = np.concatenate(list(per_month.values()))
     validation = cfg.splits.validation
-    if all_inits.min() < validation.start:
+    if train_end is not None:
+        check_confirmation_cutoff(train_end, cfg)
+        embargo_days = cfg.splits.train.embargo_days_after or 0
+        earliest = train_end + np.timedelta64(embargo_days, "D")
+        if all_inits.min() < earliest:
+            raise Refused(
+                f"period {label}: starts at {all_inits.min()}, less than "
+                f"{embargo_days} days after the confirmation cutoff ({train_end})"
+            )
+        if all_inits.max() >= validation.start:
+            raise Refused(
+                f"period {label}: reaches the validation split ({validation.start}); a confirmation "
+                "period lies before it. Score it without --confirmation-train-end."
+            )
+    elif all_inits.min() < validation.start:
         raise Refused(
             f"period {label}: starts at {all_inits.min()}, before the validation split ({validation.start})"
         )
-    inits = scorable_init_times(all_inits, cfg)
+    inits = scorable_init_times(all_inits, cfg, train_end)
+    if inits.size == 0 and train_end is not None:
+        raise Refused(
+            f"period {label}: no init time has its longest lead ({max(cfg.evaluation.lead_hours)} h) "
+            f"at or before the train split end ({cfg.splits.train.end})"
+        )
     if inits.size == 0:
         raise Refused(
             f"period {label}: no init time is inside the validation split (ends {validation.end}) with its "
@@ -155,7 +227,7 @@ def parse_period(label: str, init_hours: list[int], cfg: HarnessConfig) -> Perio
             f"({cfg.splits.sealed_test.start})"
         )
     months = (
-        tuple(m for m, times in per_month.items() if scorable_init_times(times, cfg).size)
+        tuple(m for m, times in per_month.items() if scorable_init_times(times, cfg, train_end).size)
         if is_quarter
         else ()
     )
@@ -220,12 +292,20 @@ def check_times(ds: xr.Dataset, what: str, *, latest_allowed: np.datetime64, inc
 
 
 def load_archive(
-    train_paths: list[Path], truth_path: Path, stations: list[str], cfg: HarnessConfig
+    train_paths: list[Path],
+    truth_path: Path,
+    stations: list[str],
+    cfg: HarnessConfig,
+    train_end: np.datetime64 | None = None,
 ) -> xr.Dataset:
     """Training truth plus the scored year's truth, in memory, for the baseline models.
 
     The baselines need the primary variables and their `X_offset_min` companions (data contract
     addendum 1). Stations are cut to the stations file, in its order.
+
+    Confirmation mode (`train_end` given): train truth is cut to times at or before the cutoff and
+    the scored truth to times after it, on coordinates, before any value is loaded. The scored truth
+    may therefore be the train truth file itself or a slice of it.
     """
     names = [v for name in cfg.evaluation.variables.primary for v in (name, f"{name}_offset_min")]
     parts = []
@@ -241,6 +321,12 @@ def load_archive(
         if absent:
             raise Refused(f"{what} {path.name}: {len(absent)} station(s) of the stations file are missing")
         ds = ds.assign_coords(station_id=ds["station_id"].values.astype(str))
+        if train_end is not None:
+            times = ds["valid_time"].values
+            keep = times <= train_end if what == "train truth" else times > train_end
+            if not keep.any():
+                raise Refused(f"{what} {path.name}: no time on its side of the cutoff {train_end}")
+            ds = ds.isel(valid_time=np.flatnonzero(keep))
         parts.append(ds[names].sel(station_id=stations).load())
         ds.close()
     archive = xr.concat(parts, dim="valid_time", data_vars="all", coords="minimal", compat="override")
@@ -249,27 +335,44 @@ def load_archive(
     return archive.sortby("valid_time")
 
 
-def existing_store_ok(path: Path, period: Period, stations: list[str], model: str) -> bool:
-    """True if a finished store is there and covers the period. A store that does not is refused."""
+def existing_store_ok(
+    path: Path, period: Period, stations: list[str], model: str, train_end: np.datetime64 | None = None
+) -> bool:
+    """True if a finished store is there and covers the period. A store that does not is refused.
+
+    A climatology or persistence store must also have been built with this run's cutoff: the
+    `train_end_utc` attribute is the confirmation cutoff, or absent in an ordinary run.
+    """
     if not path.exists():
         return False
+    cutoff = None if train_end is None or model == "gefs" else str(train_end)
     with open_store(path, f"{model} forecast") as ds:
         same_inits = ds.sizes.get("init_time") == period.init_times.size and bool(
             (np.sort(ds["init_time"].values) == period.init_times).all()
         )
         has_stations = set(stations) <= set(ds["station_id"].values.astype(str).tolist())
         same_model = ds.attrs.get("model_id") == MODEL_IDS[model]
-    if not (same_inits and has_stations and same_model):
+        same_cutoff = ds.attrs.get("train_end_utc") == cutoff
+    if not (same_inits and has_stations and same_model and same_cutoff):
         raise ModelFailed(
-            f"{path} exists but does not match this request (init times, stations or model id). "
-            "Delete it to rebuild."
+            f"{path} exists but does not match this request (init times, stations, model id or "
+            "training cutoff). Delete it to rebuild."
         )
     return True
 
 
-def build_baseline(model: str, path: Path, period: Period, archive: xr.Dataset, cfg: HarnessConfig) -> None:
+def build_baseline(
+    model: str,
+    path: Path,
+    period: Period,
+    archive: xr.Dataset,
+    cfg: HarnessConfig,
+    train_end: np.datetime64 | None = None,
+) -> None:
     module = climatology if model == "climatology" else persistence
-    forecast = module.forecast(archive, list(period.init_times), tuple(cfg.evaluation.lead_hours))
+    forecast = module.forecast(
+        archive, list(period.init_times), tuple(cfg.evaluation.lead_hours), train_end=train_end
+    )
     baseline_io.write(forecast, path)
 
 
@@ -312,14 +415,20 @@ def assemble_quarter(
     months: list[Period],
     model: str,
     sealed_start: np.datetime64,
+    train_end: np.datetime64 | None = None,
 ) -> None:
     """A quarter's forecast store: the stores of its months joined along init_time, nothing else.
+
+    Every month store must have been built with this run's training cutoff, as `existing_store_ok`
+    requires of a finished store: `train_end_utc` is the confirmation cutoff on a climatology or
+    persistence store of a confirmation run, and absent otherwise (ordinary runs, and GEFS always).
 
     Every month store must already exist and hold exactly that month's scorable init times, so the
     quarter is made of the same forecasts as the monthly references. Init times end up in time order.
     A month store whose init or valid times reach `sealed_start` is refused from its coordinates,
     before any of its values is read.
     """
+    cutoff = None if train_end is None or model == "gefs" else str(train_end)
     parts = []
     for store, month in zip(month_stores, months, strict=True):
         if not store.is_dir():
@@ -337,6 +446,11 @@ def assemble_quarter(
                 raise ModelFailed(f"{store} does not hold exactly the init times of {month.label}")
             if ds.attrs.get("model_id") != MODEL_IDS[model]:
                 raise ModelFailed(f"{store} is not a {MODEL_IDS[model]} forecast")
+            if ds.attrs.get("train_end_utc") != cutoff:
+                raise ModelFailed(
+                    f"{store} was built with training cutoff {ds.attrs.get('train_end_utc')!r}, "
+                    f"this run needs {cutoff!r}. Delete it to rebuild."
+                )
             parts.append(ds.assign_coords(station_id=ds["station_id"].values.astype(str)).load())
     first = parts[0]
     for store, part in zip(month_stores, parts, strict=True):
@@ -413,6 +527,21 @@ def score(
         staging.unlink(missing_ok=True)
 
 
+def check_thresholds_cutoff(thresholds: Path, train_end: np.datetime64) -> None:
+    """Attributes only: the thresholds file was built with exactly the confirmation cutoff."""
+    with open_store(thresholds, "thresholds") as ds:
+        recorded = ds.attrs.get("train_end_utc")
+    try:
+        same = recorded is not None and np.datetime64(str(recorded), "ns") == train_end
+    except ValueError:
+        same = False
+    if not same:
+        raise Refused(
+            f"thresholds {thresholds.name}: built from truth up to {recorded!r}, not up to the "
+            f"confirmation cutoff {train_end}. Build it with scripts/build_thresholds.py --train-end."
+        )
+
+
 def check_truth_covers(truth: Path, periods: list[Period], cfg: HarnessConfig) -> None:
     """Coordinates only: the scoring truth is not sealed and spans every valid time to be scored."""
     with open_store(truth, "truth") as ds:
@@ -444,7 +573,15 @@ def run(args: argparse.Namespace) -> int:
         raise Refused(f"init hour(s) {unknown} are not in the config's init_hours_utc")
     if len(set(args.period)) != len(args.period):
         raise Refused("a period is listed twice")
-    periods = [parse_period(label, hours, cfg) for label in args.period]
+    cutoff = None if args.confirmation_train_end is None else parse_utc(args.confirmation_train_end)
+    if cutoff is not None:
+        check_confirmation_cutoff(cutoff, cfg)
+        if args.truth is None or args.thresholds is None:
+            raise Refused(
+                "confirmation mode needs --truth and --thresholds: the defaults are the validation "
+                "year's truth and the thresholds of the whole train split"
+            )
+    periods = [parse_period(label, hours, cfg, cutoff) for label in args.period]
     models = [m for m in MODELS if m in args.models]
     data_dir = check_data_dir(args.data_dir, args.allow_tmp_data_dir)
     stations = required_stations(args.config, cfg)
@@ -454,6 +591,9 @@ def run(args: argparse.Namespace) -> int:
     for path, what in ((truth, "truth"), (thresholds, "thresholds")):
         if not path.exists():
             raise Refused(f"{what}: no such file or directory: {path}")
+    if cutoff is not None:
+        check_thresholds_cutoff(thresholds, cutoff)
+        print(f"confirmation mode: references learn from truth at or before {cutoff} only")
     check_truth_covers(truth, periods, cfg)
     args.out.mkdir(parents=True, exist_ok=True)
     hour_tag = "-".join(f"{h:02d}" for h in hours)
@@ -464,8 +604,13 @@ def run(args: argparse.Namespace) -> int:
         if period.n_dropped:
             print(
                 f"[{period.label}] stops at {pd.Timestamp(period.init_times.max()):%Y-%m-%dT%HZ}: the last "
-                f"{period.n_dropped} init time(s) of the period are left out for every model (after the end "
-                "of the validation split, or with a longest lead that reaches the sealed split)"
+                f"{period.n_dropped} init time(s) of the period are left out for every model "
+                + (
+                    "(their longest lead verifies after the train split end)"
+                    if cutoff is not None
+                    else "(after the end of the validation split, or with a longest lead that reaches "
+                    "the sealed split)"
+                )
             )
         work = data_dir / "gate1" / f"{period.label}_h{hour_tag}"
         stores = {model: work / f"{model}.zarr" for model in MODELS}
@@ -473,15 +618,21 @@ def run(args: argparse.Namespace) -> int:
         wanted = [m for m in MODELS if m in models or m == BASELINE]
         for model in wanted:
             try:
-                if existing_store_ok(stores[model], period, stations, model):
+                if existing_store_ok(stores[model], period, stations, model, cutoff):
                     print(f"[{period.label}] {model}: forecast store present, reused")
                 elif period.months:
-                    months = [parse_period(m, hours, cfg) for m in period.months]
+                    months = [parse_period(m, hours, cfg, cutoff) for m in period.months]
                     month_stores = [
                         data_dir / "gate1" / f"{m}_h{hour_tag}" / f"{model}.zarr" for m in period.months
                     ]
                     assemble_quarter(
-                        stores[model], period, month_stores, months, model, cfg.splits.sealed_test.start
+                        stores[model],
+                        period,
+                        month_stores,
+                        months,
+                        model,
+                        cfg.splits.sealed_test.start,
+                        cutoff,
                     )
                     print(f"[{period.label}] {model}: joined the stores of {', '.join(period.months)}")
                 elif model == "gefs":
@@ -490,8 +641,8 @@ def run(args: argparse.Namespace) -> int:
                 else:
                     if archive is None:
                         print("loading truth for the baseline models")
-                        archive = load_archive(train_truth, truth, stations, cfg)
-                    build_baseline(model, stores[model], period, archive, cfg)
+                        archive = load_archive(train_truth, truth, stations, cfg, cutoff)
+                    build_baseline(model, stores[model], period, archive, cfg, cutoff)
                     print(f"[{period.label}] {model}: forecast built for {period.init_times.size} init times")
                 ready[model] = True
             except ModelFailed as exc:
@@ -673,6 +824,12 @@ def main(argv: list[str] | None = None) -> int:
         "--models", nargs="+", choices=MODELS, default=list(MODELS), help="default: all three"
     )
     parser.add_argument("--overwrite", action="store_true", help="replace a scorecard whose content changed")
+    parser.add_argument(
+        "--confirmation-train-end",
+        metavar="UTC",
+        help="confirmation mode: score a period inside the train split, with references that learn "
+        "from truth at or before this time only (needs --truth and --thresholds)",
+    )
     parser.add_argument(
         "--allow-tmp-data-dir", action="store_true", help="tests only: accept a data dir under /tmp"
     )

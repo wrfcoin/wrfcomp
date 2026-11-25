@@ -2,6 +2,22 @@
 
 Committed `wrfcomp-eval` scorecards. Each JSON is the byte-exact output of the harness; do not edit one.
 
+## Confirmation references: 2023-Q1 to 2023-Q4
+
+Owner ruling 2026-11-24: a candidate promoted on 2024 must also pass on 2023 before anyone relies on it. These
+are the reference scorecards for that run: climatology, persistence and NOAA GEFS, each quarter of 2023 scored
+as ONE period. 12 scorecards, `<model>_2023-Qn.json`, pinned in `REFERENCES.json`.
+
+- 2023 lies inside the train split. Everything a reference learns from stops at **2022-12-17T18Z**: the tail
+  thresholds (`thresholds/tail_p95_to_2022-12-17.nc`), the climatology pools and the persistence error sample.
+  GEFS is the raw station extraction, as for 2024.
+- Init times, 00Z and 12Z: Q1 180, Q2 182, Q3 184, Q4 152. Q4 ends at 2023-12-15T12Z, the last init whose 48 h
+  lead verifies inside the truth held (to 2023-12-17T18Z).
+- Scored truth: `truth/isd_conus_2023.nc`, a slice of the train truth (2022-12-31T18Z to 2023-12-17T18Z).
+- Built with `scripts/build_thresholds.py --train-end 2022-12-17T18` and
+  `scripts/run_gate1.py --confirmation-train-end 2022-12-17T18` (months first, then the quarters).
+- These are reference scores only. No candidate was built or scored on 2023 to make them.
+
 ## Quarterly reference scorecards: 2024-Q1 to 2024-Q4
 
 The pinned references of the promotion rule (at least 3 of 4 quarters; `docs/HARNESS_LOCK.md`): climatology,

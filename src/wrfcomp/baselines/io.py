@@ -55,10 +55,27 @@ def layout(stations, inits, leads, members, model):
     return ds
 
 
-def train_truth(truth, forecast):
+def calibration_cutoff(forecast, train_end=None):
+    """Latest measurement time the historical baselines may learn from (inclusive).
+
+    Default: the earlier of the configured training end and the earliest forecast init. For a request
+    before the training end that default follows the request, so a year built month by month would
+    learn from its own earlier months. `train_end` fixes the cutoff instead. It can only be at or
+    before the default, never later.
+    """
     end, _ = boundaries()
     # Historical outcomes used in calibration must also precede the earliest forecast.
-    end = min(end, forecast.init_time.values.min())
+    latest = min(end, forecast.init_time.values.min())
+    if train_end is None:
+        return latest
+    fixed = np.datetime64(train_end, "ns")
+    if np.isnat(fixed) or fixed > latest:
+        raise ValueError(f"train_end {train_end} is not a time at or before {latest}")
+    return fixed
+
+
+def train_truth(truth, forecast, train_end=None):
+    end = calibration_cutoff(forecast, train_end)
     return truth.sel(valid_time=slice(np.datetime64("2014-01-01"), end))
 
 

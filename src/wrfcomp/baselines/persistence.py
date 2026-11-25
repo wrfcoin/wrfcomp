@@ -3,7 +3,7 @@
 import numpy as np
 
 from .climatology import fill_missing_members
-from .io import UNITS, boundaries, historical_layout, train_truth
+from .io import UNITS, calibration_cutoff, historical_layout, train_truth
 
 
 def latest(truth, name, times):
@@ -25,14 +25,20 @@ def latest(truth, name, times):
     return out
 
 
-def forecast(truth, inits, leads, members=None):
-    """Add empirical error quantiles; use climatology where the start or error sample is missing."""
+def forecast(truth, inits, leads, members=None, train_end=None):
+    """Add empirical error quantiles; use climatology where the start or error sample is missing.
+
+    The starting value is always the latest observation at init. `train_end` fixes the cutoff of the
+    error sample and of the climatology fallback (see `io.calibration_cutoff`) and is recorded in the
+    output attributes. Without it the output is exactly what it was before the argument existed.
+    """
     out = historical_layout(truth, inits, leads, members, "persistence")
-    archive = train_truth(truth, out)
+    archive = train_truth(truth, out, train_end)
     dates = archive.valid_time.to_index()
     times = out.init_time.values
-    end, _ = boundaries()
-    cutoff = min(times.min(), end)
+    cutoff = calibration_cutoff(out, train_end)
+    if train_end is not None:
+        out.attrs["train_end_utc"] = str(cutoff)
     qs = (out.ens_member.values + 0.5) / out.sizes["ens_member"]
     for name in UNITS:
         now = latest(truth, name, times)

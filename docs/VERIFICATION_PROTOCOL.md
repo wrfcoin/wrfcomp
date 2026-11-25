@@ -144,6 +144,20 @@ threshold, so `protocol_version` and the pinned reference scorecards are unchang
 `promotion_rule_version` (1: a single month decided; 2: this rule), recorded in every verdict. The 3-of-4
 requirement of the guard below is therefore always in force, not an alternative.
 
+**Confirmation on 2023 (owner ruling 2026-11-24):** a candidate that is promoted on 2024 is relied on only after
+it also passes every gate against both reference baselines in **at least 3 of the 4 calendar quarters of 2023**,
+scored once by the manager with `python -P scripts/check_promotion.py promote --year 2023 ...`. The periods
+`2023-Q1` to `2023-Q4` (init times 2023-01-01T00Z to 2023-12-15T12Z, 00Z and 12Z) lie inside the train split, so
+scoring them against the ordinary references would leak the period into its own references. Their climatology,
+persistence error sample and tail thresholds are therefore built from truth **at or before 2022-12-17T18Z only**:
+the 2024 arrangement moved back one year, with the same 14 days of embargo before the first init. Where this
+document says thresholds come from the whole training archive, that is the rule for the 2024 periods. Q4 ends at
+2023-12-15T12Z, the last init whose 48 h lead verifies inside the truth held (to 2023-12-17T18Z). The command
+prints `PROMOTED` or `NOT PROMOTED` for 2023; read that as confirmed or not confirmed. It is never a promotion by
+itself. Months of 2023 are not pinned. One run per candidate version: if a design is changed after its 2023 result
+is known, 2023 is used up for that family. No metric, mask, gate or threshold rule changes, so `protocol_version`
+and `promotion_rule_version` are unchanged. Nothing from 2025 onward is touched.
+
 **Multiple-Testing Guard (Agentic Research Loops):** When an automated swarm tests `M` candidate architectures on the 2024 validation split within a single research sprint, apply a **Bonferroni-adjusted threshold (`alpha = 0.05 / M`)** or require the winning candidate to hold its gain across at least **3 of 4 calendar quarters** of 2024 before promoting it to a release candidate.
 
 ---
