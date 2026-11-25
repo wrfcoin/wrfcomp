@@ -31,7 +31,7 @@ def summarize(candidate_dir: Path) -> dict:
                     "spread_skill_ratio": {v: m["spread_skill_ratio"] for v, m in metrics.items()},
                     "n_init_times": data["n_init_times"],
                     "n_stations": data["n_stations"],
-                    "source": str(card.relative_to(candidate_dir.parent.parent)),
+                    "source": card.relative_to(candidate_dir.parent.parent).as_posix(),
                 }
             quarters[quarter] = {"verdict": verdict["verdict"], "references": refs}
         years[year_dir.name] = {
@@ -40,7 +40,7 @@ def summarize(candidate_dir: Path) -> dict:
             "quarters_required": decision["quarters_required"],
             "promotion_rule_version": decision["promotion_rule_version"],
             "harness_version": decision["harness_version"],
-            "source": str(decision_file.relative_to(candidate_dir.parent.parent)),
+            "source": decision_file.relative_to(candidate_dir.parent.parent).as_posix(),
             "quarters": quarters,
         }
     return {"candidate": candidate_dir.name, "years": years}
