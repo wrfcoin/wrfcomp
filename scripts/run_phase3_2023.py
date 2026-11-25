@@ -75,8 +75,13 @@ def build_design1_arms(
 ) -> dict:
     """Replay untouched ``citizen_arms.Replay`` into isolated ``out_dir`` (read-only live stores)."""
     out_dir = out_dir.resolve()
-    if _paths_overlap(out_dir, data / "candidates"):
-        raise BuildRefusedError("out_dir must be isolated from <data-dir>/candidates")
+    for protected in ("candidates", "phase3", "phase3-design2"):
+        if _paths_overlap(out_dir, data / protected):
+            raise BuildRefusedError(f"out_dir must be isolated from <data-dir>/{protected}")
+    if (out_dir / "build.json").exists():
+        raise BuildRefusedError(
+            "out_dir already contains a build.json; refusing to overwrite existing output"
+        )
     if verify_against is not None:
         ref_path = verify_against.resolve()
         if not ref_path.is_file():

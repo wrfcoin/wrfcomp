@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -214,10 +213,6 @@ def test_loao_causality_reports_after_T_change_nothing():
         np.testing.assert_array_equal(a, b)
 
 
-TILE_NAMES_ON_WINDOWS = pytest.mark.skipif(sys.platform == "win32", reason="tile names use POSIX paths")
-
-
-@TILE_NAMES_ON_WINDOWS
 def test_loao_digest_binds_all_dependencies_and_timing_folder_refused(tmp_path, monkeypatch):
     from wrfcomp.assimilation.madis_archive import ReportTable, save_table
 
@@ -319,7 +314,6 @@ def test_default_load_static_sites_reads_registered_stations_conus(tmp_path):
         loao.load_static_sites(bad_csv)
 
 
-@TILE_NAMES_ON_WINDOWS
 def test_loao_qc_logs_and_summaries_contain_no_tokens_or_coordinate_tile_labels(
     tmp_path, monkeypatch, capsys
 ):

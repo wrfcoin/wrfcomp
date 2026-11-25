@@ -129,11 +129,34 @@ def run_record(
     return record
 
 
+def verify_tiles(tiles_dir: Path) -> dict:
+    """Portable tile manifest verifier (normalizes relative paths with POSIX separators)."""
+    tiles_dir = Path(tiles_dir)
+    manifest = p3.read_manifest(tiles_dir / "manifest.json", "tiles")
+    present = {p.relative_to(tiles_dir).as_posix() for p in tiles_dir.glob("*/*.npz")}
+    listed = manifest["parts"]
+    if present != set(listed):
+        missing, extra = len(set(listed) - present), len(present - set(listed))
+        raise p3.IncompleteError(
+            f"tiles: {missing} tile-month files are missing and {extra} are not in the manifest"
+        )
+    changed = [
+        name
+        for name, digest in listed.items()
+        if p3.sha256_file(tiles_dir.joinpath(*name.split("/"))) != digest
+    ]
+    if changed:
+        raise p3.IncompleteError(
+            f"tiles: {len(changed)} tile-month files are not the ones the manifest lists"
+        )
+    return manifest
+
+
 def current_run_record(
     data_dir: Path, year: int, *, stations_csv: Path = STATIONS_CSV, repo: Path = _REPO
 ) -> dict:
     """Recompute the LOAO QC provenance record from the files currently on disk."""
-    manifest = p3.verify_tiles(Path(data_dir) / "citizen" / "conus" / f"{year}-tiles")
+    manifest = verify_tiles(Path(data_dir) / "citizen" / "conus" / f"{year}-tiles")
     _, _, forecasts = load_loao_inputs(data_dir, year, stations_csv=stations_csv)
     return run_record(year, manifest, forecasts, stations_csv=stations_csv, repo=repo)
 

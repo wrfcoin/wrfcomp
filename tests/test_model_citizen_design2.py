@@ -545,7 +545,92 @@ def test_track_b_end_to_end_post_T_truth_and_late_arrival_citizen_reports(tmp_pa
         }
     )
 
-    def run_pipeline(root: Path, *, perturb: bool) -> dict:
+    def _extract_snapshot_at_cut(root: Path) -> tuple[np.ndarray, np.ndarray]:
+        cut_idx = int(np.flatnonzero(inits == t_cut)[0])
+        with xr.open_dataset(
+            root / "citizen" / "conus" / "issue_extract_loao_2024.nc", engine="h5netcdf"
+        ) as ds:
+            pick = (ds.row_issue.values == cut_idx) & (ds.row_var.values == 0)
+            st = ds.row_station.values[pick]
+            order = np.argsort(st)
+            return ds.row_value.values[pick][order].copy(), ds.row_weight.values[pick][order].copy()
+
+    def _run_loao_and_build(root: Path, manifest: dict) -> dict:
+        citizen = root / "citizen"
+        trial, sites, fc = loao_qc.load_loao_inputs(root, 2024, stations_csv=stations_csv)
+        rec = loao_qc.run_record(2024, manifest, fc, stations_csv=stations_csv)
+        qc_out = citizen / "conus" / "2024-qc-loao"
+        qc_out.mkdir(parents=True)
+        (qc_out / "run.json").write_text(json.dumps(rec, indent=1) + "\n")
+        qc_loao._G.update(
+            trial=trial,
+            sites=sites,
+            forecasts=fc,
+            issues=inits,
+            tiles=citizen / "conus" / "2024-tiles",
+            out=qc_out,
+            digest=rec["digest"],
+            start=START,
+        )
+        for ordinal, name in enumerate(manifest["tiles"]):
+            qc_loao.run_tile((ordinal, name))
+        qc_loao.merge(root, 2024, stations_csv=stations_csv, min_free_bytes=0)
+        return builder.build_track_b(
+            root,
+            2024,
+            issues=inits,
+            stations=sids,
+            stations_csv=stations_csv,
+            verify_extract=True,
+            run_relay_audit=True,
+            min_covered=1,
+            min_free_bytes=0,
+        )
+
+    def _inject_report_at_cut(root: Path, manifest: dict, *, received_ns: int, delta_k: float) -> dict:
+        """Inject a plausible (+delta_k) report at obs = T_cut - 2 min into every partitioned tile."""
+        prev_obs_ns = int((t_cut - 10 * M).astype("datetime64[ns]").astype(np.int64))
+        inj_obs_ns = int((t_cut - 2 * M).astype("datetime64[ns]").astype(np.int64))
+        tiles_dir = root / "citizen" / "conus" / "2024-tiles"
+        for rel in list(manifest["parts"]):
+            part_path = tiles_dir.joinpath(*rel.split("/"))
+            with np.load(part_path) as z:
+                d = {k: z[k] for k in z.files}
+            n_id = len(d["ident_token"])
+            prev_t = np.empty(n_id, dtype=np.float32)
+            prev_td = np.empty(n_id, dtype=np.float32)
+            for idx_id in range(n_id):
+                m = (d["row_ident"] == idx_id) & (d["obs_time"] == prev_obs_ns)
+                assert m.any()
+                prev_t[idx_id] = d["t2m"][m][-1] + delta_k
+                prev_td[idx_id] = d["td2m"][m][-1] + delta_k
+            extra_ident = np.arange(n_id, dtype=np.int32)
+            d["row_ident"] = np.concatenate([d["row_ident"], extra_ident])
+            d["obs_time"] = np.concatenate([d["obs_time"], np.full(n_id, inj_obs_ns, dtype=np.int64)])
+            d["received_time"] = np.concatenate(
+                [d["received_time"], np.full(n_id, received_ns, dtype=np.int64)]
+            )
+            d["t2m"] = np.concatenate([d["t2m"], prev_t])
+            d["td2m"] = np.concatenate([d["td2m"], prev_td])
+            d["wind_speed"] = np.concatenate([d["wind_speed"], np.full(n_id, 2.0, dtype=np.float32)])
+            d["wind_dir"] = np.concatenate([d["wind_dir"], np.full(n_id, 90.0, dtype=np.float32)])
+            order = np.lexsort((d["obs_time"], d["row_ident"]))
+            for col in ("row_ident", "obs_time", "received_time", "t2m", "td2m", "wind_speed", "wind_dir"):
+                d[col] = d[col][order]
+            np.savez_compressed(part_path, **d)
+            manifest["parts"][rel] = p3.sha256_file(part_path)
+        (tiles_dir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+        return manifest
+
+    def run_pipeline(
+        root: Path,
+        *,
+        perturb_post: bool,
+        inject_received_ns: int | None = None,
+        shared_gefs_src: Path | None = None,
+    ) -> dict:
+        import shutil
+
         rng = np.random.default_rng(77)
         diurnal = 282.0 + 5.0 * np.sin(2.0 * np.pi * hours / 24.0)
         syn = 2.2 * np.sin(2.0 * np.pi * hours / 67.0)
@@ -559,8 +644,7 @@ def test_track_b_end_to_end_post_T_truth_and_late_arrival_citizen_reports(tmp_pa
                 sig = np.zeros((len(labels), n_air))
                 sig[3:, :] = 0.6 * syn[:-3, None] + 0.7 * meso[:-3, None]
                 base = base + sig + 1.5 + rng.normal(0.0, 0.12, base.shape)
-                if perturb:
-                    # Perturb strictly post-T_cut truth (valid_time > T_cut)
+                if perturb_post:
                     post = labels > t_cut
                     base[post, :] += 10.0 * np.sin(2.0 * np.pi * hours[post, None] / 19.0) + 6.0
             else:
@@ -571,28 +655,35 @@ def test_track_b_end_to_end_post_T_truth_and_late_arrival_citizen_reports(tmp_pa
         (root / "truth").mkdir(parents=True)
         truth.to_netcdf(root / "truth" / "isd_conus_2024.nc")
 
-        # Write raw GEFS cycles (identical between base and perturbed)
-        for t in inits:
-            g = layout(stations_ds, [t], GEFS_LEADS, 31, "noaa-gefs")
-            i0 = int((t - START) / H)
-            for k_var in UNITS:
-                scale = 100.0 if k_var == "msl" else 1.0
-                centre = 100000.0 if k_var == "msl" else (275.0 if k_var == "td2m" else 282.0)
-                for j_l, lead in enumerate(GEFS_LEADS):
-                    if k_var == "u10":
-                        lvl = np.full(n_air, 6.0)
-                    elif k_var == "v10":
-                        lvl = np.zeros(n_air)
-                    else:
-                        lvl = centre + scale * (diurnal[i0 + lead] - 282.0) + np.zeros(n_air)
-                    g[k_var].values[0, j_l] = (
-                        lvl[:, None] + scale * rng.normal(0.0, 0.6, (n_air, 31))
-                    ).astype(np.float32)
-            g["td2m"].values[:] = np.minimum(g["td2m"].values, g["t2m"].values)
-            stamp = np.datetime_as_string(t, unit="h").replace("-", "").replace("T", "")
-            write(g, root / "baselines" / "gefs" / f"{stamp}.zarr")
+        # Write raw GEFS cycles once and copy for variants to keep the 4-way test fast.
+        if shared_gefs_src is not None:
+            shutil.copytree(shared_gefs_src, root / "baselines")
+            # Advance rng by identical draw count so citizen noise is identical across variants.
+            for _ in inits:
+                for _ in UNITS:
+                    for _ in GEFS_LEADS:
+                        rng.normal(0.0, 0.6, (n_air, 31))
+        else:
+            for t in inits:
+                g = layout(stations_ds, [t], GEFS_LEADS, 31, "noaa-gefs")
+                i0 = int((t - START) / H)
+                for k_var in UNITS:
+                    scale = 100.0 if k_var == "msl" else 1.0
+                    centre = 100000.0 if k_var == "msl" else (275.0 if k_var == "td2m" else 282.0)
+                    for j_l, lead in enumerate(GEFS_LEADS):
+                        if k_var == "u10":
+                            lvl = np.full(n_air, 6.0)
+                        elif k_var == "v10":
+                            lvl = np.zeros(n_air)
+                        else:
+                            lvl = centre + scale * (diurnal[i0 + lead] - 282.0) + np.zeros(n_air)
+                        g[k_var].values[0, j_l] = (
+                            lvl[:, None] + scale * rng.normal(0.0, 0.6, (n_air, 31))
+                        ).astype(np.float32)
+                g["td2m"].values[:] = np.minimum(g["td2m"].values, g["t2m"].values)
+                stamp = np.datetime_as_string(t, unit="h").replace("-", "").replace("T", "")
+                write(g, root / "baselines" / "gefs" / f"{stamp}.zarr")
 
-        # Write daily MADIS citizen NetCDFs (with Amendment 1 received_time)
         citizen = root / "citizen"
         for d_idx, day in enumerate(day_strs):
             day_start = START + d_idx * D
@@ -606,7 +697,6 @@ def test_track_b_end_to_end_post_T_truth_and_late_arrival_citizen_reports(tmp_pa
                 [],
                 [],
             )
-            # Two on-time reports per day: 11:50Z (before 12Z) and 23:50Z (before next day 00Z)
             for slot_h in (11, 23):
                 obs_t = day_start + slot_h * H + 50 * M
                 rec_t = obs_t + 30 * np.timedelta64(1, "s")
@@ -620,7 +710,7 @@ def test_track_b_end_to_end_post_T_truth_and_late_arrival_citizen_reports(tmp_pa
                         + meso[np.clip(hr, 0, len(meso) - 1)]
                         + rng.normal(0.0, 0.08)
                     )
-                    if perturb and obs_t > t_cut:
+                    if perturb_post and obs_t > t_cut:
                         val += 8.0
                     obs_list.append(obs_t)
                     rec_list.append(rec_t)
@@ -646,99 +736,100 @@ def test_track_b_end_to_end_post_T_truth_and_late_arrival_citizen_reports(tmp_pa
             save_table(tbl, citizen / "conus" / "2024" / f"{day}.nc", attrs={"day": day, "hours_missing": ""})
 
         manifest = qc_std.partition(citizen, 2024)
-        if perturb:
-            # Inject a late-arriving pre-T_cut citizen report (obs = T_cut - 5 min, received = T_cut + 60 s)
-            # directly into every partitioned tile .npz to exercise run_phase3_qc_loao's and
-            # load_full_resolution_streams_from_tiles's independent Amendment 1 arrival gates.
-            late_obs_ns = int((t_cut - 5 * M).astype("datetime64[ns]").astype(np.int64))
-            late_rec_ns = int((t_cut + 60 * np.timedelta64(1, "s")).astype("datetime64[ns]").astype(np.int64))
-            tiles_dir = citizen / "conus" / "2024-tiles"
-            for rel in list(manifest["parts"]):
-                part_path = tiles_dir / rel
-                with np.load(part_path) as z:
-                    d = {k: z[k] for k in z.files}
-                n_id = len(d["ident_token"])
-                extra_ident = np.arange(n_id, dtype=np.int32)
-                d["row_ident"] = np.concatenate([d["row_ident"], extra_ident])
-                d["obs_time"] = np.concatenate([d["obs_time"], np.full(n_id, late_obs_ns, dtype=np.int64)])
-                d["received_time"] = np.concatenate(
-                    [d["received_time"], np.full(n_id, late_rec_ns, dtype=np.int64)]
-                )
-                d["t2m"] = np.concatenate([d["t2m"], np.full(n_id, 315.0, dtype=np.float32)])
-                d["td2m"] = np.concatenate([d["td2m"], np.full(n_id, 305.0, dtype=np.float32)])
-                d["wind_speed"] = np.concatenate([d["wind_speed"], np.full(n_id, 2.0, dtype=np.float32)])
-                d["wind_dir"] = np.concatenate([d["wind_dir"], np.full(n_id, 90.0, dtype=np.float32)])
-                order = np.lexsort((d["obs_time"], d["row_ident"]))
-                for col in (
-                    "row_ident",
-                    "obs_time",
-                    "received_time",
-                    "t2m",
-                    "td2m",
-                    "wind_speed",
-                    "wind_dir",
-                ):
-                    d[col] = d[col][order]
-                np.savez_compressed(part_path, **d)
-                manifest["parts"][rel] = p3.sha256_file(part_path)
-            (tiles_dir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
-        trial, sites, fc = loao_qc.load_loao_inputs(root, 2024, stations_csv=stations_csv)
-        rec = loao_qc.run_record(2024, manifest, fc, stations_csv=stations_csv)
-        qc_out = citizen / "conus" / "2024-qc-loao"
-        qc_out.mkdir(parents=True)
-        (qc_out / "run.json").write_text(json.dumps(rec, indent=1) + "\n")
-        qc_loao._G.update(
-            trial=trial,
-            sites=sites,
-            forecasts=fc,
-            issues=inits,
-            tiles=citizen / "conus" / "2024-tiles",
-            out=qc_out,
-            digest=rec["digest"],
-            start=START,
-        )
-        for ordinal, name in enumerate(manifest["tiles"]):
-            qc_loao.run_tile((ordinal, name))
-        qc_loao.merge(root, 2024, stations_csv=stations_csv, min_free_bytes=0)
+        if inject_received_ns is not None:
+            manifest = _inject_report_at_cut(root, manifest, received_ns=inject_received_ns, delta_k=0.75)
+        return _run_loao_and_build(root, manifest)
 
-        return builder.build_track_b(
-            root,
-            2024,
-            issues=inits,
-            stations=sids,
-            stations_csv=stations_csv,
-            verify_extract=True,
-            run_relay_audit=True,
-            min_covered=1,
-            min_free_bytes=0,
-        )
+    def assert_pre_cut_unchanged(ref_root: Path, cmp_root: Path) -> None:
+        v0, w0 = _extract_snapshot_at_cut(ref_root)
+        v1, w1 = _extract_snapshot_at_cut(cmp_root)
+        np.testing.assert_array_equal(v0, v1)
+        np.testing.assert_array_equal(w0, w1)
+        with (
+            xr.open_zarr(ref_root / "candidates" / d2.MODEL_LOAO_BASE / "2024-01.zarr") as b0,
+            xr.open_zarr(cmp_root / "candidates" / d2.MODEL_LOAO_BASE / "2024-01.zarr") as b1,
+            xr.open_zarr(ref_root / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c0,
+            xr.open_zarr(cmp_root / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c1,
+        ):
+            pre = b0.init_time.values <= t_cut
+            assert pre.any()
+            for var in UNITS:
+                assert b0[var].values[pre].tobytes() == b1[var].values[pre].tobytes()
+                assert c0[var].values[pre].tobytes() == c1[var].values[pre].tobytes()
 
-    base_out = run_pipeline(tmp_path / "base", perturb=False)
-    pert_out = run_pipeline(tmp_path / "pert", perturb=True)
+    late_rec_ns = int((t_cut + 60 * np.timedelta64(1, "s")).astype("datetime64[ns]").astype(np.int64))
+    ontime_rec_ns = int((t_cut - 30 * np.timedelta64(1, "s")).astype("datetime64[ns]").astype(np.int64))
+
+    base_root = tmp_path / "base"
+    late_root = tmp_path / "pert_late"
+    ontime_root = tmp_path / "pert_ontime"
+    gate_off_root = tmp_path / "pert_gate_off"
+
+    base_out = run_pipeline(base_root, perturb_post=False)
+    late_out = run_pipeline(
+        late_root, perturb_post=True, inject_received_ns=late_rec_ns, shared_gefs_src=base_root / "baselines"
+    )
+    ontime_out = run_pipeline(
+        ontime_root,
+        perturb_post=False,
+        inject_received_ns=ontime_rec_ns,
+        shared_gefs_src=base_root / "baselines",
+    )
     assert base_out["build_kind"] == "full_year" and base_out["scoring_ready"] is True
-    assert pert_out["build_kind"] == "full_year" and pert_out["scoring_ready"] is True
+    assert late_out["build_kind"] == "full_year" and late_out["scoring_ready"] is True
+    assert ontime_out["build_kind"] == "full_year" and ontime_out["scoring_ready"] is True
     assert base_out["covered_loao_count"] == n_air
 
+    # 1. Negative control (gate ON): post-T_cut shifts + plausible late report leave <= T_cut identical.
+    assert_pre_cut_unchanged(base_root, late_root)
     with (
-        xr.open_zarr(tmp_path / "base" / "candidates" / d2.MODEL_LOAO_BASE / "2024-01.zarr") as b0,
-        xr.open_zarr(tmp_path / "pert" / "candidates" / d2.MODEL_LOAO_BASE / "2024-01.zarr") as b1,
-        xr.open_zarr(tmp_path / "base" / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c0,
-        xr.open_zarr(tmp_path / "pert" / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c1,
+        xr.open_zarr(base_root / "candidates" / d2.MODEL_LOAO_BASE / "2024-01.zarr") as b0,
+        xr.open_zarr(late_root / "candidates" / d2.MODEL_LOAO_BASE / "2024-01.zarr") as b1,
+        xr.open_zarr(base_root / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c0,
+        xr.open_zarr(late_root / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c1,
     ):
-        pre = b0.init_time.values <= t_cut
         post = b0.init_time.values > t_cut
-        assert pre.any() and post.any()
-        for var in UNITS:
-            assert b0[var].values[pre].tobytes() == b1[var].values[pre].tobytes()
-            assert c0[var].values[pre].tobytes() == c1[var].values[pre].tobytes()
-        # Non-vacuous check: post-T_cut perturbation actually changes post-T_cut forecasts!
+        assert post.any()
         assert b0["t2m"].values[post].tobytes() != b1["t2m"].values[post].tobytes()
         assert c0["t2m"].values[post].tobytes() != c1["t2m"].values[post].tobytes()
+
+    # 2. On-time positive control: identical plausible +0.75 K report arriving at T_cut - 30 s changes BOTH
+    #    the extracted snapshot and C2_LOAO at T_cut (proving QC accepts it and it moves the forecast).
+    v_base, _ = _extract_snapshot_at_cut(base_root)
+    v_ontime, _ = _extract_snapshot_at_cut(ontime_root)
+    assert not np.array_equal(v_base, v_ontime)
+    with (
+        xr.open_zarr(base_root / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c0,
+        xr.open_zarr(ontime_root / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c_on,
+    ):
+        at_cut = c0.init_time.values == t_cut
+        assert c0["t2m"].values[at_cut].tobytes() != c_on["t2m"].values[at_cut].tobytes()
+
+    # 3. Gate-disabled mutation check: disabling the LOAO worker's arrival predicate MUST make the
+    #    late-arrival test fail (both snapshot and C2_LOAO at T_cut diverge from base).
+    with monkeypatch.context() as mp_ctx:
+        mp_ctx.setattr(qc_loao, "arrived_by_next_issue_ns", lambda obs, rec: np.ones(len(obs), dtype=bool))
+        run_pipeline(
+            gate_off_root,
+            perturb_post=True,
+            inject_received_ns=late_rec_ns,
+            shared_gefs_src=base_root / "baselines",
+        )
+    v_off, _ = _extract_snapshot_at_cut(gate_off_root)
+    assert not np.array_equal(v_base, v_off)
+    with (
+        xr.open_zarr(base_root / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c0,
+        xr.open_zarr(gate_off_root / "candidates" / d2.MODEL_LOAO_CITIZEN / "2024-01.zarr") as c_off,
+    ):
+        at_cut = c0.init_time.values == t_cut
+        assert c0["t2m"].values[at_cut].tobytes() != c_off["t2m"].values[at_cut].tobytes()
+    with pytest.raises(AssertionError):
+        assert_pre_cut_unchanged(base_root, gate_off_root)
 
     # Default min_covered=50 must refuse scoring handoff on this 10-station build!
     with pytest.raises(builder.BuildRefusedError, match="covered_loao_count 10 < 50"):
         builder.build_track_b(
-            tmp_path / "base",
+            base_root,
             2024,
             issues=inits,
             stations=sids,
@@ -746,15 +837,13 @@ def test_track_b_end_to_end_post_T_truth_and_late_arrival_citizen_reports(tmp_pa
             verify_extract=True,
             min_free_bytes=0,
         )
-    blocked_meta = json.loads(
-        (tmp_path / "base" / "phase3-design2" / "2024" / "track_b" / "build.json").read_text()
-    )
+    blocked_meta = json.loads((base_root / "phase3-design2" / "2024" / "track_b" / "build.json").read_text())
     assert blocked_meta["scoring_ready"] is False and blocked_meta["stop_reasons"]
 
     # Privacy check: Track B metadata & relay audit never leak citizen tokens or coordinate tile labels.
     coord_tile_re = re.compile(r"[+-]\d{2,3}_[+-]\d{3,4}")
     token_re = re.compile(r"CW\d{9}")
-    meta_b = tmp_path / "base" / "phase3-design2" / "2024" / "track_b"
+    meta_b = base_root / "phase3-design2" / "2024" / "track_b"
     for fname in ("build.json", "folds.csv", "covered_stations_loao.csv", "relay_audit.json"):
         txt = (meta_b / fname).read_text()
         assert not coord_tile_re.search(txt) and not token_re.search(txt)
@@ -923,14 +1012,29 @@ def test_design1_2023_wrapper_isolated_replay_matches_reference_hashes(tmp_path)
     with pytest.raises(wrapper.BuildRefusedError, match="replay periods incomplete"):
         wrapper.verify_against_build_json(replay_jan, ref_json)
 
-    # Overlapping destination must be refused BEFORE overwriting reference build.json or live stores!
-    with pytest.raises(wrapper.BuildRefusedError, match="must not overlap"):
+    # Overlapping destination must be refused BEFORE overwriting canonical phase3/ or any existing
+    # build.json, EVEN WHEN verify_against is omitted!
+    canonical_dir = tmp_path / "phase3" / "2024"
+    canonical_dir.mkdir(parents=True)
+    canonical_json = canonical_dir / "build.json"
+    canonical_json.write_bytes(ref_bytes)
+    with pytest.raises(wrapper.BuildRefusedError, match="isolated from <data-dir>/phase3"):
+        wrapper.build_design1_arms(
+            tmp_path,
+            2024,
+            out_dir=canonical_dir,
+            stop_after_month="2024-02",
+            issues=times,
+            stations=ids,
+            verify_extract=False,
+        )
+    assert canonical_json.read_bytes() == ref_bytes
+    with pytest.raises(wrapper.BuildRefusedError, match="already contains a build.json"):
         wrapper.build_design1_arms(
             tmp_path,
             2024,
             out_dir=ref_json.parent,
             stop_after_month="2024-02",
-            verify_against=ref_json,
             issues=times,
             stations=ids,
             verify_extract=False,
@@ -1066,37 +1170,61 @@ def test_design2_causality_year_isolation_and_isolated_scratch_replay(tmp_path):
         },
     )
     builder = _load_script("build_phase3_design2")
-    # Default min_covered=50 must block scoring handoff on this 4-station fixture (1 covered)!
-    with pytest.raises(builder.BuildRefusedError, match="covered_count 1 < 50"):
+    track_a_build_json = tmp_path / "phase3-design2" / "2024" / "track_a" / "build.json"
+    # 1. Missing frozen Design 1 phase3/2024/build.json must block scoring handoff even if min_covered passes!
+    with pytest.raises(builder.BuildRefusedError, match="missing frozen Design 1"):
         builder.build_track_a(
-            tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_free_bytes=0
+            tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_covered=1, min_free_bytes=0
         )
-    blocked = json.loads((tmp_path / "phase3-design2" / "2024" / "track_a" / "build.json").read_text())
-    assert blocked["build_kind"] == "full_year" and blocked["scoring_ready"] is False
-    assert blocked["stop_reasons"] == ["covered_count 1 < 50"]
+    missing_meta = json.loads(track_a_build_json.read_text())
+    assert missing_meta["build_kind"] == "full_year" and missing_meta["scoring_ready"] is False
+    assert missing_meta["design1_covered_parity"] is False
+    expected_cov_sha = missing_meta["covered_sha256"]
 
-    # With min_covered=1, full run succeeds and records scoring_ready=True; partial replay records False.
-    full_a = builder.build_track_a(
-        tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_covered=1, min_free_bytes=0
-    )
-    assert full_a["build_kind"] == "full_year" and full_a["scoring_ready"] is True
-    assert full_a["covered_count"] == 1
-
-    # Track A 2024 COVERED parity check against frozen Design 1 phase3/2024/build.json.
+    # 2. Existing phase3/2024/build.json with missing or null covered_sha256 must ALSO block handoff!
     d1_meta = tmp_path / "phase3" / "2024"
     d1_meta.mkdir(parents=True)
+    for bad_payload in ({}, {"covered_sha256": None}, {"covered_sha256": ""}):
+        (d1_meta / "build.json").write_text(json.dumps(bad_payload))
+        with pytest.raises(builder.BuildRefusedError, match="missing or invalid covered_sha256"):
+            builder.build_track_a(
+                tmp_path,
+                2024,
+                issues=times,
+                stations=ids,
+                verify_extract=False,
+                min_covered=1,
+                min_free_bytes=0,
+            )
+        bad_meta = json.loads(track_a_build_json.read_text())
+        assert bad_meta["design1_covered_parity"] is False and bad_meta["scoring_ready"] is False
+
+    # 3. Mismatched 64-char hex covered_sha256 must block handoff!
     (d1_meta / "build.json").write_text(json.dumps({"covered_sha256": "0" * 64}))
     with pytest.raises(builder.BuildRefusedError, match="COVERED sha256 differs"):
         builder.build_track_a(
             tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_covered=1, min_free_bytes=0
         )
-    mismatch_meta = json.loads((tmp_path / "phase3-design2" / "2024" / "track_a" / "build.json").read_text())
+    mismatch_meta = json.loads(track_a_build_json.read_text())
     assert mismatch_meta["design1_covered_parity"] is False and mismatch_meta["scoring_ready"] is False
-    (d1_meta / "build.json").write_text(json.dumps({"covered_sha256": full_a["covered_sha256"]}))
-    matched = builder.build_track_a(
+
+    # 4. With valid matching Design 1 covered_sha256, default min_covered=50 still blocks (1 < 50)!
+    (d1_meta / "build.json").write_text(json.dumps({"covered_sha256": expected_cov_sha}))
+    with pytest.raises(builder.BuildRefusedError, match="covered_count 1 < 50"):
+        builder.build_track_a(
+            tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_free_bytes=0
+        )
+    blocked = json.loads(track_a_build_json.read_text())
+    assert blocked["build_kind"] == "full_year" and blocked["scoring_ready"] is False
+    assert blocked["design1_covered_parity"] is True
+    assert blocked["stop_reasons"] == ["covered_count 1 < 50"]
+
+    # 5. With valid matching covered_sha256 AND min_covered=1, full run succeeds with scoring_ready=True!
+    full_a = builder.build_track_a(
         tmp_path, 2024, issues=times, stations=ids, verify_extract=False, min_covered=1, min_free_bytes=0
     )
-    assert matched["design1_covered_parity"] is True and matched["scoring_ready"] is True
+    assert full_a["build_kind"] == "full_year" and full_a["scoring_ready"] is True
+    assert full_a["design1_covered_parity"] is True and full_a["covered_count"] == 1
 
     # Partial replay must require isolated out_root and mark scoring_ready=False.
     with pytest.raises(builder.BuildRefusedError, match="requires an isolated --out-dir"):

@@ -67,6 +67,10 @@ def check_free_space(data_dir: Path, min_free_bytes: int = STOP_FREE_BYTES) -> N
         )
 
 
+def _is_sha256_hex(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
+
+
 def _paths_overlap(a: Path, b: Path) -> bool:
     ra, rb = a.resolve(), b.resolve()
     return ra == rb or ra in rb.parents or rb in ra.parents
@@ -267,7 +271,7 @@ def load_full_resolution_streams_from_tiles(
     needed_indices: set[int],
 ) -> dict[tuple[int, str], tuple[np.ndarray, np.ndarray]]:
     """Load retained full-resolution thermal streams for ``needed_indices`` from ``<year>-tiles/``."""
-    p3.verify_tiles(tiles_dir)
+    loao_qc.verify_tiles(tiles_dir)
     start_ns = int(np.datetime64(f"{year}-01-01T00", "ns").astype(np.int64))
     key_to_idx: dict[tuple, int] = {}
     tiles_needed: set[str] = set()
@@ -426,21 +430,36 @@ def build_track_a(
         text = "station_id\n" + "".join(f"{s}\n" for s in covered)
         (meta_dir / "covered_stations_a.csv").write_text(text)
         cov_sha = hashlib.sha256(text.encode()).hexdigest()
-        ref_sha = reference_covered_sha256
-        if ref_sha is None and year == 2024:
-            d1_build = data / "phase3" / "2024" / "build.json"
-            if d1_build.is_file():
-                ref_sha = json.loads(d1_build.read_text()).get("covered_sha256")
-            elif verify_extract:
-                raise BuildRefusedError(
-                    "missing frozen Design 1 phase3/2024/build.json to verify Track A COVERED parity"
-                )
         stop_reasons = []
         if len(covered) < min_covered:
             stop_reasons.append(f"covered_count {len(covered)} < {min_covered}")
-        d1_parity = None if ref_sha is None else (cov_sha == ref_sha)
-        if d1_parity is False:
-            stop_reasons.append("Track A 2024 COVERED sha256 differs from frozen Design 1 COVERED list")
+        ref_sha: str | None = None
+        d1_parity: bool | None = None
+        if year == 2024 or reference_covered_sha256 is not None:
+            if reference_covered_sha256 is not None:
+                raw_ref: object = reference_covered_sha256
+                missing_file = False
+            else:
+                d1_build = data / "phase3" / "2024" / "build.json"
+                missing_file = not d1_build.is_file()
+                raw_ref = None if missing_file else json.loads(d1_build.read_text()).get("covered_sha256")
+            if missing_file:
+                d1_parity = False
+                stop_reasons.append(
+                    "missing frozen Design 1 phase3/2024/build.json to verify Track A COVERED parity"
+                )
+            elif not _is_sha256_hex(raw_ref):
+                d1_parity = False
+                stop_reasons.append(
+                    "missing or invalid covered_sha256 in frozen Design 1 phase3/2024/build.json"
+                )
+            else:
+                ref_sha = str(raw_ref)
+                d1_parity = cov_sha == ref_sha
+                if not d1_parity:
+                    stop_reasons.append(
+                        "Track A 2024 COVERED sha256 differs from frozen Design 1 COVERED list"
+                    )
         out.update(
             build_kind="full_year",
             n_issues=i,

@@ -209,7 +209,7 @@ def run(
     check_free_space(data_dir, min_free_bytes)
     citizen = data_dir / "citizen" / "conus"
     tiles_dir = citizen / f"{year}-tiles"
-    manifest = p3.verify_tiles(tiles_dir)
+    manifest = loao.verify_tiles(tiles_dir)
     start = np.datetime64(f"{year}-01-01T00", "ns")
     issues = loao.issue_times(year)
     t0 = time.monotonic()
