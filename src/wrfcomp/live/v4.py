@@ -31,6 +31,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -366,37 +367,41 @@ def _hour(t) -> str:
     return str(np.datetime_as_string(np.datetime64(t, "ns"), unit="h"))
 
 
-def _manifest_path(root: Path, t) -> Path:
-    return issue_dir(root, t) / "inputs.json"
-
-
 def published_issues(root: Path, year: int) -> dict:
-    """Every issue of ``year`` that has a pinned manifest, by issue time. Those issues are immutable."""
+    """Every published issue of ``year`` by issue time. An issue is published only once its whole
+    folder (``inputs.json``, ``v4.zarr``, ``v4.sha256``, ``build.json``) has been moved into place
+    in one rename; a published issue is immutable. Staging folders (``.staging/``) are never
+    published issues."""
     out = {}
-    for path in sorted(root.glob(f"{year:04d}-??-??T??Z/inputs.json")):
-        manifest = json.loads(safe(root, path).read_text())
+    for path in sorted(root.glob(f"{year:04d}-??-??T??Z/build.json")):
+        manifest = json.loads(safe(root, path.with_name("inputs.json")).read_text())
         out[np.datetime64(manifest["init"], "ns")] = manifest
     return out
 
 
-def pin_fetches(root: Path, t: np.datetime64, started: np.datetime64) -> dict:
-    """The METAR fetches issue ``t`` may see: those made at or before its cutoff, the earlier of the
-    build start and ``t`` + 24 h. If none of them was made 15 minutes or more after ``t`` (a delayed
-    first build), it is a retrospective backfill: the fetches up to the first one made 15 minutes or
-    more after ``t``, and nothing later, flagged as such."""
+def fetch_snapshot(root: Path, started: np.datetime64) -> list[tuple[np.datetime64, Path]]:
+    """The METAR fetches available at build start, taken ONCE: files already linked into place (a
+    fetch is linked only after it completes) whose completion time is at or before the start. A fetch
+    still in flight at the start, or completed after it, is never part of this build."""
+    return [(metar.fetch_time(f), f) for f in metar.stored(root / "metar") if metar.fetch_time(f) <= started]
+
+
+def pin_fetches(root: Path, t: np.datetime64, started: np.datetime64, snapshot) -> dict:
+    """The METAR fetches issue ``t`` may see, from the build-start snapshot: those completed by its
+    cutoff, the earlier of the build start and ``t`` + 24 h. If none of them completed 15 minutes or
+    more after ``t`` (a delayed first build), it is a retrospective backfill: the fetches up to the
+    first one completed 15 minutes or more after ``t``, and nothing later, flagged as such."""
     cutoff = min(started, t + AUTHORIZED_WINDOW)
-    stored = [(metar.fetch_time(f), f) for f in metar.stored(root / "metar")]
-    stored = [(when, f) for when, f in stored if when <= started]
-    final = [when for when, _ in stored if when >= t + metar.CLOSE_AFTER]
+    final = [when for when, _ in snapshot if when >= t + metar.CLOSE_AFTER]
     if not final:
         raise LiveRefusedError(f"no METAR fetch 15 minutes or more after {_hour(t)}; readings not final")
     backfill = min(final) > cutoff
     if backfill:
         cutoff = min(final)
-    chosen = [f for when, f in stored if when <= cutoff]
+    chosen = [f for when, f in snapshot if when <= cutoff]
     return {
-        "build_started": _iso(started),
-        "fetch_cutoff": _iso(cutoff),
+        "build_started": str(np.datetime_as_string(started, unit="us")),
+        "fetch_cutoff": str(np.datetime_as_string(cutoff, unit="us")),
         "retrospective_backfill": bool(backfill),
         "metar": [{"file": f.name, "sha256": _sha256(safe(root, f))} for f in chosen],
     }
@@ -414,23 +419,30 @@ def _check_manifest_inputs(root: Path, manifest: dict, raw_hash: str | None) -> 
 def build_issue(t, data: Path | None = None, *, now=None) -> dict:
     """Build the live v4 store for issue ``t``.
 
-    Published issues (those with an ``inputs.json``) are immutable: their manifest pins their METAR
-    fetches and the ordered GEFS history they were replayed over, gaps included. A new issue extends
-    the history of the latest published issue before it with the kept cycles after that issue, in
-    order; a cycle that arrives late (before the latest published issue) is ignored and recorded, and
-    a pinned cycle that is missing or changed is refused. Every published issue on the way must
-    reproduce its published store exactly, or the build is refused."""
+    Published issues are immutable: their manifest pins their METAR fetches and the ordered GEFS
+    history they were replayed over, gaps included. A new issue extends the history of the latest
+    published issue with the kept cycles after it, in order. Refused: an issue older than an already
+    published one (a gap can never be filled in later); a pinned cycle that is missing or changed; a
+    published store that does not reproduce. Each new issue is assembled in a staging folder and moved
+    into place in one rename only after its store is built; a failed build publishes nothing for the
+    issue it failed on and leaves no pin behind."""
     root = live_root(data)
     t = check_issue(t)
     year = pd.Timestamp(t).year
     started = _now() if now is None else np.datetime64(now, "ns")
     policy = LiveYear(year)
     with _lock(root, "build"):
-        return _build(root, t, year, started, policy)
+        snapshot = fetch_snapshot(root, started)
+        return _build(root, t, year, started, snapshot, policy)
 
 
-def _build(root, t, year, started, policy) -> dict:
-    published = {c: m for c, m in published_issues(root, year).items() if c <= t}
+def _build(root, t, year, started, snapshot, policy) -> dict:
+    every = published_issues(root, year)
+    if t not in every and any(p > t for p in every):
+        raise LiveRefusedError(
+            f"{_hour(t)} is older than an already published issue; a gap can never be filled in"
+        )
+    published = {c: m for c, m in every.items() if c <= t}
     kept = {_stem_time(p): p for p in kept_cycles(root, t)}
     if t in published:
         latest, new = t, []
@@ -458,24 +470,20 @@ def _build(root, t, year, started, policy) -> dict:
         expected = [h["gefs_sha256"] for h in published[c]["history"]]
         if expected != [hashes[np.datetime64(h["init"], "ns")] for h in published[c]["history"]]:
             raise LiveRefusedError(f"the GEFS history pinned by {_hour(c)} has changed")
-    manifests = dict(published)
     order = chain + new
-    for k, c in enumerate(new):
+    manifests = dict(published)
+    for k, c in enumerate(new):  # in memory only, until the issue is published
         history = order[: len(chain) + k]
         grid = np.arange(history[0], c, 12 * HOUR) if history else np.array([], "datetime64[ns]")
-        manifest = {
+        manifests[c] = {
             "init": _hour(c),
             "gefs_sha256": hashes[c],
             "history": [{"init": _hour(h), "gefs_sha256": hashes[h]} for h in history],
             "missing_cycles": [_hour(g) for g in grid if g not in set(history)],
             "ignored_late_cycles": ignored,
-            **pin_fetches(root, c, started),
+            **pin_fetches(root, c, started, snapshot),
             "truth_source": metar.API,
         }
-        with _lock(root, _hour(c)):
-            if not _publish_once(root, _manifest_path(root, c), json.dumps(manifest, indent=1) + "\n"):
-                raise LiveRefusedError(f"issue {_hour(c)} was published by another writer meanwhile")
-        manifests[c] = manifest
 
     site, icaos = stations(), icao_map()
     start = np.datetime64(f"{year:04d}-01-01T00", "ns")
@@ -502,51 +510,73 @@ def _build(root, t, year, started, policy) -> dict:
     for c, _, b, diag in replay([raws[c] for c in order], truth_for, year, policy):
         issues.append({"init": diag.init, "phi": diag.phi, "own_defined": diag.own_defined})
         with _lock(root, _hour(c)):
-            record = _publish(root, policy, c, b, manifests[c], order[0], issues)
+            if c in published:
+                record = _verify_published(root, c, b)
+            else:
+                record = _publish_new(root, policy, c, b, manifests[c], order[0], issues)
         if c == t:
             result = record
     return result
 
 
-def _publish(root, policy, c, store, manifest, first, issues) -> dict:
-    out_dir = issue_dir(root, c)
-    dest = safe(root, out_dir / "v4.zarr")
+def _clean_store(store):
     for var in store.variables.values():
         var.encoding.clear()
-    if dest.exists():
-        with xr.open_zarr(dest, chunks=None) as previous:
-            try:
-                xr.testing.assert_identical(store, previous.load())
-            except AssertionError as exc:
-                raise LiveRefusedError(f"published issue {_hour(c)} does not reproduce; refused") from exc
-    else:
-        policy.write(store, dest)
-    with xr.open_zarr(dest, chunks=None) as saved:
-        digest = content_sha256(saved)
-    sha_line = f"{digest}  v4.zarr\n"
-    if (
-        not _publish_once(root, out_dir / "v4.sha256", sha_line)
-        and (out_dir / "v4.sha256").read_text() != sha_line
-    ):
-        raise LiveRefusedError(f"issue {_hour(c)} has another published hash")
-    record = {
-        "init": manifest["init"],
-        "model_id": store.attrs["model_id"],
-        "model_version": store.attrs["model_version"],
-        "candidate": "v4 = v3 + the airport's own reading (frozen Phase 3 arm B), live inputs",
-        "content_sha256": digest,
-        "store": dest.name,
-        **code_state(),
-        "frozen_sources_sha256": policy.sources,
-        "live_start": _hour(first),
-        "missing_cycles": manifest["missing_cycles"],
-        "retrospective_backfill": manifest["retrospective_backfill"],
-        "inputs": "inputs.json",
-        "issues": list(issues),
-    }
-    build = out_dir / "build.json"
-    _publish_once(root, build, json.dumps(record, indent=1) + "\n")
-    saved_record = json.loads(safe(root, build).read_text())
-    if saved_record["content_sha256"] != digest:
-        raise LiveRefusedError(f"{build} records another store")
-    return saved_record
+    return store
+
+
+def _verify_published(root, c, store) -> dict:
+    """A published issue must reproduce its store exactly; nothing in its folder is written."""
+    out_dir = issue_dir(root, c)
+    dest = safe(root, out_dir / "v4.zarr")
+    with xr.open_zarr(dest, chunks=None) as previous:
+        try:
+            xr.testing.assert_identical(_clean_store(store), previous.load())
+        except AssertionError as exc:
+            raise LiveRefusedError(f"published issue {_hour(c)} does not reproduce; refused") from exc
+        digest = content_sha256(previous)
+    record = json.loads(safe(root, out_dir / "build.json").read_text())
+    if record["content_sha256"] != digest or (out_dir / "v4.sha256").read_text() != f"{digest}  v4.zarr\n":
+        raise LiveRefusedError(f"published issue {_hour(c)} records another store")
+    return record
+
+
+def _publish_new(root, policy, c, store, manifest, first, issues) -> dict:
+    """Assemble the whole issue folder in ``.staging/`` and move it into place in one rename. On any
+    failure the staging folder is removed and nothing of the issue is published."""
+    final = safe(root, issue_dir(root, c))
+    if final.exists():
+        raise LiveRefusedError(f"{final.name} exists but is not a published issue; remove it by hand")
+    staging_root = safe(root, root / ".staging")
+    staging_root.mkdir(exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=staging_root, prefix=f"{final.name}."))
+    try:
+        metar.publish_file(staging / "inputs.json", json.dumps(manifest, indent=1) + "\n")
+        dest = staging / "v4.zarr"
+        policy.write(_clean_store(store), dest)
+        with xr.open_zarr(dest, chunks=None) as saved:
+            digest = content_sha256(saved)
+        metar.publish_file(staging / "v4.sha256", f"{digest}  v4.zarr\n")
+        record = {
+            "init": manifest["init"],
+            "model_id": store.attrs["model_id"],
+            "model_version": store.attrs["model_version"],
+            "candidate": "v4 = v3 + the airport's own reading (frozen Phase 3 arm B), live inputs",
+            "content_sha256": digest,
+            "store": dest.name,
+            **code_state(),
+            "frozen_sources_sha256": policy.sources,
+            "live_start": _hour(first),
+            "missing_cycles": manifest["missing_cycles"],
+            "retrospective_backfill": manifest["retrospective_backfill"],
+            "inputs": "inputs.json",
+            "issues": list(issues),
+        }
+        metar.publish_file(staging / "build.json", json.dumps(record, indent=1) + "\n")
+        if final.exists() or final.is_symlink():
+            raise LiveRefusedError(f"{final.name} appeared during the build; refused")
+        os.rename(staging, final)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return record

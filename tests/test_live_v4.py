@@ -412,15 +412,15 @@ def test_fetch_batches_and_stores_append_only(tmp_path):
 
     now = datetime(2026, 12, 2, 4, 30, tzinfo=UTC)
     icaos = [f"K{i:03d}" for i in range(250)]
-    path, received = metar.fetch(tmp_path / "metar", icaos, 30, now=now, get=get)
+    path, received = metar.fetch(tmp_path / "metar", icaos, 30, clock=lambda: now, get=get)
     assert len(asked) == 3 and all("hours=30" in u and u.startswith(metar.API) for u in asked)
-    assert path.name == "20261202T043000Z.json" and received > 0
+    assert path.name == "20261202T043000.000000Z.json" and received > 0
     assert len(json.loads(path.read_text())["reports"]) == 3
     assert metar.fetch_time(path) == np.datetime64("2026-12-02T04:30:00", "ns")
     with pytest.raises(FileExistsError):
-        metar.fetch(tmp_path / "metar", icaos, 30, now=now, get=get)
+        metar.fetch(tmp_path / "metar", icaos, 30, clock=lambda: now, get=get)
     with pytest.raises(ValueError):
-        metar.fetch(tmp_path / "metar", icaos, 49, now=now, get=get)
+        metar.fetch(tmp_path / "metar", icaos, 49, clock=lambda: now, get=get)
 
 
 def _raw_report(icao, when, values):
@@ -783,15 +783,15 @@ def test_a_delayed_first_build_sees_only_fetches_inside_each_issues_window(live_
     pinned_last = json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
     assert [m["file"] for m in pinned_earlier["metar"]] == [original.name]
     assert not pinned_earlier["retrospective_backfill"]
-    assert pinned_earlier["fetch_cutoff"] == _iso(earlier + 24 * H)
+    assert pinned_earlier["fetch_cutoff"] == _us(earlier + 24 * H)
     assert [m["file"] for m in pinned_last["metar"]] == [original.name, late.name]
     # The 1 March issue's only final fetch is 20 days later: a flagged backfill, cut at that fetch.
     assert first["retrospective_backfill"] and [m["file"] for m in first["metar"]] == [original.name]
-    assert first["fetch_cutoff"] == _iso(metar.fetch_time(original))
+    assert first["fetch_cutoff"] == _us(metar.fetch_time(original))
 
 
-def _iso(t):
-    return str(np.datetime_as_string(np.datetime64(t, "ns"), unit="s"))
+def _us(t):
+    return str(np.datetime_as_string(np.datetime64(t, "ns"), unit="us"))
 
 
 def test_a_fetch_made_after_the_build_started_is_never_pinned(live_world):
@@ -800,7 +800,7 @@ def test_a_fetch_made_after_the_build_started_is_never_pinned(live_world):
     live.build_issue(last, data, now=last + 5 * H)
     pinned = json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
     assert future.name not in [m["file"] for m in pinned["metar"]]
-    assert pinned["build_started"] == _iso(last + 5 * H)
+    assert pinned["build_started"] == _us(last + 5 * H)
 
 
 def test_a_late_gefs_cycle_never_enters_a_published_history(live_world):
@@ -857,7 +857,10 @@ def test_a_published_issue_that_does_not_reproduce_is_refused(live_world):
     POLICY_2026.write(other, store)
     with pytest.raises(LiveRefusedError, match="does not reproduce"):
         live.build_issue(last, data)
-    assert not (live.issue_dir(root, last) / "v4.zarr").exists()
+    # A failed prefix check leaves no pin, hash, store or build record for the next issue.
+    assert not live.issue_dir(root, last).exists()
+    assert not any((root / ".staging").iterdir()) if (root / ".staging").exists() else True
+    assert last not in live.published_issues(root, 2026)
 
 
 def test_publish_file_never_replaces_and_leaves_no_staging(tmp_path):
@@ -872,11 +875,10 @@ def test_publish_file_never_replaces_and_leaves_no_staging(tmp_path):
         metar.publish_file(tmp_path / "linked" / "x.json", "x\n")
 
 
-def test_an_interrupted_build_resumes_from_its_pins(live_world, monkeypatch):
+def test_an_interrupted_build_publishes_nothing_for_that_issue_and_reruns_cleanly(live_world, monkeypatch):
     data, root, raws, last = live_world
-    out = live.issue_dir(root, last)
-    out.mkdir(parents=True)
-    (out / ".inputs.json.leftover.staging").write_text("half")  # a crashed writer's staging file
+    (root / ".staging" / "2026-03-20T12Z.crashed").mkdir(parents=True)  # a crashed writer's leftovers
+    (root / ".staging" / "2026-03-20T12Z.crashed" / "inputs.json").write_text("half")
     calls = {"n": 0}
     original = LiveYear.write
 
@@ -889,12 +891,13 @@ def test_an_interrupted_build_resumes_from_its_pins(live_world, monkeypatch):
     monkeypatch.setattr(LiveYear, "write", crash_on_last)
     with pytest.raises(OSError, match="power cut"):
         live.build_issue(last, data)
-    manifest = (out / "inputs.json").read_bytes()
-    assert not (out / "v4.zarr").exists()
-    _write_fetch([], root / "metar", _stamp(last + 5 * H))  # newer fetch: must not change the pin
+    assert not live.issue_dir(root, last).exists() and last not in live.published_issues(root, 2026)
+    assert last - 12 * H in live.published_issues(root, 2026)  # earlier issues completed and stand
+    assert [p.name for p in (root / ".staging").iterdir()] == ["2026-03-20T12Z.crashed"]
     record = live.build_issue(last, data)
-    assert (out / "inputs.json").read_bytes() == manifest
+    out = live.issue_dir(root, last)
     assert (out / "v4.sha256").read_text() == f"{record['content_sha256']}  v4.zarr\n"
+    assert sorted(p.name for p in out.iterdir()) == ["build.json", "inputs.json", "v4.sha256", "v4.zarr"]
 
 
 def test_concurrent_builds_keep_one_intact_manifest_inside_the_live_tree(live_world):
@@ -919,7 +922,8 @@ def test_concurrent_builds_keep_one_intact_manifest_inside_the_live_tree(live_wo
         for name in dirs + files:
             path = Path(here) / name
             assert not path.is_symlink() and path.resolve().is_relative_to(root.resolve())
-            assert not name.endswith(".staging")
+            assert not name.endswith(".staging") or path == root / ".staging"
+    assert not any((root / ".staging").iterdir())
     json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
 
 
@@ -940,3 +944,61 @@ def test_fetch_cycle_refuses_a_link_inside_the_gefs_cache(tmp_path, monkeypatch)
     with pytest.raises(LiveRefusedError, match="linked path"):
         live.fetch_cycle(root, np.datetime64("2026-12-02T00", "ns"), policy=LiveYear(2026))
     assert not any((tmp_path / "elsewhere").iterdir())
+
+
+# -- round 3 regressions -------------------------------------------------------------------------
+
+
+def test_a_fetch_in_flight_at_build_start_is_never_pinned(live_world, monkeypatch):
+    """A fetch is in flight when the build starts and completes during the build, 0.4 s after it
+    started (same second), its name stamped before the build start. It is not pinned."""
+    data, root, raws, last = live_world
+    start = last + 5 * H + np.timedelta64(500, "ms")
+    x = pd.Timestamp(last + 5 * H).tz_localize("UTC").to_pydatetime()
+    times = iter([x, x + pd.Timedelta(milliseconds=400)])
+    correction = [
+        _raw_report(icao, last - 7 * M, {"t2m": 290.0, "td2m": 280.0, "msl": 100000.0}) for icao in ICAO
+    ]
+    landed = []
+    original = live.kept_cycles
+
+    def fetch_lands_mid_build(root_, t_):
+        if not landed:  # after the build's snapshot, before any issue is pinned
+            path, _ = metar.fetch(
+                root / "metar",
+                ICAO,
+                30,
+                clock=lambda: next(times),
+                get=lambda url: json.dumps(correction).encode(),
+            )
+            landed.append(path)
+        return original(root_, t_)
+
+    monkeypatch.setattr(live, "kept_cycles", fetch_lands_mid_build)
+    live.build_issue(last, data, now=start)
+    assert landed and metar.fetch_time(landed[0]) < start  # its name is before the build start
+    pinned = json.loads((live.issue_dir(root, last) / "inputs.json").read_text())
+    assert landed[0].name not in [m["file"] for m in pinned["metar"]]
+
+
+def test_fetch_snapshot_uses_completion_time_to_the_microsecond(live_world):
+    data, root, raws, last = live_world
+    start = last + 5 * H + np.timedelta64(200, "ms")
+    same_second = root / "metar" / f"{pd.Timestamp(start + np.timedelta64(200, 'ms')):%Y%m%dT%H%M%S.%fZ}.json"
+    same_second.write_text(json.dumps({"reports": []}))
+    names = [f.name for _, f in live.fetch_snapshot(root, start)]
+    assert same_second.name not in names and len(names) == 1
+
+
+def test_a_gap_can_never_be_filled_after_a_later_issue_is_published(live_world):
+    data, root, raws, last = live_world
+    gap = raws[-4].init_time.values[0]
+    kept = live.raw_path(root, gap)
+    shutil.move(kept, kept.with_name("away.zarr"))
+    live.build_issue(last - 12 * H, data)
+    shutil.move(kept.with_name("away.zarr"), kept)  # the cycle is restored
+    with pytest.raises(LiveRefusedError, match="gap can never be filled"):
+        live.build_issue(gap, data)
+    assert not live.issue_dir(root, gap).exists()
+    record = live.build_issue(last, data)
+    assert _hour(gap) in record["missing_cycles"]

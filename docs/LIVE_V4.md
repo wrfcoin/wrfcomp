@@ -62,26 +62,34 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
 
 ## What each issue saw is frozen
 
-- **Fetch window.** An issue at T may see only METAR fetches made at or before its cutoff: the
-  earlier of its build start and T + 24 h. The daily run builds the 00Z issue at about T + 4.5 h and
-  the previous 12Z issue at about T + 16.5 h, both inside the window. If no fetch made 15 minutes or
-  more after T exists by then (a delayed first build), the issue is a **retrospective backfill**: it
-  sees the fetches up to the first one made 15 minutes or more after T and nothing later, and its
-  manifest says `"retrospective_backfill": true`.
-- **Manifest.** When an issue is first built, `inputs.json` records the build start, the fetch
-  cutoff, the pinned METAR fetches (name and sha256), its GEFS cycle's hash, and the ordered GEFS
-  history it is replayed over (every earlier cycle with its hash, gaps listed as `missing_cycles`).
-- **Published issues are immutable.** An issue with an `inputs.json` is never changed. A new issue
-  extends the history of the latest published issue with the kept cycles after it, in order. A cycle
-  that arrives after a later issue was published is ignored and listed as `ignored_late_cycles`. A
-  pinned cycle or fetch that is missing or changed is refused. Each replay must reproduce every
-  published store exactly, or the build stops and nothing new is published.
+- **When a fetch counts.** A METAR fetch file is named by its completion time, to the microsecond,
+  and is linked into place only after it completes. Each build takes one snapshot at its start: the
+  fetch files already in place whose completion time is at or before the start. A fetch still in
+  flight at the start, or completed after it (also later in the same second), is never part of that
+  build.
+- **Fetch window.** From that snapshot, an issue at T sees only fetches completed by its cutoff: the
+  earlier of the build start and T + 24 h. The daily run builds the 00Z issue at about T + 4.5 h and
+  the previous 12Z issue at about T + 16.5 h, both inside the window. If no fetch completed 15 minutes
+  or more after T is inside the window (a delayed first build), the issue is a **retrospective
+  backfill**: it sees the fetches up to the first one completed 15 minutes or more after T and
+  nothing later, and its manifest says `"retrospective_backfill": true`.
+- **Manifest.** `inputs.json` records the build start, the fetch cutoff, the pinned METAR fetches
+  (name and sha256), the issue's GEFS cycle hash, and the ordered GEFS history it is replayed over
+  (every earlier cycle with its hash, gaps listed as `missing_cycles`).
+- **Publication is all or nothing.** A new issue is assembled in `live/.staging/` (manifest, store,
+  hash, `build.json`) and moved into place in one rename after its store is built. Only issue folders
+  in place are published. A failed build publishes nothing for the issue it failed on and leaves no
+  pin; a crashed run can leave a folder under `.staging/`, which is never read.
+- **Published issues are immutable.** A new issue extends the history of the latest published issue
+  with the kept cycles after it, in order. A cycle that arrives after a later issue was published is
+  ignored and listed as `ignored_late_cycles`, and **an issue older than an already published one is
+  refused: a gap can never be filled in later.** A pinned cycle or fetch that is missing or changed is
+  refused. Each build replays every published issue on the way and must reproduce its store exactly;
+  otherwise it stops before anything new is published.
 - **Writing.** One build at a time (`live/locks/build.lock`) and one writer per issue
   (`live/locks/<issue>.lock`); a second writer is refused, not queued, and the locks are released
-  when the process ends. Every file is staged under an exclusive temporary name in its own folder and
-  linked into place atomically without replacing anything; a store folder is staged and renamed into
-  place. Leftover staging files from an interrupted run are ignored, and the run resumes from the
-  pins already written.
+  when the process ends. Every file is staged under an exclusive temporary name and linked into place
+  without replacing anything.
 
 ## Learned state (v2 regression, v3 pressure gain, v4 own-reading gain)
 

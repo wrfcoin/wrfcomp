@@ -64,6 +64,7 @@ MAX_HOURS = 48
 VARIABLES = ("t2m", "td2m", "u10", "v10", "msl")
 KNOT = 0.514444
 CLOSE_AFTER = np.timedelta64(15, "m")
+STAMP = "%Y%m%dT%H%M%S.%fZ"  # fetch file names: completion time, microseconds
 MAX_WIND_MS = 90.0  # ISD's limit (900 tenths of m/s)
 SLP_RANGE_HPA = (850.0, 1090.0)
 TEMP_RANGE_C = (-80.0, 60.0)
@@ -152,16 +153,18 @@ def fetch(
     icaos: list[str],
     hours: int,
     *,
-    now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
     get: Callable[[str], bytes] = _http_get,
 ) -> tuple[Path, int]:
     """Fetch the last ``hours`` of reports for ``icaos`` and store them as one append-only file.
 
-    Returns the file and the payload bytes received (decompressed size is not counted twice)."""
+    The file is named by its COMPLETION time, to the microsecond, taken after the last response and
+    before the file is linked into place: a fetch is available from that moment, never earlier.
+    Returns the file and the payload bytes received."""
     if not 1 <= hours <= MAX_HOURS:
         raise ValueError(f"hours must be 1..{MAX_HOURS}")
-    now = datetime.now(UTC) if now is None else now
-    stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    clock = clock or (lambda: datetime.now(UTC))
+    started = clock().astimezone(UTC)
     reports, received = [], 0
     for i in range(0, len(icaos), BATCH):
         query = urlencode({"ids": ",".join(icaos[i : i + BATCH]), "format": "json", "hours": hours})
@@ -171,8 +174,16 @@ def fetch(
         if not isinstance(batch, list):
             raise ValueError("unexpected METAR API response")
         reports.extend(batch)
+    completed = clock().astimezone(UTC)
+    stamp = completed.strftime(STAMP)
     path = directory / f"{stamp}.json"
-    body = {"source": API, "fetched_at": stamp, "hours": hours, "reports": reports}
+    body = {
+        "source": API,
+        "started_at": started.strftime(STAMP),
+        "completed_at": stamp,
+        "hours": hours,
+        "reports": reports,
+    }
     publish_file(path, json.dumps(body, sort_keys=True) + "\n")
     return path, received
 
@@ -197,7 +208,9 @@ def publish_file(path: Path, text: str) -> None:
 
 
 def fetch_time(path: Path) -> np.datetime64:
-    return np.datetime64(datetime.strptime(path.stem, "%Y%m%dT%H%M%SZ"), "ns")
+    """When a fetch became available (its completion time, from its name)."""
+    form = STAMP if "." in path.stem else "%Y%m%dT%H%M%SZ"
+    return np.datetime64(datetime.strptime(path.stem, form), "ns")
 
 
 def stored(directory: Path) -> list[Path]:
