@@ -63,10 +63,26 @@ maintainer. Changes to the harness were reviewed by an agent from a different pr
 locked changes need the project owner's approval on the exact commit. Pull request comments are posted
 through the maintainer's GitHub account, so a comment's author is not always the person who wrote it.
 
-## Data
+## How to get the scoring data
 
 Downloaded data lives outside the repo (default `~/wrfcomp-data/`, override with `WRFCOMP_DATA_DIR`).
 Never commit data files.
+
+To score a candidate locally against the locked harness (`scripts/check_promotion.py`), download the
+per-year scoring data bundle from Zenodo (truth, p95 tail thresholds, and the pinned monthly and
+quarterly climatology and GEFS reference stores — no citizen data and no sealed 2025+ data):
+
+```bash
+uv run python -P scripts/fetch_scoring_data.py \
+  --url <ZENODO_RECORD_URL> \
+  --expected-sha256 <ARCHIVE_SHA256> \
+  --year 2024
+```
+
+`scripts/fetch_scoring_data.py` verifies every unpacked file against both the archive's
+`MANIFEST.json` and the pinned content hashes in `experiments/REFERENCES.json` before installing
+into `$WRFCOMP_DATA_DIR`. See [docs/SCORING_DATA.md](docs/SCORING_DATA.md) for bundle contents,
+rebuilding instructions (`scripts/build_scoring_bundle.py`), data sources, and licensing.
 
 ## License
 
