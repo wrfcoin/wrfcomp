@@ -25,8 +25,8 @@ for that year:
 
 ```bash
 uv run python -P scripts/fetch_scoring_data.py \
-  --url <ZENODO_RECORD_URL> \
-  --expected-sha256 <ARCHIVE_SHA256> \
+  --url https://zenodo.org/records/24520171 \
+  --expected-sha256 108e36f91d4400d1b4d94e964f51c6c70a1a471a20a02825c6c3eae047d19605 \
   --year 2024
 ```
 
@@ -126,5 +126,5 @@ uv run python -P scripts/build_scoring_bundle.py --year 2024
 
 | Year | Status | Pinned periods in `experiments/REFERENCES.json` | Zenodo URL |
 | --- | --- | --- | --- |
-| `2024` | Bundle built; awaiting owner Zenodo upload | `2024-01`..`2024-12`, `2024-Q1`..`2024-Q4` (34 datasets) | *Pending owner upload* |
-| `2023` | Planned after 2023 references are pinned | — | — |
+| `2024` | Published 2024-11-24; verified by installing from the record and reproducing the published v3 2024 scorecards byte for byte | `2024-01`..`2024-12`, `2024-Q1`..`2024-Q4` (34 datasets) | [doi:10.5281/zenodo.24520171](https://doi.org/10.5281/zenodo.24520171) |
+| `2023` | References pinned (#40); bundle not built yet | `2023-Q1`..`2023-Q4` | — |

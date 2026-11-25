@@ -81,13 +81,13 @@ Downloaded data lives outside the repo (default `~/wrfcomp-data/`, override with
 Never commit data files.
 
 To score a candidate locally against the locked harness (`scripts/check_promotion.py`), download the
-per-year scoring data bundle from Zenodo (truth, p95 tail thresholds, and the pinned monthly and
+per-year scoring data bundle from Zenodo ([doi:10.5281/zenodo.24520171](https://doi.org/10.5281/zenodo.24520171) for 2024; truth, p95 tail thresholds, and the pinned monthly and
 quarterly climatology and GEFS reference stores — no citizen data and no sealed 2025+ data):
 
 ```bash
 uv run python -P scripts/fetch_scoring_data.py \
-  --url <ZENODO_RECORD_URL> \
-  --expected-sha256 <ARCHIVE_SHA256> \
+  --url https://zenodo.org/records/24520171 \
+  --expected-sha256 108e36f91d4400d1b4d94e964f51c6c70a1a471a20a02825c6c3eae047d19605 \
   --year 2024
 ```
 
