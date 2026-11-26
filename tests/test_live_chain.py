@@ -150,7 +150,13 @@ def published(_published_world, tmp_path, monkeypatch):
     cli.write_text(FAKE_CLI.format(python=sys.executable, state=str(state)))  # fixed: its hash is pinned
     cli.chmod(0o700)
     monkeypatch.setenv("WRFCOMP_DATA_DIR", str(data))
-    return data, root, last, key, cli
+    yield data, root, last, key, cli
+    # each copy is many small zarr files; pytest keeps three runs of temp folders, so drop the copy
+    # (on a tmpfs /tmp the inode count, not the size, is the limit)
+    for path in sorted(data.rglob("*"), reverse=True):
+        if path.is_dir() and not path.is_symlink():
+            path.chmod(0o700)
+    shutil.rmtree(data, ignore_errors=True)
 
 
 def _prepare(root, t, key, cli, **kw):
@@ -304,10 +310,12 @@ else:
         os.kill(os.getppid(), 9)  # the script dies between its claim and the send
         sys.exit(9)
     from urllib.request import urlopen
-    with urlopen(opts["node-url"] + "/network/info") as response:  # the tip at the moment of the send
+    fake_node = (state / "node_url").read_text()  # the test's fake node; no other destination
+    assert fake_node.startswith("http://127.0.0.1:"), fake_node
+    with urlopen(fake_node + "/network/info") as response:  # the tip at the moment of the send
         tip = json.loads(response.read())["chain_height"]
     with (state / "send_tips.log").open("a") as fh:
-        fh.write(f"{{kind}} {{tip}}\n")
+        fh.write(f"{{kind}} {{tip}} {{fake_node}}\n")
     failures = state / f"failed_{{kind}}"
     failed = int(failures.read_text()) if failures.exists() else 0
     if failed < behaviour.get("fail_send", {{}}).get(kind, 0):
@@ -527,6 +535,7 @@ def _run_submit(published, tmp_path, *, mode=None, node=None, **cli_kw):
     cli = tmp_path / "bin" / "wrfcoin"
     (state / "cli_options.json").write_text(json.dumps(cli_kw))
     node = node or FakeNode(state, t)
+    (state / "node_url").write_text(node.url)
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir(exist_ok=True)
     (shim_dir / "uv").write_text(UV_SHIM.format(python=sys.executable, node=node.url, state=str(state)))
@@ -574,7 +583,8 @@ def _no_token_anywhere(result, out, state):
     helper_envs = log.read_text().splitlines() if log.exists() else []
     # helper steps run without the bearer; only record gets it, as the reader token
     assert helper_envs and all(
-        line == ("record ['WRFCOIN_READER_TOKEN']" if line.startswith("record ") else line.split()[0] + " []")
+        line
+        == ("record ['WRFCOIN_OPERATOR_TOKEN']" if line.startswith("record ") else line.split()[0] + " []")
         for line in helper_envs
     )
 
@@ -1191,7 +1201,8 @@ def test_reveal_retries_stop_once_the_window_has_passed(published, tmp_path):
     assert len(_broadcasts(calls, "reveal")) >= 2 and _sent(node.state, "reveal") == 0
     assert not (out / "receipt.json").exists()
     tips = [line.split() for line in (node.state / "send_tips.log").read_text().splitlines()]
-    reveal_tips = [int(tip) for kind, tip in tips if kind == "reveal"]
+    assert {url for *_, url in tips} == {node.url}  # every send height came from the same fake chain
+    reveal_tips = [int(tip) for kind, tip, _ in tips if kind == "reveal"]
     assert len(reveal_tips) >= 2 and all(tip + 1 <= COMMIT_HEIGHT + 3 for tip in reveal_tips)
 
 
@@ -1347,7 +1358,7 @@ def _sent_issue(published):
     _prepare(root, t, key, cli)
     out = chain.chain_dir(root, t)
     record = json.loads((out / "commit.json").read_text())
-    chain.freeze_reveal(out)
+    (chain.freeze_reveal(out) / "sending").mkdir()
     for kind in ("commit", "reveal"):
         result = {"commit_id": record["commit_id"], "tx_id": TX_IDS[kind]}
         (out / f"{kind}_result.json").write_text(json.dumps({"ok": True, "data": result}))
@@ -1357,7 +1368,7 @@ def _sent_issue(published):
 @pytest.mark.parametrize(
     "kw, message",
     [
-        ({"tip": 107}, "5 deep, not 6"),
+        ({"tip": 108}, "5 successor blocks, not 6"),
         ({"reveal_at": 104}, "outside the window 101..103"),
         ({"reveal_at": 100}, "outside the window"),
         ({"sender": "0x" + "22" * 20}, "does not carry our reveal"),
@@ -1371,7 +1382,7 @@ def test_the_receipt_needs_our_transactions_in_confirmed_blocks(published, kw, m
     with pytest.raises(chain.ChainRefusedError, match=message):
         chain.record_receipt(out, node)
     assert not (out / "receipt.json").exists()
-    good, _ = _memory_chain(record, tip=108)  # 108 - 103 + 1 = 6 deep
+    good, _ = _memory_chain(record, tip=109)  # six blocks after 103
     receipt = chain.record_receipt(out, good)
     assert receipt["commit_height"] == 100 and receipt["reveal_height"] == 103
     assert receipt["commit_block_time"] == "2026-03-10T04:40:00.000000000Z"
@@ -1418,12 +1429,12 @@ def test_a_chain_that_changes_between_the_two_reads_gives_no_receipt(published):
 
 
 def test_a_tip_rollback_during_the_last_pass_gives_no_receipt(published):
-    """Round 5 (4): the tip is 109 in the first pass and rolls back to 107 during the second; the
-    depth comes from the last tip read (107 - 103 + 1 = 5): no receipt."""
+    """Rounds 5 and 6: the tip is 109 in the first pass and rolls back to 108 during the second; the
+    final tip read leaves 5 blocks after the reveal at 103: no receipt."""
     out, record = _sent_issue(published)
     node, state = _memory_chain(record)
-    state["tips"] = iter([109, 107])
-    with pytest.raises(chain.ChainRefusedError, match="5 deep, not 6"):
+    state["tips"] = iter([109, 108])
+    with pytest.raises(chain.ChainRefusedError, match="5 successor blocks, not 6"):
         chain.record_receipt(out, node)
     assert not (out / "receipt.json").exists()
 
@@ -1472,8 +1483,8 @@ def test_a_manifest_changed_during_backoff_is_never_sent(published, tmp_path):
     assert result.returncode != 0 and "manifest.json differs" in result.stderr
     assert _sent(node.state, "reveal") == 0 and len(_broadcasts(calls, "reveal")) == 1
     assert not (out / "receipt.json").exists()
-    sent = sorted((out / "reveal_send").iterdir())
-    assert [p.name for p in sent] == ["1", "2"]
+    sent = sorted(p for p in (out / "reveal_send").iterdir() if p.name.isdigit())
+    assert [p.name for p in sent] == ["1"]  # the refused second freeze never became an attempt
     first = json.loads((sent[0] / "manifest.json").read_text())
     assert chain.manifest_digest(first) == json.loads((out / "commit.json").read_text())["manifest_digest"]
 
@@ -1484,11 +1495,124 @@ def test_the_receipt_stores_the_digest_of_the_files_actually_sent(published, tmp
     node.server.shutdown()
     assert result.returncode == 0, result.stdout + result.stderr
     receipt = json.loads((out / "receipt.json").read_text())
-    attempts = sorted((out / "reveal_send").iterdir())
-    assert len(attempts) == 2 and all(
-        oct((p / "manifest.json").stat().st_mode & 0o777) == "0o400" for p in attempts
+    attempts = sorted((p for p in (out / "reveal_send").iterdir() if p.name.isdigit()), key=lambda p: p.name)
+    assert (
+        len(attempts) == 2
+        and all((p / "sending").is_dir() for p in attempts)
+        and all(oct((p / "manifest.json").stat().st_mode & 0o777) == "0o400" for p in attempts)
     )
     sent = json.loads((attempts[-1] / "manifest.json").read_text())
     assert receipt["manifest_digest"] == chain.manifest_digest(sent)
     for call in _broadcasts(calls, "reveal"):
         assert "/reveal_send/" in call[call.index("--manifest-file") + 1]
+
+
+# -- round 6 regressions ---------------------------------------------------------------------------------
+
+
+def test_the_bearer_never_follows_a_redirect(monkeypatch):
+    """A node answering the authenticated transaction read with a redirect is refused, and the
+    redirect's target never sees any request (so never the bearer)."""
+    seen = []
+
+    class Target(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"tx_id": "x", "status": "included", "block_height": 1}')
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+    threading.Thread(target=target.serve_forever, daemon=True).start()
+    elsewhere = f"http://127.0.0.1:{target.server_address[1]}"
+
+    class Redirecting(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", elsewhere + self.path)
+            self.end_headers()
+
+    node_server = ThreadingHTTPServer(("127.0.0.1", 0), Redirecting)
+    threading.Thread(target=node_server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{node_server.server_address[1]}"
+    monkeypatch.setattr(chain, "ALLOWED_NODES", frozenset({url}))
+    node = chain.Node(url, sleep=lambda s: None, token="synthetic-bearer")
+    try:
+        with pytest.raises(chain.ChainRefusedError, match="redirect"):
+            node.tx_status("0c" * 32)
+        with pytest.raises(chain.ChainRefusedError, match="redirect"):
+            node.tip()
+    finally:
+        node_server.shutdown()
+        target.shutdown()
+    assert seen == []
+
+
+def test_a_transaction_answer_for_another_id_is_refused(published):
+    """Asked for our commit (at 100), the node answers with another same-wallet commit's id at 102:
+    refused, whatever the heights."""
+    out, record = _sent_issue(published)
+    node, _ = _memory_chain(record, commit_at=100, reveal_at=104, extra=(102,), tip=111)
+    real = node._get
+
+    def other_id(url, token=None):
+        if url.endswith(f"/transactions/{TX_IDS['commit']}/status"):
+            data = {
+                "tx_id": "0d" * 32,
+                "status": "included",
+                "block_height": 102,
+                "tx_type": "ForecastCommit",
+            }
+            return 200, json.dumps({"ok": True, "data": data}).encode()
+        return real(url, token)
+
+    node._get = other_id
+    with pytest.raises(chain.ChainRefusedError, match="another transaction"):
+        chain.record_receipt(out, node)
+    assert not (out / "receipt.json").exists()
+
+
+@pytest.mark.parametrize("tip, ok", [(108, False), (109, True)])
+def test_confirmation_is_six_successor_blocks(published, tip, ok):
+    out, record = _sent_issue(published)
+    node, _ = _memory_chain(record, tip=tip)
+    assert chain.confirmed(tip, 103) is ok and chain.successors(tip, 103) == tip - 103
+    if ok:
+        assert chain.record_receipt(out, node)["reveal_height"] == 103
+    else:
+        with pytest.raises(chain.ChainRefusedError, match="5 successor blocks, not 6"):
+            chain.record_receipt(out, node)
+
+
+def test_an_interrupted_freeze_leaves_no_attempt_and_does_not_block_the_receipt(published, monkeypatch):
+    """A freeze that fails between its two files leaves no numbered attempt; a freeze killed outright
+    leaves only a staging folder, which is ignored. A later complete, sent attempt gives the receipt."""
+    out, record = _sent_issue(published)  # attempt 1 was frozen and sent
+    real = chain._publish_file
+
+    def cut(path, text, *, root):
+        if Path(path).name == "manifest.json":
+            raise OSError("power cut")
+        return real(path, text, root=root)
+
+    with monkeypatch.context() as mp:
+        mp.setattr(chain, "_publish_file", cut)
+        with pytest.raises(OSError, match="power cut"):
+            chain.freeze_reveal(out)
+    base = out / "reveal_send"
+    assert sorted(p.name for p in base.iterdir() if p.name.isdigit()) == ["1"]
+    assert list((base / ".staging").iterdir()) == []  # cleaned up
+    killed = base / ".staging" / "attempt.killed"  # what a SIGKILL mid-freeze leaves behind
+    killed.mkdir()
+    (killed / "data.json").write_text("{}")
+    unsent = chain.freeze_reveal(out)  # frozen but never sent (e.g. the window check refused)
+    assert unsent.name == "2" and not (unsent / "sending").exists()
+    node, _ = _memory_chain(record, tip=109)
+    receipt = chain.record_receipt(out, node)
+    assert receipt["manifest_digest"] == record["manifest_digest"]

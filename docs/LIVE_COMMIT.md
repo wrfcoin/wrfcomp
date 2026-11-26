@@ -74,7 +74,9 @@ refused while one is active. Its steps:
    later expiries, and the commit block itself excluded.
 4. The reveal loop. Every attempt runs these steps in this order:
    1. **Freeze** read-only (0400) copies of the prepared `data.json` and `manifest.json` into a new
-      folder `reveal_send/<n>/`. Rederive the commit id and the manifest digest from those exact
+      folder `reveal_send/<n>/`. The freeze is atomic: the files are written and fsynced in a
+      staging folder, checked, then the folder is renamed into place. An interrupted freeze leaves
+      no attempt, only a staging folder that is ignored. Rederive the commit id and the manifest digest from those exact
       bytes, and check that the manifest describes the committed store. A file changed since
       prepare (for example during a backoff) refuses the attempt before anything is sent.
    2. **Validate offline.** The CLI's offline reveal body, made from those frozen files, must
@@ -86,7 +88,8 @@ refused while one is active. Its steps:
       - the commit block must be final;
       - then the tip, read **last**, must not be below the commit and must put the next block
         inside the window (tip + 1 ≤ commit + 3, and within the chain's expiries).
-   4. **Send** with the same frozen files: claim the reveal (`reveal.claim`) and reveal the data
+   4. **Send** with the same frozen files: mark the attempt (`reveal_send/<n>/sending`), claim the
+      reveal (`reveal.claim`) and reveal the data
       object and manifest (no oracle receipt). `reveal.sent` is written only after the send
       returns successfully.
 
@@ -96,15 +99,18 @@ refused while one is active. Its steps:
    - the commit is still pending: send again (a duplicate is refused by the chain, harmlessly);
    - the next block is past the window: stop, with no receipt.
 5. Wait until the chain reports OUR reveal included (`revealed_pending_attestation` or
-   `revealed_attested`, the only two core4 statuses that mean included), and its block at least
-   **6 deep**. Depth is tip − height + 1, so the tip block itself is 1 deep. Nothing is saved here.
+   `revealed_attested`, the only two core4 statuses that mean included), and confirmed: the chain
+   has at least **6 blocks after** the reveal block (tip − height ≥ 6, from a fresh tip read). The
+   same rule is used everywhere. Nothing is saved here.
 6. Compute `receipt.json` from the chain as the node has it at that moment. No earlier checkpoint is
    used:
    - the commit block is located by **our commit's own transaction id** (the one the CLI returned
      for our commit id), through core4's `/transactions/<tx_id>/status`. That route needs the
-     Reader role, so this step alone gets the bearer: `WRFCOIN_READER_TOKEN`, or else the
-     operator bearer, exported inside a subshell (never on a command line), sent only to the
-     local node and only on that route, and never printed or saved. The block must carry a
+     Reader role, so this step alone keeps the bearer in its environment. The helper picks
+     `WRFCOIN_READER_TOKEN`, or else the operator bearer; the shell never expands it. It is sent
+     only to the configured local node and only on that route, never printed or saved. No read
+     ever follows a redirect: a 3xx answer is refused, so the bearer cannot be forwarded.
+     The answer must name the transaction id that was asked for. The block must carry a
      `ForecastCommit` from our forecaster. Another issue's commit from the same key can never
      stand in for ours;
    - the reveal height is the one the chain reports for our commit id. If the reveal's own
@@ -112,8 +118,9 @@ refused while one is active. Its steps:
      was refused as a duplicate. The block must carry our `ForecastReveal`;
    - the reveal must be at commit height + 1 to + 3;
    - everything is read twice, with the tip read last in each pass, after the block reads. The two
-     passes must agree (heights and block hashes), and the depth comes from the final tip read. A
-     difference (a reorg in progress), or a tip that rolled back below 6 deep, gives no receipt
+     passes must agree (heights and block hashes), and the confirmation comes from the final tip
+     read. A difference (a reorg in progress), or a tip that rolled back below 6 blocks after the
+     reveal, gives no receipt
      yet. Run `resume` later;
    - if the commit's transaction id was lost (interrupted around the commit send), its block cannot
      be located by id. There is then no counted receipt: OPERATOR DECISION.
@@ -122,8 +129,8 @@ refused while one is active. Its steps:
    - the commit and reveal transaction ids;
    - the confirmed commit and reveal heights, and the window's last block;
    - both block hashes and times;
-   - the data sha256 and manifest digest recomputed from the files of every reveal attempt (all
-     must equal the prepared ones);
+   - the data sha256 and manifest digest recomputed from the files of every attempt that reached
+     the send (all must equal the prepared ones). Attempts frozen but never sent are not evidence;
    - which leads count, timed from the confirmed commit block to the nanosecond.
 
    A replacement chain that moved the commit, or the reveal, before confirmation is therefore

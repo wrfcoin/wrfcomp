@@ -36,8 +36,9 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import numpy as np
 
@@ -56,7 +57,7 @@ MARGIN = np.timedelta64(15, "m")
 REVEAL_WINDOW_BLOCKS = 3
 INCLUDED_STATUSES = frozenset({"revealed_pending_attestation", "revealed_attested"})
 POLL_SECONDS = 20
-CONFIRMATIONS = 6  # a block counts for the receipt once it is this deep (the tip block is 1 deep)
+CONFIRMATIONS = 6  # a block counts for the receipt once the chain has this many blocks after it
 RETRY_BACKOFF_S = (5, 10, 20, 30)  # between reveal attempts while the window is open
 MIN_REQUEST_GAP_S = 3.0
 # Keys the data object must never carry: the chain would read them as a weather reading or a paid
@@ -453,6 +454,7 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         "        fi",
         "        ATTEMPT=$((ATTEMPT + 1))",
         '        mkdir -p "$DIR/reveal.claim"',
+        '        mkdir "$SEND/sending"',
         '        echo "revealing the hash and manifest (attempt $ATTEMPT)"',
         f'        if {reveal_cmd} > "$DIR/reveal_result.json.part"; then',
         '            mv "$DIR/reveal_result.json.part" "$DIR/reveal_result.json"',
@@ -468,13 +470,10 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         f'echo "waiting until the reveal is included and {CONFIRMATIONS} blocks deep"',
         "py wait-revealed",
         'echo "computing the receipt from the confirmed blocks"',
-        "# record locates our transactions by id, a Reader-role read: only this step gets the bearer, as",
-        "# WRFCOIN_READER_TOKEN (exported in a subshell, never on a command line), sent only to the node",
-        "(",
-        '    export WRFCOIN_READER_TOKEN="${WRFCOIN_READER_TOKEN:-${WRFCOIN_OPERATOR_TOKEN:-}}"',
-        "    unset WRFCOIN_OPERATOR_TOKEN",
-        '    uv run --frozen python -P scripts/live_commit.py record --dir "$DIR"',
-        ")",
+        "# record locates our transactions by id, a Reader-role read: only this step keeps the bearer",
+        "# in its environment (the reader token, else the operator token, picked inside the helper; it",
+        "# is sent only to the node, on that route, with redirects refused)",
+        'uv run --frozen python -P scripts/live_commit.py record --dir "$DIR"',
         'echo "done: $DIR/receipt.json"',
     ]
     return "\n".join(lines) + "\n"
@@ -486,11 +485,22 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
 _TX_ID = re.compile(r"(0x)?[0-9a-fA-F]{64}")
 
 
+class _NoRedirect(HTTPRedirectHandler):
+    """Never follow a redirect: a 3xx comes back as an HTTPError with that status, and no request
+    (with or without the bearer) is ever made to the redirect's target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = build_opener(_NoRedirect)
+
+
 def reader_token_from_env() -> str | None:
     """The bearer for the one authenticated read (a transaction's inclusion). Only the ``record``
     step is given it; it is sent only to the local node's transaction-status route and never
     printed or saved."""
-    return os.environ.get("WRFCOIN_READER_TOKEN") or None
+    return os.environ.get("WRFCOIN_READER_TOKEN") or os.environ.get("WRFCOIN_OPERATOR_TOKEN") or None
 
 
 class Node:
@@ -523,17 +533,15 @@ class Node:
 
     @staticmethod
     def _http_get(url: str, token: str | None = None) -> tuple[int, bytes]:
+        """One GET, redirects never followed (the opener refuses them; see :class:`_NoRedirect`)."""
         headers = {"Accept": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:
-            with urlopen(Request(url, headers=headers), timeout=20) as response:
+            with _OPENER.open(Request(url, headers=headers), timeout=20) as response:
                 return response.status, response.read()
-        except Exception as exc:  # noqa: BLE001 - HTTPError carries a status; others are failures
-            status = getattr(exc, "code", None)
-            if status is None:
-                raise
-            return status, exc.read() if hasattr(exc, "read") else b""
+        except HTTPError as exc:
+            return exc.code, exc.read() or b""
 
     def get(self, path: str, *, authenticated: bool = False):
         if self.last is not None:
@@ -541,10 +549,15 @@ class Node:
             if wait > 0:
                 self.sleep(wait)
         self.last = self.clock()
+        url = self.url + path
+        if urlsplit(url).netloc != urlsplit(self.url).netloc:
+            raise ChainRefusedError("reads go to the configured node only")
         if authenticated:
-            status, body = self._get(self.url + path, self._token)
+            status, body = self._get(url, self._token)
         else:
-            status, body = self._get(self.url + path)
+            status, body = self._get(url)
+        if 300 <= status < 400:
+            raise ChainRefusedError(f"the node answered {path} with a redirect ({status}); refused")
         value = json.loads(body) if body else None
         if isinstance(value, dict) and value.get("ok") is True and "data" in value:
             value = value["data"]
@@ -743,15 +756,32 @@ def freeze_reveal(out: Path) -> Path:
     check and the send of this attempt all use exactly these files."""
     live_root = _live(out)
     base = Path(out) / "reveal_send"
-    if not base.is_dir():
-        check_target(live_root, base)
-        make_dir(base)
-    n = 1 + max((int(p.name) for p in base.iterdir() if p.name.isdigit()), default=0)
-    folder = base / str(n)
-    for name in ("data.json", "manifest.json"):
-        _publish_file(folder / name, (Path(out) / name).read_text(), root=live_root)
-        (folder / name).chmod(0o400)
-    check_reveal_inputs(out, folder)
+    staging_root = base / ".staging"  # an interrupted freeze leaves only a folder here, ignored
+    if not staging_root.is_dir():
+        with write_scope(live_root, staging_root):
+            make_dir(staging_root)
+    with write_scope(live_root, staging_root):
+        staging = Path(tempfile.mkdtemp(dir=staging_root, prefix="attempt."))
+    try:
+        for name in ("data.json", "manifest.json"):
+            _publish_file(staging / name, (Path(out) / name).read_text(), root=live_root)  # fsynced
+            (staging / name).chmod(0o400)
+        check_reveal_inputs(out, staging)
+        n = 1 + max((int(p.name) for p in base.iterdir() if p.name.isdigit()), default=0)
+        folder = base / str(n)
+        check_target(live_root, folder)
+        if folder.exists() or folder.is_symlink():
+            raise ChainRefusedError(f"reveal attempt {n} appeared during the freeze; refused")
+        os.rename(staging, folder)  # the attempt appears complete or not at all
+        fd = os.open(base, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        with write_scope(live_root, staging):
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
     return folder
 
 
@@ -851,7 +881,7 @@ def wait_revealed(
         included = status == 200 and _our_reveal_included(record, value)
         if included and isinstance(value.get("revealed_at"), int):
             height = value["revealed_at"]
-            if depth(node.tip(), height) >= CONFIRMATIONS:
+            if confirmed(node.tip(), height):
                 return height
         else:
             pending_now = isinstance(value, dict) and value.get("status") == "committed_pending_reveal"
@@ -909,9 +939,17 @@ def _ours(block: dict, tx_type: str, forecaster: str) -> int:
     )
 
 
+def _norm_tx(value) -> str | None:
+    if not (isinstance(value, str) and _TX_ID.fullmatch(value)):
+        return None
+    return value.lower().removeprefix("0x")
+
+
 def _included_at(node: Node, tx_id: str, tx_type: str) -> int:
     """The height at which the node's chain includes transaction ``tx_id`` (of ``tx_type``) now."""
     value = node.tx_status(tx_id)
+    if _norm_tx(value.get("tx_id")) != _norm_tx(tx_id):
+        raise ChainRefusedError(f"the node answered for another transaction than {tx_id}; no receipt")
     height = value.get("block_height")
     if value.get("status") != "included" or not isinstance(height, int) or isinstance(height, bool):
         raise ChainRefusedError(f"transaction {tx_id} is not included now; no receipt")
@@ -922,9 +960,15 @@ def _included_at(node: Node, tx_id: str, tx_type: str) -> int:
     return height
 
 
-def depth(tip: int, height: int) -> int:
-    """How deep block ``height`` is under ``tip``: the tip block itself is 1 deep."""
-    return tip - height + 1
+def successors(tip: int, height: int) -> int:
+    """How many blocks the chain has after block ``height`` when its tip is ``tip``."""
+    return tip - height
+
+
+def confirmed(tip: int, height: int) -> bool:
+    """The one confirmation rule: block ``height`` has at least CONFIRMATIONS successor blocks
+    under ``tip`` (a fresh tip read)."""
+    return successors(tip, height) >= CONFIRMATIONS
 
 
 def confirmed_inclusion(out: Path, node: Node) -> dict:
@@ -978,9 +1022,10 @@ def confirmed_inclusion(out: Path, node: Node) -> dict:
         if _ours(reveal_block, "ForecastReveal", forecaster) < 1:
             raise ChainRefusedError(f"block {revealed} does not carry our reveal; no receipt")
         tip = node.tip()  # last, after the block reads
-        if depth(tip, revealed) < CONFIRMATIONS:
+        if not confirmed(tip, revealed):
             raise ChainRefusedError(
-                f"the reveal block {revealed} is {depth(tip, revealed)} deep, not {CONFIRMATIONS} "
+                f"the reveal block {revealed} has {successors(tip, revealed)} successor blocks, not "
+                f"{CONFIRMATIONS} "
                 f"(tip {tip}); no receipt yet (resume later)"
             )
         return {
@@ -1001,12 +1046,20 @@ def confirmed_inclusion(out: Path, node: Node) -> dict:
 
 def sent_reveal_digests(out: Path) -> tuple[str, str]:
     """The data sha256 and manifest digest recomputed from the exact files of every reveal attempt
-    (``reveal_send/<n>/``); all must equal the prepared ones."""
+    that reached the send (``reveal_send/<n>/`` with its ``sending`` mark, made right before the
+    CLI send); all must equal the prepared ones. Attempts frozen but never sent are not evidence."""
     record = _load(out, "commit.json")
     base = Path(out) / "reveal_send"
-    folders = sorted(p for p in base.iterdir() if p.name.isdigit()) if base.is_dir() else []
+    folders = (
+        sorted(
+            (p for p in base.iterdir() if p.name.isdigit() and (p / "sending").is_dir()),
+            key=lambda p: int(p.name),
+        )
+        if base.is_dir()
+        else []
+    )
     if not folders:
-        raise ChainRefusedError("no reveal attempt files are saved; no receipt")
+        raise ChainRefusedError("no sent reveal attempt is saved; no receipt")
     for folder in folders:
         data = json.loads((folder / "data.json").read_text())
         sent = (
