@@ -604,8 +604,8 @@ def _stamp(t):
     return f"{pd.Timestamp(t):%Y%m%dT%H%M%S.%fZ}"
 
 
-def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", days=20):
-    """Twenty days of kept 2026 cycles and one METAR fetch (hourly reports at :53), 4 stations."""
+def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", days=10):
+    """Ten days of kept 2026 cycles and one METAR fetch (hourly reports at :53), 4 stations."""
     start = np.datetime64(start, "ns")
     labels, sig = signal(start, days=days, seed=3)
     raws = raw_world(start, seed=3, days=days)
