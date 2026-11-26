@@ -51,16 +51,15 @@ from wrfcomp.live import metar
 from wrfcomp.live.dates import LiveRefusedError, LiveYear
 from wrfcomp.live.locks import LockBusyError, LockPathError, file_lock
 from wrfcomp.live.paths import (
-    LIVE_DIR,
     LivePathError,
-    check_data_dir,
-    check_live_root,
     check_path,
     check_target,
     make_dir,
     refuse_windows,
     write_scope,
 )
+from wrfcomp.live.paths import default_data_dir as paths_default_data_dir
+from wrfcomp.live.paths import live_root as paths_live_root
 
 ISSUE_HOURS = (0, 12)
 HOUR = np.timedelta64(1, "h")
@@ -77,17 +76,15 @@ def refuse_windows_entry() -> None:
         raise LiveRefusedError(str(exc)) from exc
 
 
-def default_data_dir() -> Path:
-    return Path(os.environ.get("WRFCOMP_DATA_DIR") or Path.home() / "wrfcomp-data")
+default_data_dir = paths_default_data_dir
 
 
 def live_root(data: Path | None = None) -> Path:
     """``<data>/live``, refused unless it is a safe place for live data (``paths.check_live_root``):
     the data directory is not inside the repository or a temp directory, is not an evaluation folder
     and is not inside one; ``live`` is not a symlink and holds no evaluation folder."""
-    data = Path(default_data_dir() if data is None else data)
     try:
-        return check_live_root(check_data_dir(data) / LIVE_DIR)
+        return paths_live_root(data)
     except LivePathError as exc:
         raise LiveRefusedError(str(exc)) from exc
 

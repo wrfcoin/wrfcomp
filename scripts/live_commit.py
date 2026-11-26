@@ -9,7 +9,8 @@ The operator then runs ``bash <live>/chain/<issue>/submit.sh``, which calls the 
 these steps (each takes --dir <live>/chain/<issue>):
 
   check-cli | check-key | check-node | check-validate | check-submitted --step commit|reveal |
-  wait-pending | check-reveal-inputs | check-reveal-validate | check-window | reconcile-reveal |
+  wait-pending | check-reveal-inputs | check-reveal-validate | check-window |
+  reveal-backoff --attempt N |
   wait-revealed | record
 
 The throwaway forecaster key is made once with the CLI (never a producer, oracle or station key),
@@ -30,8 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-from wrfcomp.live import chain
-from wrfcomp.live import v4 as live
+from wrfcomp.live import chain, paths
 from wrfcomp.live.paths import check_path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -66,18 +66,22 @@ def main() -> None:
         "check-reveal-inputs",
         "check-reveal-validate",
         "check-window",
-        "reconcile-reveal",
         "wait-revealed",
         "record",
     ):
         sub.add_parser(name).add_argument("--dir", required=True)
+    backoff = sub.add_parser("reveal-backoff")
+    backoff.add_argument("--attempt", required=True, type=int)
+    backoff.add_argument("--dir", required=True)
     submitted = sub.add_parser("check-submitted")
     submitted.add_argument("--step", required=True, choices=("commit", "reveal"))
     submitted.add_argument("--dir", required=True)
     args = parser.parse_args()
-    live.refuse_windows_entry()
-    root = live.live_root()
     if args.command == "prepare":
+        from wrfcomp.live import v4 as live  # the full live builder, only for prepare
+
+        live.refuse_windows_entry()
+        root = live.live_root()
         out = chain.prepare(
             root,
             np.datetime64(args.init),
@@ -91,6 +95,9 @@ def main() -> None:
         print(json.dumps({k: out[k] for k in ("init", "commit_id", "station_id", "if_committed_now")}))
         print(f"next: bash {chain.chain_dir(root, np.datetime64(args.init)) / 'submit.sh'}")
         return
+    # the submit.sh steps: the same checks as live.live_root, without importing the model code
+    paths.refuse_windows()
+    root = paths.live_root()
     out = _chain_dir(root, args.dir)
     if args.command == "check-cli":
         chain.check_cli(out)
@@ -102,10 +109,10 @@ def main() -> None:
         chain.check_reveal_validate(out)
     elif args.command == "check-window":
         print(chain.check_window(out, chain.Node()))
-    elif args.command == "reconcile-reveal":
-        print(chain.reconcile_reveal(out, chain.Node()))
+    elif args.command == "reveal-backoff":
+        chain.reveal_backoff(args.attempt)
     elif args.command == "wait-revealed":
-        print(json.dumps({"revealed_at": chain.wait_revealed(out, chain.Node())["revealed_at"]}))
+        print(json.dumps({"revealed_at": chain.wait_revealed(out, chain.Node())}))
     elif args.command == "check-node":
         info = chain.check_node(out, chain.Node())
         print(json.dumps({"chain_id": info.get("chain_id"), "network_id": info.get("network_id")}))

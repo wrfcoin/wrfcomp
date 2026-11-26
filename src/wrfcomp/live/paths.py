@@ -88,6 +88,17 @@ def check_live_root(root: Path) -> Path:
     return root
 
 
+def default_data_dir() -> Path:
+    return Path(os.environ.get("WRFCOMP_DATA_DIR") or Path.home() / "wrfcomp-data")
+
+
+def live_root(data: Path | None = None) -> Path:
+    """``<data>/live`` (data defaults to ``$WRFCOMP_DATA_DIR`` or ``~/wrfcomp-data``), refused unless
+    it is a safe place for live data (:func:`check_live_root`)."""
+    data = Path(default_data_dir() if data is None else data)
+    return check_live_root(check_data_dir(data) / LIVE_DIR)
+
+
 def check_target(root: Path, target: Path) -> Path:
     """Approve ONE live write to ``target``: call it immediately before that write, never for a
     read or a validation (use :func:`check_path`). Refuses as :func:`check_path` does."""

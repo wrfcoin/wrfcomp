@@ -78,25 +78,45 @@ refused while one is active. Its steps:
    manifest included, with sorted keys, which is the same manifest; the digest is computed after
    putting the fields back in the Rust declaration order.
 
-   Then re-read the node. It must still report OUR commit pending at the saved height, its tip
-   must not be below that height, the commit block must be final, and the next block must be inside
-   the window. Then claim the reveal (`reveal.claim`) and reveal the data object and manifest (no
-   oracle receipt). `reveal.sent` is written only after the send returns successfully.
-5. Wait until the chain reports OUR reveal included (`revealed_pending_attestation` or
-   `revealed_attested`, the only two core4 statuses that mean included) at a height inside the
-   window. Pin that evidence once: both heights and the final hashes of the commit block and the
-   reveal block (`status_revealed.json`).
-6. Before writing `receipt.json`, read the inclusion from the node again. Both heights and both
-   block hashes must equal the pinned ones; a replacement block, or a node that no longer has the
-   commitment, gives no receipt. The receipt holds:
-   - the commit and reveal transaction ids;
-   - the commit and reveal heights, and the window's last block;
-   - both block hashes;
-   - the commit block's time, to the nanosecond as the node gives it;
-   - which leads count.
+   Then the reveal loop. Each attempt first re-reads the node. If our reveal is already included,
+   nothing is sent. Otherwise the node must still report OUR commit pending at the saved height, its
+   tip must not be below that height, the commit block must be final, and the next block must be
+   inside the window. Then claim the reveal (`reveal.claim`) and reveal the data object and manifest
+   (no oracle receipt). `reveal.sent` is written only after the send returns successfully.
 
-   A reveal still pending when the window closes, or reported outside it or for another commit,
-   gives no receipt and a non-zero exit.
+   A send that fails, whether a temporary refusal or a duplicate, does not end the run. The loop
+   waits (5, 10, 20, then 30 s) and goes round again. Each new attempt starts with the same re-read,
+   so the chain decides:
+   - our reveal is included: done;
+   - the commit is still pending: send again (a duplicate is refused by the chain, harmlessly);
+   - the next block is past the window: stop, with no receipt.
+5. Wait until the chain reports OUR reveal included (`revealed_pending_attestation` or
+   `revealed_attested`, the only two core4 statuses that mean included), and its block at least
+   **6 blocks deep** (the tip at least 6 past it). Nothing is saved here.
+6. Compute `receipt.json` from the chain as the node has it at that moment. No earlier checkpoint is
+   used. After the reveal, core4 no longer reports `committed_at`, so the blocks are found by their
+   transactions, which `/chain/block/<h>` lists by type and sender:
+   - the reveal block is the one the commit status names. It must carry our `ForecastReveal`, sent
+     by our forecaster;
+   - the commit block is the one block among the 3 before it (the window, read backwards) that
+     carries our `ForecastCommit`. The forecaster key commits once per issue, so this is our
+     commit. No such block means the reveal was outside the window, so no receipt;
+   - everything is read twice, and any difference between the two reads (a reorg in progress)
+     gives no receipt yet. Run `resume` later.
+
+   The receipt holds:
+   - the commit and reveal transaction ids;
+   - the confirmed commit and reveal heights, and the window's last block;
+   - both block hashes and times;
+   - which leads count, timed from the confirmed commit block to the nanosecond.
+
+   A replacement chain that moved the commit, or the reveal, before confirmation is therefore
+   followed: the receipt names the blocks the chain has, not the ones seen earlier. The status
+   (`revealed_pending_attestation` or `revealed_attested`) is not part of the receipt.
+
+   A reveal still pending when the window closes, outside the window, or reported for another
+   commit gives no receipt and a non-zero exit. The chain itself refuses a reveal past the commit's
+   `commit_expires_at` or `reveal_expires_at`.
 
 The helper steps run without the operator bearer in their environment; only the CLI sees it, and
 nothing prints it.
@@ -107,16 +127,16 @@ saved and never broadcasts the commit twice:
 - **prepared:** validate and commit;
 - **committed:** wait for the pending commit. A commit that was claimed but is not on chain a few
   blocks later is never sent again: resume stops with OPERATOR DECISION;
-- **included:** `status_pending.json` saved; reveal. If a reveal was claimed but `reveal.sent` is
-  missing (killed around the send), resume asks the chain. If our reveal is included, nothing is
-  sent. If our commit is still pending, the reveal is sent again; a duplicate is refused by the
-  chain, and the inclusion it then reports decides;
-- **revealed:** inclusion pinned; re-read it from the node and write the receipt.
+- **included:** `status_pending.json` saved; the reveal loop above. If a reveal was claimed but
+  `reveal.sent` is missing (killed around the send), the loop's first re-read asks the chain: our
+  reveal included means nothing is sent; our commit still pending means it is sent again;
+- **revealed:** wait for 6 confirmations and compute the receipt from the chain.
 
-Running it again after the receipt changes nothing. Every saved checkpoint is rechecked before it is
-reused, and the `record` step validates the saved evidence itself (our commit id and station, an
-included-reveal status, a height inside the window). If a run was killed, remove the `active` folder
-only after checking that no run is still going.
+Running `resume` after the receipt recomputes it from the confirmed blocks. If it is identical, for
+example after the status moved on to `revealed_attested`, nothing changes. If it differs (a reorg
+deeper than 6 blocks), the run stops with OPERATOR DECISION and leaves `receipt.json` as it was.
+Every saved checkpoint is rechecked before it is reused. If a run was killed, remove the `active`
+folder only after checking that no run is still going.
 
 ## Which leads count
 

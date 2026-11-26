@@ -613,16 +613,21 @@ def _stamp(t):
     return f"{pd.Timestamp(t):%Y%m%dT%H%M%S.%fZ}"
 
 
-def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", days=10):
-    """Ten days of kept 2026 cycles and one METAR fetch (hourly reports at :53), 4 stations."""
-    start = np.datetime64(start, "ns")
-    labels, sig = signal(start, days=days, seed=3)
-    raws = raw_world(start, seed=3, days=days)
+def make_live_world_patches(monkeypatch):
+    """The station list and temp-dir settings the synthetic live world runs with."""
     monkeypatch.setattr(paths, "TEMP_DIRS", ())
     monkeypatch.setattr(live, "stations", site)
     monkeypatch.setattr(
         live, "icao_map", lambda: dict(zip(ICAO, site().station_id.values.tolist(), strict=True))
     )
+
+
+def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", days=10):
+    """Ten days of kept 2026 cycles and one METAR fetch (hourly reports at :53), 4 stations."""
+    start = np.datetime64(start, "ns")
+    labels, sig = signal(start, days=days, seed=3)
+    raws = raw_world(start, seed=3, days=days)
+    make_live_world_patches(monkeypatch)
     root = live.live_root(data)
     for raw in raws:
         LiveYear(2026, root=root).write(raw, live.raw_path(root, raw.init_time.values[0]))
