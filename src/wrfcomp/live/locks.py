@@ -13,7 +13,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-from wrfcomp.live.paths import check_target
+from wrfcomp.live.paths import check_target, make_dir
 
 try:
     import fcntl
@@ -64,7 +64,7 @@ def file_lock(path: Path, *, root: Path, blocking: bool = False):
     path = Path(path)
     if not path.parent.is_dir():
         check_target(root, path.parent)
-        path.parent.mkdir(parents=True)
+        make_dir(path.parent)
     check_target(root, path)  # consumed by the os.open below
     if path.parent.is_symlink() or path.is_symlink():
         raise LockPathError(f"refusing a linked lock path: {path}")

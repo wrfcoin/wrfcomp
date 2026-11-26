@@ -613,16 +613,21 @@ def _stamp(t):
     return f"{pd.Timestamp(t):%Y%m%dT%H%M%S.%fZ}"
 
 
-def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", days=10):
-    """Ten days of kept 2026 cycles and one METAR fetch (hourly reports at :53), 4 stations."""
-    start = np.datetime64(start, "ns")
-    labels, sig = signal(start, days=days, seed=3)
-    raws = raw_world(start, seed=3, days=days)
+def make_live_world_patches(monkeypatch):
+    """The station list and temp-dir settings the synthetic live world runs with."""
     monkeypatch.setattr(paths, "TEMP_DIRS", ())
     monkeypatch.setattr(live, "stations", site)
     monkeypatch.setattr(
         live, "icao_map", lambda: dict(zip(ICAO, site().station_id.values.tolist(), strict=True))
     )
+
+
+def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", days=10):
+    """Ten days of kept 2026 cycles and one METAR fetch (hourly reports at :53), 4 stations."""
+    start = np.datetime64(start, "ns")
+    labels, sig = signal(start, days=days, seed=3)
+    raws = raw_world(start, seed=3, days=days)
+    make_live_world_patches(monkeypatch)
     root = live.live_root(data)
     for raw in raws:
         LiveYear(2026, root=root).write(raw, live.raw_path(root, raw.init_time.values[0]))
@@ -921,8 +926,8 @@ def test_concurrent_builds_keep_one_intact_manifest_inside_the_live_tree(live_wo
     def run():
         try:
             results.append(live.build_issue(last, data)["content_sha256"])
-        except LiveRefusedError as exc:
-            errors.append(str(exc))
+        except Exception as exc:  # noqa: BLE001 - every failure is recorded; only refusals are allowed
+            errors.append(f"{type(exc).__name__}: {exc}")
 
     threads = [threading.Thread(target=run) for _ in range(3)]
     for th in threads:
@@ -930,7 +935,7 @@ def test_concurrent_builds_keep_one_intact_manifest_inside_the_live_tree(live_wo
     for th in threads:
         th.join(300)
     assert results and all(r == results[0] for r in results), (results, errors)
-    assert all("another live writer" in e for e in errors), errors
+    assert all(e.startswith("LiveRefusedError: another live writer") for e in errors), errors
     assert live.build_issue(last, data)["content_sha256"] == results[0]
     for here, dirs, files in os.walk(data):
         for name in dirs + files:
