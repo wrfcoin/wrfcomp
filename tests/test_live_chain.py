@@ -25,6 +25,7 @@ from test_live_v4 import H, make_live_world
 
 from wrfcomp.live import chain, paths
 from wrfcomp.live import v4 as live
+from wrfcomp.live.dates import LiveYear
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="live writes are refused on Windows")
 REPO = Path(__file__).resolve().parents[1]
@@ -276,6 +277,10 @@ if kind == "reveal":
     body.update(payload=data, nonce=opts["nonce"], timestamp=int(opts["timestamp"]),
                 manifest=json.loads(Path(opts["manifest-file"]).read_text()), verification_receipt=None)
 if opts.get("validate_only"):
+    crash = behaviour.get("crash_on_reveal_check") and not (state / "crashed_reveal").exists()
+    if kind == "reveal" and crash:
+        (state / "crashed_reveal").write_text("1")
+        sys.exit(8)
     out = {{"validated": True, "kind": kind, "submitted": False, "commit_id": cid, "body": body}}
 else:
     if kind == "commit":
@@ -285,7 +290,7 @@ else:
         (state / "crashed").write_text("1")
         sys.exit(9)  # the broadcast happened; the result never reached the script
     out = {{"commit_id": cid, "tx_id": f"tx-{{kind}}-1", "result": {{"id": f"tx-{{kind}}-1"}}}}
-print(json.dumps({{"ok": True, "command": "forecast", "exit_code": 0, "data": out}}))
+print(json.dumps({{"ok": True, "command": "forecast", "exit_code": 0, "data": out}}, sort_keys=True))
 """
 
 UV_SHIM = r"""#!{python}
@@ -297,6 +302,7 @@ assert args[:5] == ["run", "--frozen", "python", "-P", "scripts/live_commit.py"]
 with (Path({state!r}) / "helper_env.log").open("a") as fh:
     fh.write(repr(sorted(k for k in os.environ if "TOKEN" in k)) + "\n")
 from wrfcomp.live import chain, paths
+from wrfcomp.live.dates import LiveYear
 chain.NODE_URL = {node!r}
 chain.ALLOWED_NODES = frozenset({{{node!r}}})
 chain.MIN_REQUEST_GAP_S = 0.0
@@ -315,8 +321,14 @@ class FakeNode:
     "last" (the last eligible block), "never", "late" (one block after the window) or "other" (reported
     for another commit)."""
 
-    def __init__(self, state, init, *, chain_id="888", reveal="next", block_hash="ab" * 32):
-        self.state, self.init, self.chain_id, self.reveal = state, init, chain_id, reveal
+    def __init__(self, state, init, *, chain_id="888", reveal="next", block_hash="ab" * 32, expiries=(10, 3)):
+        self.state, self.init, self.chain_id, self.reveal, self.expiries = (
+            state,
+            init,
+            chain_id,
+            reveal,
+            expiries,
+        )
         when = pd.Timestamp(init + 4 * H + np.timedelta64(15, "m")).tz_localize("UTC")
         self.block_time = when.isoformat()
         self.block_hash, self.tip, self.requests, self.revealed_at = block_hash, COMMIT_HEIGHT - 1, [], None
@@ -339,16 +351,24 @@ class FakeNode:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def answer(self, path):
-        deadline = COMMIT_HEIGHT + 3
+        deadline = COMMIT_HEIGHT + min(3, *self.expiries)
         if path == "/network/info":
             return 200, {"chain_id": self.chain_id, "network_id": "testnet", "chain_height": self.tip}
         if path.startswith("/transactions/commit/"):
             cid = path.split("/")[3]
             self.tip += 1
             if (self.state / "reveal").exists() and self.revealed_at is None and self.reveal != "never":
-                heights = {"next": self.tip, "last": deadline, "late": deadline + 1, "other": self.tip}
+                heights = {
+                    "next": self.tip,
+                    "last": deadline,
+                    "late": deadline + 1,
+                    "other": self.tip,
+                    "beyond_cap": COMMIT_HEIGHT + 4,
+                }
                 self.revealed_at = heights[self.reveal]
-            if self.revealed_at is not None and self.tip >= min(self.revealed_at, deadline):
+            if self.revealed_at is not None and self.tip >= min(
+                self.revealed_at, COMMIT_HEIGHT + max(self.expiries)
+            ):
                 return 200, {
                     "commit_id": "f" * 64 if self.reveal == "other" else cid,
                     "station_id": "wrfcomp-live-v4",
@@ -362,8 +382,8 @@ class FakeNode:
                     "contribution_type": "forecast",
                     "status": "committed_pending_reveal",
                     "committed_at": COMMIT_HEIGHT,
-                    "commit_expires_at": COMMIT_HEIGHT + 10,
-                    "reveal_expires_at": deadline,
+                    "commit_expires_at": COMMIT_HEIGHT + self.expiries[0],
+                    "reveal_expires_at": COMMIT_HEIGHT + self.expiries[1],
                 }
             return 404, {"commit_id": cid, "status": "not_found"}
         if path == f"/chain/block/{COMMIT_HEIGHT}":
@@ -590,12 +610,14 @@ def test_resume_after_an_interrupted_commit_never_rebroadcasts_it(published, tmp
     _no_token_anywhere(resumed, out, node.state)
 
 
-def test_resume_refuses_when_nothing_was_committed(published, tmp_path):
+def test_resume_from_the_prepared_stage_runs_the_whole_submission(published, tmp_path):
     data, root, last, key, cli = published
     _prepare(root, last - 12 * H, key, cli)
     result, calls, out, node, _ = _run_submit(published, tmp_path, mode="resume")
     node.server.shutdown()
-    assert result.returncode != 0 and "nothing was committed" in result.stdout and calls == []
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(_broadcasts(calls, "commit")) == 1 and len(_broadcasts(calls, "reveal")) == 1
+    assert (out / "receipt.json").is_file()
 
 
 def test_submit_sh_stops_before_committing_when_the_cli_disagrees_on_the_commit_id(published, tmp_path):
@@ -757,3 +779,158 @@ def test_exact_nanosecond_timeliness_survives_the_receipt():
     assert shifted == np.datetime64("2026-12-02T05:45:00.000000001", "ns")
     with pytest.raises(chain.ChainRefusedError):
         chain.parse_time_ns("2026-12-02 05:45:00")
+
+
+# -- round 2 regressions ---------------------------------------------------------------------------------
+
+
+def test_a_reveal_body_in_core4s_sorted_key_order_is_accepted(published):
+    """core4 prints the reveal body (manifest included) from a serde_json Value: keys sorted. That is
+    the same manifest; only a different one is refused."""
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    _prepare(root, t, key, cli)
+    out = chain.chain_dir(root, t)
+    record = json.loads((out / "commit.json").read_text())
+    body = {
+        "forecaster": record["forecaster"],
+        "station_id": record["station_id"],
+        "payload": json.loads((out / "data.json").read_text()),
+        "nonce": record["nonce"],
+        "timestamp": record["timestamp"],
+        "commit_hash": record["commit_id"],
+        "manifest": json.loads((out / "manifest.json").read_text()),
+        "verification_receipt": None,
+    }
+    valid = {"validated": True, "submitted": False, "kind": "reveal", "commit_id": record["commit_id"]}
+    (out / "reveal_validate.json").write_text(
+        json.dumps({"ok": True, "data": {**valid, "body": body}}, sort_keys=True)
+    )
+    assert list(json.loads((out / "reveal_validate.json").read_text())["data"]["body"]["manifest"]) == sorted(
+        chain.MANIFEST_FIELDS
+    )
+    chain.check_reveal_validate(out)
+    with pytest.raises(chain.ChainRefusedError, match="wrong fields"):
+        chain.canonical_manifest({**body["manifest"], "extra": 1})
+
+
+def _move_store_init(store, build, sha, new_init):
+    ds = xr.open_zarr(store, chunks=None).load()
+    ds = ds.assign_coords(init_time=[np.datetime64(new_init, "ns")])
+    for var in ds.variables.values():
+        var.encoding.clear()
+    shutil.rmtree(store)
+    LiveYear(2026, root=store.parent.parent).write(ds, store)
+    digest = chain.content_sha256(xr.open_zarr(store, chunks=None))
+    _rewrite(build, {"content_sha256": digest})
+    sha.chmod(0o600)
+    sha.write_text(f"{digest}  v4.zarr\n")
+
+
+def test_prepare_refuses_a_store_at_another_instant_of_the_same_hour(published):
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    store, build, _ = _store_and_records(root, t)
+    _move_store_init(store, build, store.with_name("v4.sha256"), t + np.timedelta64(30, "m"))
+    _expect_refusal(published, "its init differs")
+
+
+def test_prepare_refuses_a_published_hash_file_that_disagrees(published):
+    data, root, last, key, cli = published
+    sha = live.issue_dir(root, last - 12 * H) / "v4.sha256"
+    sha.chmod(0o600)
+    sha.write_text("0" * 64 + "  v4.zarr\n")
+    _expect_refusal(published, "v4.sha256 does not match")
+
+
+def test_the_reveal_window_is_commit_plus_one_to_plus_three_even_with_later_expiries():
+    pending = {"committed_at": 100, "commit_expires_at": 106, "reveal_expires_at": 112}
+    assert chain.reveal_window(pending) == (101, 103)
+    assert chain.reveal_window({**pending, "reveal_expires_at": 102}) == (101, 102)
+    with pytest.raises(chain.ChainRefusedError):
+        chain.reveal_window({**pending, "reveal_expires_at": 100})
+
+
+def _checkpoints(out, record, pending, revealed):
+    (out / "status_pending.json").write_text(json.dumps(pending))
+    (out / "status_revealed.json").write_text(json.dumps(revealed))
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ({"revealed_at": 104}, "not included inside the window"),
+        ({"revealed_at": 100}, "not included inside the window"),
+        ({"commit_id": "e" * 64}, "another reveal"),
+        ({"station_id": "somewhere"}, "another reveal"),
+        ({"status": "committed_pending_reveal"}, "not reported as included"),
+    ],
+)
+def test_record_validates_the_saved_evidence_itself(published, change, message):
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    _prepare(root, t, key, cli)
+    out = chain.chain_dir(root, t)
+    record = json.loads((out / "commit.json").read_text())
+    base = {"commit_id": record["commit_id"], "station_id": record["station_id"]}
+    pending = {
+        **base,
+        "contribution_type": "forecast",
+        "status": "committed_pending_reveal",
+        "committed_at": 100,
+        "commit_expires_at": 106,
+        "reveal_expires_at": 112,
+    }
+    revealed = {**base, "status": "revealed_pending_attestation", "revealed_at": 103, **change}
+    _checkpoints(out, record, pending, revealed)
+    node = chain.Node(get=lambda url: (200, b"{}"), sleep=lambda s: None)
+    with pytest.raises(chain.ChainRefusedError, match=message):
+        chain.record_receipt(out, node)
+    assert not (out / "receipt.json").exists()
+
+
+def test_a_reveal_beyond_commit_plus_three_gets_no_receipt_end_to_end(published, tmp_path):
+    node = _node(tmp_path, published, reveal="beyond_cap", expiries=(6, 12))
+    result, calls, out, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
+    assert result.returncode != 0 and "no receipt" in result.stderr and not (out / "receipt.json").exists()
+
+
+def test_resume_from_the_included_stage(published, tmp_path):
+    """Interrupted after the commit was included (status_pending.json saved), before the reveal."""
+    node = _node(tmp_path, published)
+    first, calls, out, *_ = _run_submit(published, tmp_path, node=node, crash_on_reveal_check=True)
+    assert (
+        first.returncode != 0
+        and (out / "status_pending.json").exists()
+        and not (out / "reveal.claim").exists()
+    )
+    resumed, calls, *_ = _run_submit(
+        published, tmp_path, mode="resume", node=node, crash_on_reveal_check=True
+    )
+    node.server.shutdown()
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert len(_broadcasts(calls, "commit")) == 1 and len(_broadcasts(calls, "reveal")) == 1
+    assert (out / "receipt.json").is_file()
+
+
+def test_resume_from_the_revealed_stage_and_again_after_the_receipt(published, tmp_path):
+    """Reveal confirmed and saved, then the block lookup had no final hash; after it recovers, resume
+    writes the receipt without any broadcast; a further resume changes nothing."""
+    node = _node(tmp_path, published, block_hash="pending")
+    first, calls, out, *_ = _run_submit(published, tmp_path, node=node)
+    assert (
+        first.returncode != 0
+        and (out / "status_revealed.json").exists()
+        and not (out / "receipt.json").exists()
+    )
+    node.block_hash = "ab" * 32
+    resumed, calls, *_ = _run_submit(published, tmp_path, mode="resume", node=node)
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert len(_broadcasts(calls, "commit")) == 1 and len(_broadcasts(calls, "reveal")) == 1
+    receipt = (out / "receipt.json").read_text()
+    again, calls_again, *_ = _run_submit(published, tmp_path, mode="resume", node=node)
+    node.server.shutdown()
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert len(_broadcasts(calls_again, "commit")) == 1 and len(_broadcasts(calls_again, "reveal")) == 1
+    assert (out / "receipt.json").read_text() == receipt

@@ -48,8 +48,8 @@ uv run python -P scripts/live_commit.py prepare --init 2026-12-02T00 \
     --cli /path/to/wrfcoin --cli-sha256 <sha256>
 ```
 
-Prepare first checks the published issue against itself: the store's single init and its own
-model attributes (`gefs-station-corrected-own`, version 1) must agree with the requested issue,
+Prepare first checks the published issue against itself: the store's single init (exactly the
+issue time, to the nanosecond), its published `v4.sha256`, and its own model attributes (`gefs-station-corrected-own`, version 1) must agree with the requested issue,
 `build.json` and the pinned `inputs.json`, because the content hash covers the numbers and not the
 attributes. It then writes `~/wrfcomp-data/live/chain/2026-12-02T00Z/` as a whole: `data.json`,
 `manifest.json`, `commit.json` and `submit.sh` are staged together and moved into place in one rename,
@@ -68,11 +68,15 @@ refused while one is active. Its steps:
    the body must name the same forecaster and station. Recheck the key, then claim the commit
    (`commit.claim`) and commit. The commit is never broadcast twice.
 3. Wait until the node reports OUR commit (same id, station and type) as `committed_pending_reveal`,
-   and save its heights: the reveal must land at a block from `committed_at` to the earlier of
-   `commit_expires_at` and `reveal_expires_at` (the chain's own rule, commit_reveal.rs).
+   and save its heights. The reveal must land at a block from `committed_at + 1` to the earliest of
+   `committed_at + 3`, `commit_expires_at` and `reveal_expires_at`, inclusive. That is the chain's
+   own rule (commit_reveal.rs), with the 3-block window enforced here even if the node advertises
+   later expiries, and the commit block itself excluded.
 4. Before the reveal: rederive the commit id and the manifest digest from the exact files it will
    send, check the manifest describes the committed store, and require the CLI's offline reveal body
-   to equal the prepared reveal exactly. Refuse if the next block is already past the window. Then
+   to equal the prepared reveal. The comparison is of the decoded objects: core4 prints the body,
+   manifest included, with sorted keys, which is the same manifest; the digest is computed after
+   putting the fields back in the Rust declaration order. Refuse if the next block is already past the window. Then
    claim the reveal (`reveal.claim`) and reveal the data object and manifest (no oracle receipt).
 5. Wait until the chain reports OUR reveal included at a height inside the window. Only then is
    `receipt.json` written: the commit and reveal transaction ids, the commit and reveal heights, the
@@ -83,9 +87,17 @@ refused while one is active. Its steps:
 The helper steps run without the operator bearer in their environment; only the CLI sees it, and
 nothing prints it.
 
-**If a run is interrupted**, run `bash submit.sh resume`. It never broadcasts the commit again: it
-continues from the chain's status (wait for the pending commit, reveal if that has not been claimed,
-wait for the included reveal, write the receipt). If a run was killed, remove the `active` folder
+**If a run is interrupted**, run `bash submit.sh resume`. It continues from whatever stage was
+saved and never broadcasts the commit twice:
+
+- **prepared:** validate and commit;
+- **committed:** wait for the pending commit;
+- **included:** `status_pending.json` saved; reveal, if the reveal has not been claimed;
+- **revealed:** `status_revealed.json` saved; write the receipt.
+
+Running it again after the receipt changes nothing. Every saved checkpoint is rechecked before it is
+reused, and the `record` step validates the saved evidence itself (our commit id and station, an
+included-reveal status, a height inside the window). If a run was killed, remove the `active` folder
 only after checking that no run is still going.
 
 ## Which leads count

@@ -136,6 +136,14 @@ def validate_manifest(m: dict) -> None:
             raise ChainRefusedError(f"manifest {key} must be non-empty, sorted and unique")
 
 
+def canonical_manifest(m: dict) -> dict:
+    """A manifest parsed from anywhere (core4's CLI prints it with sorted keys) in the Rust
+    declaration order, refused unless it has exactly the manifest's fields."""
+    if not isinstance(m, dict) or set(m) != set(MANIFEST_FIELDS):
+        raise ChainRefusedError("not a manifest: wrong fields")
+    return {k: m[k] for k in MANIFEST_FIELDS}
+
+
 def manifest_digest(m: dict) -> str:
     validate_manifest(m)
     return hashlib.sha3_256(json.dumps(m, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
@@ -216,14 +224,18 @@ def _published_identity(root: Path, t) -> dict:
     build = json.loads(build_path.read_text())
     inputs = json.loads(inputs_path.read_text())
     want = str(np.datetime_as_string(np.datetime64(t, "h"), unit="h"))
+    exact = np.datetime64(t, "ns")
+    sha_path = issue / "v4.sha256"
     with xr.open_zarr(store_path, chunks=None) as store:
         digest = content_sha256(store)
         inits = store.init_time.values
         attrs = dict(store.attrs)
     if digest != build.get("content_sha256"):
         raise ChainRefusedError("the published store does not match its build.json hash")
-    if inits.size != 1 or str(np.datetime_as_string(inits[0], unit="h")) != want:
-        raise ChainRefusedError("the published store is not the requested issue")
+    if inits.size != 1 or np.datetime64(inits[0], "ns") != exact:
+        raise ChainRefusedError("the published store is not the requested issue (its init differs)")
+    if not sha_path.is_file() or sha_path.read_text() != f"{digest}  v4.zarr\n":
+        raise ChainRefusedError("the published v4.sha256 does not match the store")
     if build.get("init") != want or inputs.get("init") != want:
         raise ChainRefusedError("the build or inputs record names another issue")
     if attrs.get("model_id") != V4_MODEL_ID or attrs.get("model_version") != V4_MODEL_VERSION:
@@ -367,7 +379,8 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         "#!/usr/bin/env bash",
         f"# submit.sh for live v4 issue {record['init']}: testnet {record['chain_id']} only.",
         "# Written by scripts/live_commit.py prepare.   bash submit.sh          the first run",
-        "#                                               bash submit.sh resume   after an interruption",
+        "#                                               bash submit.sh resume   after an interruption:",
+        "#   it continues from whatever stage was saved and never broadcasts the commit twice.",
         "# The CLI uses the operator bearer (WRFCOIN_OPERATOR_TOKEN) from this shell; the helper steps run",
         "# without it, and nothing prints it. One run at a time; the commit is never broadcast twice.",
         "set -euo pipefail",
@@ -394,12 +407,12 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         "py check-cli",
         "py check-key",
         "py check-node",
-        'if [ "$MODE" = run ]; then',
-        '    if [ -e "$DIR/commit.claim" ]; then',
-        '        echo "a commit was already attempted here; it is never sent twice"',
-        '        echo "to finish it:  bash submit.sh resume"',
-        "        exit 1",
-        "    fi",
+        'if [ -e "$DIR/commit.claim" ] && [ "$MODE" = run ]; then',
+        '    echo "a commit was already attempted here; it is never sent twice"',
+        '    echo "to finish it:  bash submit.sh resume"',
+        "    exit 1",
+        "fi",
+        'if [ ! -e "$DIR/commit.claim" ]; then',
         '    echo "validating the commit offline (nothing is sent)"',
         f'    {commit_cmd.replace(" commit", " commit --validate-only", 1)} > "$DIR/validate.json"',
         "    py check-validate",
@@ -409,14 +422,9 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         f'    {commit_cmd} > "$DIR/commit_result.json.part"',
         '    mv "$DIR/commit_result.json.part" "$DIR/commit_result.json"',
         "    py check-submitted --step commit",
-        'elif [ ! -e "$DIR/commit.claim" ]; then',
-        '    echo "nothing was committed here yet: run  bash submit.sh"',
-        "    exit 1",
         "fi",
-        'if [ ! -e "$DIR/status_pending.json" ]; then',
-        f'    echo "waiting for committed_pending_reveal (one read every {POLL_SECONDS} s)"',
-        "    py wait-pending",
-        "fi",
+        f'echo "waiting for committed_pending_reveal (one read every {POLL_SECONDS} s)"',
+        "py wait-pending",
         'if [ ! -e "$DIR/reveal.claim" ]; then',
         '    echo "checking the reveal against the prepared commitment"',
         "    py check-reveal-inputs",
@@ -497,7 +505,15 @@ def _load(out: Path, name: str):
 
 
 def _save(out: Path, name: str, value) -> None:
-    metar.publish_file(Path(out) / name, json.dumps(value, indent=1) + "\n", root=_live(out))
+    """Write a checkpoint once. An identical existing checkpoint is fine (a resumed step); a
+    different one is refused."""
+    text = json.dumps(value, indent=1) + "\n"
+    path = Path(out) / name
+    try:
+        metar.publish_file(path, text, root=_live(out))
+    except FileExistsError:
+        if path.read_text() != text:
+            raise ChainRefusedError(f"{name} already exists with other content") from None
 
 
 def _cli_data(out: Path, name: str) -> dict:
@@ -554,8 +570,20 @@ def check_submitted(out: Path, step: str) -> dict:
     return data
 
 
+def reveal_window(pending: dict) -> tuple[int, int]:
+    """The blocks a reveal may land in: commit height + 1 .. the earliest of commit height + 3 and
+    the chain's own reported commit and reveal expiries (inclusive)."""
+    committed = int(pending["committed_at"])
+    last = min(
+        committed + REVEAL_WINDOW_BLOCKS, int(pending["commit_expires_at"]), int(pending["reveal_expires_at"])
+    )
+    if last < committed + 1:
+        raise ChainRefusedError("the chain reports no block a reveal could land in")
+    return committed + 1, last
+
+
 def _deadline(pending: dict) -> int:
-    return min(int(pending["commit_expires_at"]), int(pending["reveal_expires_at"]))
+    return reveal_window(pending)[1]
 
 
 def _check_pending(record: dict, value: dict) -> dict:
@@ -564,9 +592,27 @@ def _check_pending(record: dict, value: dict) -> dict:
         raise ChainRefusedError("the node's pending commit is another commit; not revealing")
     if value.get("station_id") != record["station_id"] or value.get("contribution_type") != "forecast":
         raise ChainRefusedError("the node's pending commit names another station or type; not revealing")
+    if value.get("status") != "committed_pending_reveal":
+        raise ChainRefusedError("the saved commit status is not committed_pending_reveal")
     heights = [value.get(k) for k in ("committed_at", "commit_expires_at", "reveal_expires_at")]
-    if not all(isinstance(h, int) and h >= 0 for h in heights) or _deadline(value) < heights[0]:
+    if not all(isinstance(h, int) and not isinstance(h, bool) and h >= 0 for h in heights):
         raise ChainRefusedError("the node's pending commit has no valid heights; not revealing")
+    reveal_window(value)
+    return value
+
+
+def _check_revealed(record: dict, pending: dict, value: dict) -> dict:
+    """OUR reveal, included (a revealed_* status), at a height inside the window."""
+    if value.get("commit_id") != record["commit_id"] or value.get("station_id") != record["station_id"]:
+        raise ChainRefusedError("the node reports another reveal; no receipt")
+    if not str(value.get("status", "")).startswith("revealed_"):
+        raise ChainRefusedError("the reveal is not reported as included; no receipt")
+    first, last = reveal_window(pending)
+    height = value.get("revealed_at")
+    if not isinstance(height, int) or isinstance(height, bool) or not first <= height <= last:
+        raise ChainRefusedError(
+            f"the reveal was not included inside the window {first}..{last} (reported {height!r}); no receipt"
+        )
     return value
 
 
@@ -575,6 +621,8 @@ def wait_pending(
 ) -> dict:
     """Poll the commit status until OUR commit is ``committed_pending_reveal``; save it."""
     record = _load(out, "commit.json")
+    if (Path(out) / "status_pending.json").exists():  # resumed: reuse the saved, rechecked checkpoint
+        return _check_pending(record, _load(out, "status_pending.json"))
     start = clock()
     while True:
         status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
@@ -635,7 +683,7 @@ def check_reveal_validate(out: Path) -> None:
         raise ChainRefusedError("reveal_validate.json is not an offline reveal validation")
     if data.get("commit_id") != record["commit_id"] or body != expected:
         raise ChainRefusedError("the CLI's reveal body differs from the prepared reveal; not revealing")
-    if manifest_digest(body["manifest"]) != record["manifest_digest"]:
+    if manifest_digest(canonical_manifest(body["manifest"])) != record["manifest_digest"]:
         raise ChainRefusedError("the CLI's reveal manifest differs from the prepared one; not revealing")
 
 
@@ -654,24 +702,18 @@ def wait_revealed(
     out: Path, node: Node, *, timeout_s: float = 900.0, sleep=time.sleep, clock=time.monotonic
 ) -> dict:
     """Poll until the chain reports OUR reveal included at a height inside the window; save it.
-    Refused (no receipt) if the window passes first, or the reveal is reported outside it."""
-    record, pending = _load(out, "commit.json"), _load(out, "status_pending.json")
-    committed, deadline = int(pending["committed_at"]), _deadline(pending)
+    Refused (no receipt) if the window passes first, or the reveal is reported outside it. A saved
+    checkpoint (a resumed run) is rechecked and reused."""
+    record = _load(out, "commit.json")
+    pending = _check_pending(record, _load(out, "status_pending.json"))
+    if (Path(out) / "status_revealed.json").exists():
+        return _check_revealed(record, pending, _load(out, "status_revealed.json"))
+    deadline = _deadline(pending)
     start = clock()
     while True:
         status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
         if status == 200 and isinstance(value, dict) and str(value.get("status", "")).startswith("revealed_"):
-            if (
-                value.get("commit_id") != record["commit_id"]
-                or value.get("station_id") != record["station_id"]
-            ):
-                raise ChainRefusedError("the node reports another reveal; no receipt")
-            height = value.get("revealed_at")
-            if not isinstance(height, int) or not committed <= height <= deadline:
-                raise ChainRefusedError(
-                    f"the reveal was not included inside the window {committed}..{deadline} "
-                    f"(reported {height!r}); no receipt"
-                )
+            value = _check_revealed(record, pending, value)
             _save(out, "status_revealed.json", value)
             return value
         if node.tip() > deadline:
@@ -706,10 +748,9 @@ def format_time_ns(t: np.datetime64) -> str:
 def record_receipt(out: Path, node: Node) -> dict:
     """Write receipt.json, only for OUR reveal included inside the window, with the commit block."""
     record = _load(out, "commit.json")
-    pending, revealed = _load(out, "status_pending.json"), _load(out, "status_revealed.json")
+    pending = _check_pending(record, _load(out, "status_pending.json"))
+    revealed = _check_revealed(record, pending, _load(out, "status_revealed.json"))
     committed, deadline = int(pending["committed_at"]), _deadline(pending)
-    if not committed <= int(revealed["revealed_at"]) <= deadline:
-        raise ChainRefusedError("the saved reveal is outside the window; no receipt")
     status, block = node.get(f"/chain/block/{committed}")
     if status != 200 or not isinstance(block, dict) or block.get("height") != committed:
         raise ChainRefusedError(f"the node did not return block {committed}; no receipt")
