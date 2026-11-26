@@ -1148,18 +1148,19 @@ class WriteAudit:
     """Records every filesystem write CALL of a live run, and judges each call on its own target.
 
     * Outside a write scope, a call is allowed only if its own target was approved by
-      ``check_target`` before the call (exact path: an approved folder does not cover its contents).
+      ``check_target`` before the call (exact path: an approved folder does not cover its contents),
+      and each approval is single-use: it is consumed by exactly one write call.
     * Inside a ``write_scope(root, target)`` (approved exactly when it opens), a call is allowed if
       its target is the scope target or below it, or one of the scope's own temporary files or
       folders (made by mkstemp/mkdtemp inside the scope, in or next to the target) or below them,
-      or was itself approved exactly.
+      or consumes an exact approval of its own. Opening a scope leaves no approval behind.
     """
 
     WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 
     def __init__(self, root):
         self.root = Path(os.path.realpath(root))
-        self.approved, self.scopes, self.calls = set(), [], []
+        self.approved, self.scopes, self.calls = {}, [], []
         self.in_temp = 0  # inside mkstemp/mkdtemp: their own os.open/os.mkdir are the temp creation
 
     @staticmethod
@@ -1167,16 +1168,22 @@ class WriteAudit:
         return Path(os.path.realpath(os.fspath(target)))
 
     def approve(self, target):
-        self.approved.add(self.real(target))
+        real = self.real(target)
+        self.approved[real] = self.approved.get(real, 0) + 1
+
+    def _consume(self, real):
+        if self.approved.get(real, 0) > 0:
+            self.approved[real] -= 1
+            return True
+        return False
 
     def _allowed(self, real):
-        if real in self.approved:
-            return True
-        if not self.scopes:
-            return False
-        scope = self.scopes[-1]
-        under = (scope["target"], *scope["temps"])
-        return any(real == u or real.is_relative_to(u) for u in under)
+        if self.scopes:
+            scope = self.scopes[-1]
+            under = (scope["target"], *scope["temps"])
+            if any(real == u or real.is_relative_to(u) for u in under):
+                return True
+        return self._consume(real)
 
     def wrote(self, primitive, target):
         if target is None or isinstance(target, int) or self.in_temp:
@@ -1216,8 +1223,7 @@ def _install_audit(monkeypatch, audit):
 
     @contextmanager
     def scope(root, target):
-        real_check(root, target)
-        audit.approve(target)
+        real_check(root, target)  # the scope's own check; it leaves no reusable approval
         audit.scopes.append({"target": audit.real(target), "temps": set()})
         try:
             yield Path(target)
@@ -1394,3 +1400,22 @@ def test_the_audit_fails_on_an_unchecked_metadata_write(live_world, monkeypatch)
     audit = _audited_live_run(live_world, monkeypatch, mutate=with_metadata)
     unchecked = audit.findings()["unchecked"]
     assert unchecked and all(str(w).endswith(".meta") for _, w in unchecked), unchecked[:5]
+
+
+def test_the_audit_fails_on_an_unchecked_second_write_to_the_same_file(live_world, monkeypatch):
+    """Mutation 3: every published file is written a second time, right after its checked write.
+    Approvals are single-use, so the second write has none and is caught."""
+    original = metar.publish_file
+
+    def twice(policy, mp):
+        def publish(path, text, *, root):
+            original(path, text, root=root)
+            Path(path).write_text(text)  # the same file again, never re-checked
+
+        mp.setattr(metar, "publish_file", publish)
+
+    audit = _audited_live_run(live_world, monkeypatch, mutate=twice)
+    unchecked = audit.findings()["unchecked"]
+    published = {"inputs.json", "v4.sha256", "build.json"}
+    assert unchecked, "the second write was not caught"
+    assert all(w.name in published or w.parent.name == "metar" for _, w in unchecked), unchecked[:5]
