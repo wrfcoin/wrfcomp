@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import shlex
+import shutil
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,7 +45,7 @@ import xarray as xr
 
 from wrfcomp.harness.hashing import content_sha256
 from wrfcomp.live import metar
-from wrfcomp.live.paths import check_path
+from wrfcomp.live.paths import check_path, check_target, make_dir, write_scope
 
 CHAIN_ID = "888"
 NETWORK_ID = "testnet"
@@ -177,17 +180,66 @@ def _sha256_file(path: Path) -> str:
 
 
 def _check_key_file(root: Path, key: Path) -> Path:
-    """The throwaway forecaster key: a regular file (not a link) under ``<live>/keys/``, mode 0600.
+    """The throwaway forecaster key: a regular file (not a link) owned by this user, mode exactly 0600,
+    in ``<live>/keys/``, which must itself be a real folder owned by this user with mode exactly 0700.
     Its contents are never opened here; the CLI reads it when the operator runs ``submit.sh``."""
     key = Path(key)
+    folder = root / "keys"
+    if folder.is_symlink() or not folder.is_dir():
+        raise ChainRefusedError("<live>/keys/ must be a real folder (make it with: install -d -m 0700)")
+    if folder.stat().st_mode & 0o7777 != 0o700 or folder.stat().st_uid != os.getuid():
+        raise ChainRefusedError("<live>/keys/ must be owned by you with mode exactly 0700")
     if key.is_symlink() or not key.is_file():
         raise ChainRefusedError("the signer key must be a regular file, not a link")
-    if key.parent.resolve() != (root / "keys").resolve():
+    if key.parent.resolve() != folder.resolve():
         raise ChainRefusedError("the throwaway forecaster key must live in <live>/keys/")
-    if key.stat().st_mode & 0o777 != 0o600:
-        raise ChainRefusedError("the signer key file must have mode 0600")
+    if key.stat().st_mode & 0o7777 != 0o600 or key.stat().st_uid != os.getuid():
+        raise ChainRefusedError("the signer key file must be owned by you with mode exactly 0600")
     check_path(root, key)
     return key
+
+
+# The published v4 identity a live commit may carry (citizen_arms.MODEL_OWN / VERSION).
+V4_MODEL_ID = "gefs-station-corrected-own"
+V4_MODEL_VERSION = "1"
+
+
+def _published_identity(root: Path, t) -> dict:
+    """Read and cross-check a published issue: the store's single init and model attributes, its
+    build record and its pinned inputs must all agree with the requested issue and the v4 identity."""
+    from wrfcomp.live import v4 as live
+
+    issue = live.issue_dir(root, t)
+    build_path, inputs_path, store_path = issue / "build.json", issue / "inputs.json", issue / "v4.zarr"
+    if not build_path.is_file() or not inputs_path.is_file() or not store_path.is_dir():
+        raise ChainRefusedError("the issue is not published; build it first")
+    build = json.loads(build_path.read_text())
+    inputs = json.loads(inputs_path.read_text())
+    want = str(np.datetime_as_string(np.datetime64(t, "h"), unit="h"))
+    with xr.open_zarr(store_path, chunks=None) as store:
+        digest = content_sha256(store)
+        inits = store.init_time.values
+        attrs = dict(store.attrs)
+    if digest != build.get("content_sha256"):
+        raise ChainRefusedError("the published store does not match its build.json hash")
+    if inits.size != 1 or str(np.datetime_as_string(inits[0], unit="h")) != want:
+        raise ChainRefusedError("the published store is not the requested issue")
+    if build.get("init") != want or inputs.get("init") != want:
+        raise ChainRefusedError("the build or inputs record names another issue")
+    if attrs.get("model_id") != V4_MODEL_ID or attrs.get("model_version") != V4_MODEL_VERSION:
+        raise ChainRefusedError("the published store is not candidate v4")
+    if build.get("model_id") != attrs.get("model_id") or build.get("model_version") != attrs.get(
+        "model_version"
+    ):
+        raise ChainRefusedError("the build record's model differs from the store's")
+    return {
+        "init": want,
+        "content_sha256": digest,
+        "model_id": attrs["model_id"],
+        "model_version": attrs["model_version"],
+        "inputs_sha256": _sha256_file(inputs_path),
+        "build_started": inputs["build_started"],
+    }
 
 
 def prepare(
@@ -203,21 +255,15 @@ def prepare(
     now: datetime | None = None,
     nonce: str | None = None,
 ) -> dict:
-    """Write ``<live>/chain/<issue>/`` (once): data.json, manifest.json, commit.json, submit.sh."""
+    """Write ``<live>/chain/<issue>/`` (once, as a whole): data.json, manifest.json, commit.json and
+    submit.sh are staged together and moved into place in one rename, so an interrupted prepare
+    leaves nothing behind and can simply be run again."""
     from wrfcomp.live import v4 as live
 
     t = live.check_issue(t)
     if pd.Timestamp(t).hour == 12 and not allow_12z:
         raise ChainRefusedError("only 00Z issues are committed (12Z needs --allow-12z)")
-    issue = live.issue_dir(root, t)
-    build_path, inputs_path, store_path = issue / "build.json", issue / "inputs.json", issue / "v4.zarr"
-    if not build_path.is_file() or not inputs_path.is_file() or not store_path.is_dir():
-        raise ChainRefusedError("the issue is not published; build it first")
-    build = json.loads(build_path.read_text())
-    with xr.open_zarr(store_path, chunks=None) as store:
-        digest = content_sha256(store)
-    if digest != build["content_sha256"]:
-        raise ChainRefusedError("the published store does not match its build.json hash")
+    ident = _published_identity(root, t)
     if not _ADDRESS.fullmatch(forecaster or ""):
         raise ChainRefusedError("--forecaster must be 0x followed by 40 hex")
     _check_key_file(root, signer_key)
@@ -225,23 +271,25 @@ def prepare(
     if not cli.is_file() or _sha256_file(cli) != cli_sha256:
         raise ChainRefusedError("the CLI binary is missing or its sha256 differs from --cli-sha256")
     out = chain_dir(root, t)
-    if (out / "commit.json").exists():
+    if out.exists() or out.is_symlink():
         raise ChainRefusedError(f"{out.name} is already prepared; one commit per issue")
     now = now or datetime.now(UTC)
     timestamp = int(now.timestamp())
     nonce = nonce or secrets.token_hex(32)
-    lock_sha = _sha256_file(Path(repo) / "HARNESS_LOCK.json")
     data = {
-        "forecast_sha256": digest,
-        "init": build["init"],
-        "inputs_sha256": _sha256_file(inputs_path),
-        "model_id": build["model_id"],
-        "model_version": build["model_version"],
+        "forecast_sha256": ident["content_sha256"],
+        "init": ident["init"],
+        "inputs_sha256": ident["inputs_sha256"],
+        "model_id": ident["model_id"],
+        "model_version": ident["model_version"],
         "wrfcomp_commit": "v1",
     }
     check_data(data)
-    produced = int(np.datetime64(json.loads(inputs_path.read_text())["build_started"], "s").astype(int))
-    man = manifest(build["model_id"], lock_sha, digest, produced, horizon_hours=max(LEAD_HOURS))
+    produced = int(np.datetime64(ident["build_started"], "s").astype(int))
+    lock_sha = _sha256_file(Path(repo) / "HARNESS_LOCK.json")
+    man = manifest(
+        ident["model_id"], lock_sha, ident["content_sha256"], produced, horizon_hours=max(LEAD_HOURS)
+    )
     record = {
         "chain_id": CHAIN_ID,
         "network_id": NETWORK_ID,
@@ -251,22 +299,39 @@ def prepare(
         "nonce": nonce,
         "timestamp": timestamp,
         "commit_id": commit_id(data, nonce, STATION_LABEL, timestamp),
+        "data_sha256": hashlib.sha256(compact(data).encode()).hexdigest(),
         "manifest_digest": manifest_digest(man),
-        "init": build["init"],
-        "content_sha256": digest,
+        "init": ident["init"],
+        "content_sha256": ident["content_sha256"],
+        "model_id": ident["model_id"],
         "signer_key": str(signer_key),
         "cli": str(cli),
         "cli_sha256": cli_sha256,
         "prepared_at": now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "if_committed_now": counted_leads(t, np.datetime64(now.astimezone(UTC).replace(tzinfo=None), "ns")),
     }
-    for name, value in (
-        ("data.json", compact(data) + "\n"),
-        ("manifest.json", json.dumps(man, separators=(",", ":")) + "\n"),
-        ("commit.json", json.dumps(record, indent=1) + "\n"),
-        ("submit.sh", submit_script(out, record, repo)),
-    ):
-        metar.publish_file(out / name, value, root=root)
+    files = {
+        "data.json": compact(data) + "\n",
+        "manifest.json": json.dumps(man, separators=(",", ":")) + "\n",
+        "commit.json": json.dumps(record, indent=1) + "\n",
+        "submit.sh": submit_script(out, record, repo),
+    }
+    staging_root = out.parent / ".staging"
+    with write_scope(root, staging_root):
+        make_dir(staging_root)
+    with write_scope(root, staging_root):
+        staging = Path(tempfile.mkdtemp(dir=staging_root, prefix=f"{out.name}."))
+    try:
+        for name, text in files.items():
+            metar.publish_file(staging / name, text, root=root)
+        check_target(root, out)
+        if out.exists() or out.is_symlink():
+            raise ChainRefusedError(f"{out.name} appeared during prepare; refused")
+        os.rename(staging, out)
+    except BaseException:
+        with write_scope(root, staging):
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
     return record
 
 
@@ -276,7 +341,8 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         if not _SAFE.fullmatch(str(record[key])):
             raise ChainRefusedError(f"unsafe characters in {key}")
     q = shlex.quote
-    common = " \\\n    ".join(
+    cont = " \\\n    "
+    common = cont.join(
         [
             f"--forecaster {q(record['forecaster'])}",
             f"--station-id {q(record['station_id'])}",
@@ -285,54 +351,86 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
             f"--timestamp {int(record['timestamp'])}",
         ]
     )
-    signing = " \\\n    ".join(
+    signing = cont.join(
         [
             f"--signer-key {q(record['signer_key'])}",
             f"--chain-id {q(record['chain_id'])}",
             f"--network-id {q(record['network_id'])}",
         ]
     )
-    chain_name = f"{record['chain_id']} {record['network_id']}"
+    commit_cmd = f'"$CLI" --output json forecast commit{cont}{common}{cont}{signing}{cont}--node-url "$NODE"'
+    reveal_cmd = (
+        f'"$CLI" --output json forecast reveal{cont}{common}{cont}'
+        '--manifest-file "$DIR/manifest.json"' + cont + '--node-url "$NODE"'
+    )
     lines = [
         "#!/usr/bin/env bash",
         f"# submit.sh for live v4 issue {record['init']}: testnet {record['chain_id']} only.",
-        "# Written by scripts/live_commit.py prepare. Run it once:  bash submit.sh",
-        "# It needs the operator bearer in this shell (WRFCOIN_OPERATOR_TOKEN) and never prints it.",
-        "# Steps: check the CLI binary; check the node; validate the commit offline; commit;",
-        "# wait for committed_pending_reveal; reveal (hash and manifest only); write receipt.json.",
+        "# Written by scripts/live_commit.py prepare.   bash submit.sh          the first run",
+        "#                                               bash submit.sh resume   after an interruption",
+        "# The CLI uses the operator bearer (WRFCOIN_OPERATOR_TOKEN) from this shell; the helper steps run",
+        "# without it, and nothing prints it. One run at a time; the commit is never broadcast twice.",
         "set -euo pipefail",
         "umask 077",
         f"DIR={q(str(out))}",
         f"REPO={q(str(Path(repo).resolve()))}",
         f"CLI={q(record['cli'])}",
         f"NODE={q(record['node_url'])}",
+        'MODE="${1:-run}"',
+        'case "$MODE" in run|resume) ;; *) echo "usage: bash submit.sh [resume]"; exit 2;; esac',
         'cd "$REPO"',
-        'py() { uv run --frozen python -P scripts/live_commit.py "$@" --dir "$DIR"; }',
-        'if [ -e "$DIR/commit_result.json" ] || [ -e "$DIR/commit_result.json.part" ]; then',
-        '    echo "a commit was already attempted here: check its status before trying again"; exit 1',
+        "py() {",
+        "    env -u WRFCOIN_OPERATOR_TOKEN -u WRFCOIN_READER_TOKEN \\",
+        '        uv run --frozen python -P scripts/live_commit.py "$@" --dir "$DIR"',
+        "}",
+        'if ! mkdir "$DIR/active" 2>/dev/null; then',
+        '    echo "another submit.sh is running for this issue"',
+        '    echo "(if a run was killed: check nothing is running, then remove $DIR/active)"',
+        "    exit 1",
         "fi",
+        "trap 'rmdir \"$DIR/active\"' EXIT",
         "",
-        'echo "1/7 checking the CLI binary"',
+        'echo "checking the CLI binary, the key and the node"',
         "py check-cli",
-        f'echo "2/7 checking the node is chain {chain_name}"',
+        "py check-key",
         "py check-node",
-        'echo "3/7 validating the commit (nothing is sent)"',
-        f'"$CLI" --output json forecast commit --validate-only \\\n    {common} \\\n    {signing} \\\n'
-        '    --node-url "$NODE" > "$DIR/validate.json"',
-        "py check-validate",
-        'echo "4/7 committing"',
-        f'"$CLI" --output json forecast commit \\\n    {common} \\\n    {signing} \\\n'
-        '    --node-url "$NODE" > "$DIR/commit_result.json.part"',
-        'mv "$DIR/commit_result.json.part" "$DIR/commit_result.json"',
-        "py check-submitted --step commit",
-        f'echo "5/7 waiting for committed_pending_reveal (one read every {POLL_SECONDS} s)"',
-        "py wait-pending",
-        'echo "6/7 revealing the hash and manifest"',
-        f'"$CLI" --output json forecast reveal \\\n    {common} \\\n'
-        '    --manifest-file "$DIR/manifest.json" --node-url "$NODE" > "$DIR/reveal_result.json.part"',
-        'mv "$DIR/reveal_result.json.part" "$DIR/reveal_result.json"',
-        "py check-submitted --step reveal",
-        'echo "7/7 writing receipt.json"',
+        'if [ "$MODE" = run ]; then',
+        '    if [ -e "$DIR/commit.claim" ]; then',
+        '        echo "a commit was already attempted here; it is never sent twice"',
+        '        echo "to finish it:  bash submit.sh resume"',
+        "        exit 1",
+        "    fi",
+        '    echo "validating the commit offline (nothing is sent)"',
+        f'    {commit_cmd.replace(" commit", " commit --validate-only", 1)} > "$DIR/validate.json"',
+        "    py check-validate",
+        "    py check-key",
+        '    mkdir "$DIR/commit.claim"',
+        '    echo "committing"',
+        f'    {commit_cmd} > "$DIR/commit_result.json.part"',
+        '    mv "$DIR/commit_result.json.part" "$DIR/commit_result.json"',
+        "    py check-submitted --step commit",
+        'elif [ ! -e "$DIR/commit.claim" ]; then',
+        '    echo "nothing was committed here yet: run  bash submit.sh"',
+        "    exit 1",
+        "fi",
+        'if [ ! -e "$DIR/status_pending.json" ]; then',
+        f'    echo "waiting for committed_pending_reveal (one read every {POLL_SECONDS} s)"',
+        "    py wait-pending",
+        "fi",
+        'if [ ! -e "$DIR/reveal.claim" ]; then',
+        '    echo "checking the reveal against the prepared commitment"',
+        "    py check-reveal-inputs",
+        f'    {reveal_cmd.replace(" reveal", " reveal --validate-only", 1)} > "$DIR/reveal_validate.json"',
+        "    py check-reveal-validate",
+        "    py check-window",
+        '    mkdir "$DIR/reveal.claim"',
+        '    echo "revealing the hash and manifest"',
+        f'    {reveal_cmd} > "$DIR/reveal_result.json.part"',
+        '    mv "$DIR/reveal_result.json.part" "$DIR/reveal_result.json"',
+        "    py check-submitted --step reveal",
+        "fi",
+        'echo "waiting for the reveal to be included inside the reveal window"',
+        "py wait-revealed",
         "py record",
         'echo "done: $DIR/receipt.json"',
     ]
@@ -383,9 +481,23 @@ class Node:
             value = value["data"]
         return status, value
 
+    def tip(self) -> int:
+        status, info = self.get("/network/info")
+        if status != 200 or not isinstance(info, dict) or not isinstance(info.get("chain_height"), int):
+            raise ChainRefusedError("the node did not report its chain height")
+        return info["chain_height"]
+
+
+def _live(out: Path) -> Path:
+    return Path(out).parent.parent
+
 
 def _load(out: Path, name: str):
     return json.loads((Path(out) / name).read_text())
+
+
+def _save(out: Path, name: str, value) -> None:
+    metar.publish_file(Path(out) / name, json.dumps(value, indent=1) + "\n", root=_live(out))
 
 
 def _cli_data(out: Path, name: str) -> dict:
@@ -399,6 +511,11 @@ def check_cli(out: Path) -> None:
     record = _load(out, "commit.json")
     if _sha256_file(Path(record["cli"])) != record["cli_sha256"]:
         raise ChainRefusedError("the CLI binary's sha256 differs from the one recorded at prepare")
+
+
+def check_key(out: Path) -> None:
+    """Recheck the key folder (0700) and file (0600) right before the CLI signs."""
+    _check_key_file(_live(out), Path(_load(out, "commit.json")["signer_key"]))
 
 
 def check_node(out: Path, node: Node) -> dict:
@@ -417,8 +534,12 @@ def check_node(out: Path, node: Node) -> dict:
 def check_validate(out: Path) -> None:
     record, data = _load(out, "commit.json"), _cli_data(out, "validate.json")
     body = data.get("body", {})
-    if data.get("validated") is not True or data.get("submitted") is not False:
-        raise ChainRefusedError("validate.json is not an offline validation")
+    if (
+        data.get("validated") is not True
+        or data.get("submitted") is not False
+        or data.get("kind") != "commit"
+    ):
+        raise ChainRefusedError("validate.json is not an offline commit validation")
     if data.get("commit_id") != record["commit_id"] or body.get("commit_hash") != record["commit_id"]:
         raise ChainRefusedError("the CLI's commit id differs from the helper's; refusing")
     if body.get("forecaster") != record["forecaster"] or body.get("station_id") != record["station_id"]:
@@ -433,20 +554,35 @@ def check_submitted(out: Path, step: str) -> dict:
     return data
 
 
+def _deadline(pending: dict) -> int:
+    return min(int(pending["commit_expires_at"]), int(pending["reveal_expires_at"]))
+
+
+def _check_pending(record: dict, value: dict) -> dict:
+    """A pending commit is OURS and carries the chain's heights (CommitRecord, commit_reveal.rs)."""
+    if value.get("commit_id") != record["commit_id"]:
+        raise ChainRefusedError("the node's pending commit is another commit; not revealing")
+    if value.get("station_id") != record["station_id"] or value.get("contribution_type") != "forecast":
+        raise ChainRefusedError("the node's pending commit names another station or type; not revealing")
+    heights = [value.get(k) for k in ("committed_at", "commit_expires_at", "reveal_expires_at")]
+    if not all(isinstance(h, int) and h >= 0 for h in heights) or _deadline(value) < heights[0]:
+        raise ChainRefusedError("the node's pending commit has no valid heights; not revealing")
+    return value
+
+
 def wait_pending(
     out: Path, node: Node, *, timeout_s: float = 600.0, sleep=time.sleep, clock=time.monotonic
 ) -> dict:
-    """Poll the commit status until ``committed_pending_reveal``; save it as status_pending.json."""
+    """Poll the commit status until OUR commit is ``committed_pending_reveal``; save it."""
     record = _load(out, "commit.json")
     start = clock()
     while True:
         status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
         if status == 200 and isinstance(value, dict):
             if value.get("status") == "committed_pending_reveal":
-                metar.publish_file(
-                    Path(out) / "status_pending.json", json.dumps(value, indent=1) + "\n", root=_live(out)
-                )
-                return value
+                pending = _check_pending(record, value)
+                _save(out, "status_pending.json", pending)
+                return pending
             if value.get("status") not in (None, "not_found"):
                 raise ChainRefusedError(f"unexpected commit status {value.get('status')!r}; not revealing")
         if clock() - start > timeout_s:
@@ -456,32 +592,147 @@ def wait_pending(
         sleep(POLL_SECONDS)
 
 
-def _live(out: Path) -> Path:
-    return Path(out).parent.parent
+def check_reveal_inputs(out: Path) -> None:
+    """Rederive everything the reveal will carry from the exact files it will send."""
+    record = _load(out, "commit.json")
+    raw = (Path(out) / "data.json").read_text()
+    data = json.loads(raw)
+    check_data(data)
+    if (
+        raw != compact(data) + "\n"
+        or hashlib.sha256(compact(data).encode()).hexdigest() != record["data_sha256"]
+    ):
+        raise ChainRefusedError("data.json differs from the prepared data object; not revealing")
+    if commit_id(data, record["nonce"], record["station_id"], record["timestamp"]) != record["commit_id"]:
+        raise ChainRefusedError("data.json no longer derives the committed id; not revealing")
+    man = json.loads((Path(out) / "manifest.json").read_text())
+    if manifest_digest(man) != record["manifest_digest"]:
+        raise ChainRefusedError("manifest.json differs from the prepared manifest; not revealing")
+    if man["output_hash"] != data["forecast_sha256"] or man["model_id"] != data["model_id"]:
+        raise ChainRefusedError("the manifest does not describe the committed store; not revealing")
+
+
+def check_reveal_validate(out: Path) -> None:
+    """The CLI's offline reveal body must be exactly the prepared reveal."""
+    record = _load(out, "commit.json")
+    data = _cli_data(out, "reveal_validate.json")
+    body = data.get("body", {})
+    expected = {
+        "forecaster": record["forecaster"],
+        "station_id": record["station_id"],
+        "payload": json.loads((Path(out) / "data.json").read_text()),
+        "nonce": record["nonce"],
+        "timestamp": record["timestamp"],
+        "commit_hash": record["commit_id"],
+        "manifest": json.loads((Path(out) / "manifest.json").read_text()),
+        "verification_receipt": None,
+    }
+    if (
+        data.get("validated") is not True
+        or data.get("submitted") is not False
+        or data.get("kind") != "reveal"
+    ):
+        raise ChainRefusedError("reveal_validate.json is not an offline reveal validation")
+    if data.get("commit_id") != record["commit_id"] or body != expected:
+        raise ChainRefusedError("the CLI's reveal body differs from the prepared reveal; not revealing")
+    if manifest_digest(body["manifest"]) != record["manifest_digest"]:
+        raise ChainRefusedError("the CLI's reveal manifest differs from the prepared one; not revealing")
+
+
+def check_window(out: Path, node: Node) -> int:
+    """Refuse to broadcast a reveal that can no longer land inside the window (next block > deadline)."""
+    deadline = _deadline(_load(out, "status_pending.json"))
+    tip = node.tip()
+    if tip + 1 > deadline:
+        raise ChainRefusedError(
+            f"the reveal window has closed (tip {tip}, last block {deadline}); not revealing"
+        )
+    return tip
+
+
+def wait_revealed(
+    out: Path, node: Node, *, timeout_s: float = 900.0, sleep=time.sleep, clock=time.monotonic
+) -> dict:
+    """Poll until the chain reports OUR reveal included at a height inside the window; save it.
+    Refused (no receipt) if the window passes first, or the reveal is reported outside it."""
+    record, pending = _load(out, "commit.json"), _load(out, "status_pending.json")
+    committed, deadline = int(pending["committed_at"]), _deadline(pending)
+    start = clock()
+    while True:
+        status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
+        if status == 200 and isinstance(value, dict) and str(value.get("status", "")).startswith("revealed_"):
+            if (
+                value.get("commit_id") != record["commit_id"]
+                or value.get("station_id") != record["station_id"]
+            ):
+                raise ChainRefusedError("the node reports another reveal; no receipt")
+            height = value.get("revealed_at")
+            if not isinstance(height, int) or not committed <= height <= deadline:
+                raise ChainRefusedError(
+                    f"the reveal was not included inside the window {committed}..{deadline} "
+                    f"(reported {height!r}); no receipt"
+                )
+            _save(out, "status_revealed.json", value)
+            return value
+        if node.tip() > deadline:
+            raise ChainRefusedError(
+                f"the reveal window closed at block {deadline} without our reveal; no receipt"
+            )
+        if clock() - start > timeout_s:
+            raise ChainRefusedError("the reveal was not seen in time; no receipt")
+        sleep(POLL_SECONDS)
+
+
+_RFC3339 = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)")
+
+
+def parse_time_ns(text: str) -> np.datetime64:
+    """An RFC 3339 time to UTC nanoseconds, exactly (no rounding through datetime's microseconds)."""
+    found = _RFC3339.fullmatch(str(text))
+    if not found:
+        raise ChainRefusedError(f"not an RFC 3339 time: {text!r}")
+    base, fraction, zone = found.groups()
+    t = np.datetime64(base, "ns") + np.timedelta64(int((fraction or "0").ljust(9, "0")), "ns")
+    if zone != "Z":
+        sign = 1 if zone[0] == "+" else -1
+        t -= sign * (np.timedelta64(int(zone[1:3]), "h") + np.timedelta64(int(zone[4:6]), "m"))
+    return t
+
+
+def format_time_ns(t: np.datetime64) -> str:
+    return str(np.datetime_as_string(np.datetime64(t, "ns"), unit="ns")) + "Z"
 
 
 def record_receipt(out: Path, node: Node) -> dict:
-    """Write receipt.json: commit and reveal transactions, the commit block, and the leads that count."""
+    """Write receipt.json, only for OUR reveal included inside the window, with the commit block."""
     record = _load(out, "commit.json")
-    pending = _load(out, "status_pending.json")
-    commit, reveal = check_submitted(out, "commit"), check_submitted(out, "reveal")
-    height = int(pending["committed_at"])  # a block height (CommitRecord.committed_at)
-    status, block = node.get(f"/chain/block/{height}")
-    if status != 200 or not isinstance(block, dict) or int(block.get("height", -1)) != height:
-        raise ChainRefusedError(f"the node did not return block {height}")
-    block_time = np.datetime64(
-        datetime.fromisoformat(block["timestamp"]).astimezone(UTC).replace(tzinfo=None), "ns"
-    )
-    status, after = node.get(f"/transactions/commit/{record['commit_id']}/status")
+    pending, revealed = _load(out, "status_pending.json"), _load(out, "status_revealed.json")
+    committed, deadline = int(pending["committed_at"]), _deadline(pending)
+    if not committed <= int(revealed["revealed_at"]) <= deadline:
+        raise ChainRefusedError("the saved reveal is outside the window; no receipt")
+    status, block = node.get(f"/chain/block/{committed}")
+    if status != 200 or not isinstance(block, dict) or block.get("height") != committed:
+        raise ChainRefusedError(f"the node did not return block {committed}; no receipt")
+    if not (isinstance(block.get("hash"), str) and _hex64(block["hash"])):
+        raise ChainRefusedError(f"block {committed} has no final hash; no receipt")
+    block_time = parse_time_ns(block["timestamp"])
+
+    def tx(step):
+        try:
+            return check_submitted(out, step)["tx_id"]
+        except FileNotFoundError:
+            return None  # interrupted after broadcast; the chain status is the evidence
+
     receipt = {
         "commit_id": record["commit_id"],
-        "commit_tx_id": commit["tx_id"],
-        "reveal_tx_id": reveal["tx_id"],
-        "commit_height": height,
-        "commit_block_hash": block.get("hash"),
-        "commit_block_time": str(np.datetime_as_string(block_time, unit="s")) + "Z",
-        "reveal_status": (after or {}).get("status") if status == 200 else None,
-        "revealed_at": (after or {}).get("revealed_at") if status == 200 else None,
+        "commit_tx_id": tx("commit"),
+        "reveal_tx_id": tx("reveal"),
+        "commit_height": committed,
+        "reveal_height": int(revealed["revealed_at"]),
+        "reveal_window_last_block": deadline,
+        "commit_block_hash": block["hash"],
+        "commit_block_time": format_time_ns(block_time),
+        "reveal_status": revealed["status"],
         "chain_id": record["chain_id"],
         "network_id": record["network_id"],
         "station_id": record["station_id"],
@@ -492,5 +743,5 @@ def record_receipt(out: Path, node: Node) -> dict:
         "rule": "a lead counts only if its valid time is at least 15 minutes after the commit block time",
         **counted_leads(np.datetime64(record["init"], "ns"), block_time),
     }
-    metar.publish_file(Path(out) / "receipt.json", json.dumps(receipt, indent=1) + "\n", root=_live(out))
+    _save(out, "receipt.json", receipt)
     return receipt

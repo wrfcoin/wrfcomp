@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
 from test_live_v4 import H, make_live_world
 
 from wrfcomp.live import chain, paths
@@ -124,12 +125,15 @@ def published(tmp_path, monkeypatch):
     live.build_issue(last, data)
     keys = root / "keys"
     keys.mkdir()
+    keys.chmod(0o700)
     key = keys / "forecaster.key"
     key.write_text("0" * 64)
     key.chmod(0o600)
+    state = tmp_path / "state"
+    state.mkdir()
     cli = tmp_path / "bin" / "wrfcoin"
     cli.parent.mkdir()
-    cli.write_text("#!/bin/sh\nexit 1\n")
+    cli.write_text(FAKE_CLI.format(python=sys.executable, state=str(state)))  # fixed: its hash is pinned
     cli.chmod(0o700)
     monkeypatch.setenv("WRFCOMP_DATA_DIR", str(data))
     return data, root, last, key, cli
@@ -166,6 +170,7 @@ def test_prepare_writes_the_commit_files_once_and_never_opens_the_key(published,
     assert str(key) not in opened and os.fspath(key) not in opened
     out = chain.chain_dir(root, t)
     assert sorted(p.name for p in out.iterdir()) == ["commit.json", "data.json", "manifest.json", "submit.sh"]
+    assert not any((out.parent / ".staging").iterdir())
     data_obj = json.loads((out / "data.json").read_text())
     build = json.loads((live.issue_dir(root, t) / "build.json").read_text())
     assert data_obj["forecast_sha256"] == build["content_sha256"] == record["content_sha256"]
@@ -202,7 +207,7 @@ def test_prepare_refuses_a_bad_forecaster_or_cli(published):
 def test_prepare_refuses_a_key_that_is_not_a_private_0600_file_in_keys(published, tmp_path):
     data, root, last, key, cli = published
     key.chmod(0o644)
-    _expect_refusal(published, "mode 0600")
+    _expect_refusal(published, "mode exactly 0600")
     key.chmod(0o600)
     elsewhere = root / "forecaster.key"
     shutil.copy(key, elsewhere)
@@ -238,15 +243,14 @@ def test_submit_script_shell_quotes_and_never_echoes_the_token(published):
 # -- submit.sh end to end, with a fake CLI and a fake node --------------------------------------------
 
 
-FAKE_CLI = r'''#!{python}
-"""A stand-in for the wrfcoin CLI: same flags and JSON envelope; logs every call; sends nothing."""
-import hashlib, json, sys
+FAKE_CLI = r"""#!{python}
+# A stand-in for the wrfcoin CLI: same flags and JSON envelope; logs every call; sends nothing.
+import hashlib, json, os, sys, time
 from pathlib import Path
 
 state = Path({state!r})
 args = sys.argv[1:]
-log = state / "cli.log"
-with log.open("a") as fh:
+with (state / "cli.log").open("a") as fh:
     fh.write(json.dumps(args) + "\n")
 assert args[:2] == ["--output", "json"] and args[2] == "forecast", args
 kind = args[3]
@@ -263,36 +267,59 @@ data = json.loads(Path(opts["data-file"]).read_text())
 compact = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 pre = f"{{compact}}||{{opts['nonce']}}||{{opts['station-id']}}||{{opts['timestamp']}}||forecast"
 cid = hashlib.sha3_256(pre.encode()).hexdigest()
-if {wrong_id}:
+opt_file = state / "cli_options.json"
+behaviour = json.loads(opt_file.read_text()) if opt_file.exists() else {{}}
+if behaviour.get("wrong_id"):
     cid = "0" * 64
 body = {{"forecaster": opts["forecaster"], "station_id": opts["station-id"], "commit_hash": cid}}
+if kind == "reveal":
+    body.update(payload=data, nonce=opts["nonce"], timestamp=int(opts["timestamp"]),
+                manifest=json.loads(Path(opts["manifest-file"]).read_text()), verification_receipt=None)
 if opts.get("validate_only"):
-    data_out = {{"validated": True, "kind": kind, "submitted": False, "commit_id": cid, "body": body}}
+    out = {{"validated": True, "kind": kind, "submitted": False, "commit_id": cid, "body": body}}
 else:
-    (state / kind).write_text("done")
-    data_out = {{"commit_id": cid, "tx_id": f"tx-{{kind}}-1", "result": {{"id": f"tx-{{kind}}-1"}}}}
-print(json.dumps({{"ok": True, "command": "forecast", "exit_code": 0, "data": data_out}}))
-'''
+    if kind == "commit":
+        time.sleep(behaviour.get("commit_delay", 0))
+    (state / kind).write_text("broadcast")
+    if kind == "commit" and behaviour.get("crash_after_commit") and not (state / "crashed").exists():
+        (state / "crashed").write_text("1")
+        sys.exit(9)  # the broadcast happened; the result never reached the script
+    out = {{"commit_id": cid, "tx_id": f"tx-{{kind}}-1", "result": {{"id": f"tx-{{kind}}-1"}}}}
+print(json.dumps({{"ok": True, "command": "forecast", "exit_code": 0, "data": out}}))
+"""
 
-UV_SHIM = r'''#!{python}
-"""Stands in for `uv run --frozen python -P <script> ...`: run the helper with the fake node."""
-import runpy, sys
+UV_SHIM = r"""#!{python}
+# Stands in for `uv run --frozen python -P <script> ...`: run the helper against the fake node.
+import os, runpy, sys
+from pathlib import Path
 args = sys.argv[1:]
 assert args[:5] == ["run", "--frozen", "python", "-P", "scripts/live_commit.py"], args
+with (Path({state!r}) / "helper_env.log").open("a") as fh:
+    fh.write(repr(sorted(k for k in os.environ if "TOKEN" in k)) + "\n")
 from wrfcomp.live import chain, paths
 chain.NODE_URL = {node!r}
 chain.ALLOWED_NODES = frozenset({{{node!r}}})
 chain.MIN_REQUEST_GAP_S = 0.0
+chain.POLL_SECONDS = 0
 paths.TEMP_DIRS = ()
 sys.argv = ["scripts/live_commit.py", *args[5:]]
 runpy.run_path("scripts/live_commit.py", run_name="__main__")
-'''
+"""
+
+COMMIT_HEIGHT = 40000
 
 
 class FakeNode:
-    def __init__(self, state, init, *, chain_id="888"):
-        self.state, self.init, self.chain_id = state, init, chain_id
-        self.requests = []
+    """A tiny chain. The tip advances one block per status read; the commit lands at 40000 with the
+    3-block reveal window (last block 40003); the reveal lands per ``reveal``: "next" (the next block),
+    "last" (the last eligible block), "never", "late" (one block after the window) or "other" (reported
+    for another commit)."""
+
+    def __init__(self, state, init, *, chain_id="888", reveal="next", block_hash="ab" * 32):
+        self.state, self.init, self.chain_id, self.reveal = state, init, chain_id, reveal
+        when = pd.Timestamp(init + 4 * H + np.timedelta64(15, "m")).tz_localize("UTC")
+        self.block_time = when.isoformat()
+        self.block_hash, self.tip, self.requests, self.revealed_at = block_hash, COMMIT_HEIGHT - 1, [], None
         node = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -312,35 +339,58 @@ class FakeNode:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def answer(self, path):
+        deadline = COMMIT_HEIGHT + 3
         if path == "/network/info":
-            return 200, {"chain_id": self.chain_id, "network_id": "testnet"}
+            return 200, {"chain_id": self.chain_id, "network_id": "testnet", "chain_height": self.tip}
         if path.startswith("/transactions/commit/"):
             cid = path.split("/")[3]
-            if (self.state / "reveal").exists():
-                return 200, {"commit_id": cid, "status": "revealed_pending_attestation", "revealed_at": 40002}
+            self.tip += 1
+            if (self.state / "reveal").exists() and self.revealed_at is None and self.reveal != "never":
+                heights = {"next": self.tip, "last": deadline, "late": deadline + 1, "other": self.tip}
+                self.revealed_at = heights[self.reveal]
+            if self.revealed_at is not None and self.tip >= min(self.revealed_at, deadline):
+                return 200, {
+                    "commit_id": "f" * 64 if self.reveal == "other" else cid,
+                    "station_id": "wrfcomp-live-v4",
+                    "status": "revealed_pending_attestation",
+                    "revealed_at": self.revealed_at,
+                }
             if (self.state / "commit").exists():
-                return 200, {"commit_id": cid, "status": "committed_pending_reveal", "committed_at": 40000}
+                return 200, {
+                    "commit_id": cid,
+                    "station_id": "wrfcomp-live-v4",
+                    "contribution_type": "forecast",
+                    "status": "committed_pending_reveal",
+                    "committed_at": COMMIT_HEIGHT,
+                    "commit_expires_at": COMMIT_HEIGHT + 10,
+                    "reveal_expires_at": deadline,
+                }
             return 404, {"commit_id": cid, "status": "not_found"}
-        if path == "/chain/block/40000":
-            when = pd.Timestamp(self.init + 4 * H + np.timedelta64(15, "m")).tz_localize("UTC").isoformat()
-            return 200, {"ok": True, "data": {"height": 40000, "hash": "ab" * 32, "timestamp": when}}
+        if path == f"/chain/block/{COMMIT_HEIGHT}":
+            data = {"height": COMMIT_HEIGHT, "hash": self.block_hash, "timestamp": self.block_time}
+            return 200, {"ok": True, "data": data}
         return 404, {}
 
 
-def _run_submit(published, tmp_path, *, wrong_id=False, chain_id="888"):
+def _node(tmp_path, published, **kw):
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    return FakeNode(state, published[2] - 12 * H, **kw)
+
+
+def _run_submit(published, tmp_path, *, mode=None, node=None, **cli_kw):
     data, root, last, key, _ = published
     t = last - 12 * H
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
     cli = tmp_path / "bin" / "wrfcoin"
-    cli.write_text(FAKE_CLI.format(python=sys.executable, state=str(state), wrong_id=wrong_id))
-    cli.chmod(0o700)
-    node = FakeNode(state, t, chain_id=chain_id)
+    (state / "cli_options.json").write_text(json.dumps(cli_kw))
+    node = node or FakeNode(state, t)
     shim_dir = tmp_path / "shim"
     shim_dir.mkdir(exist_ok=True)
-    (shim_dir / "uv").write_text(UV_SHIM.format(python=sys.executable, node=node.url))
+    (shim_dir / "uv").write_text(UV_SHIM.format(python=sys.executable, node=node.url, state=str(state)))
     (shim_dir / "uv").chmod(0o700)
-    if not (chain.chain_dir(root, t) / "commit.json").exists():
+    if not chain.chain_dir(root, t).exists():
         _prepare(root, t, key, cli)
     env = {
         "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
@@ -349,64 +399,237 @@ def _run_submit(published, tmp_path, *, wrong_id=False, chain_id="888"):
         "HOME": os.environ.get("HOME", str(tmp_path)),
         "PYTHONPATH": str(REPO / "src"),
     }
-    result = subprocess.run(
-        ["bash", str(chain.chain_dir(root, t) / "submit.sh")],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    node.server.shutdown()
-    calls = (
-        [json.loads(line) for line in (state / "cli.log").read_text().splitlines()]
-        if (state / "cli.log").exists()
-        else []
-    )
-    return result, calls, chain.chain_dir(root, t), node, t
+    argv = ["bash", str(chain.chain_dir(root, t) / "submit.sh"), *([mode] if mode else [])]
+    result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=300)
+    return result, _calls(state), chain.chain_dir(root, t), node, t
+
+
+def _calls(state):
+    log = state / "cli.log"
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def _broadcasts(calls, kind):
+    return [c for c in calls if c[3] == kind and "--validate-only" not in c]
+
+
+def _no_token_anywhere(result, out, state):
+    texts = [result.stdout, result.stderr]
+    texts += [p.read_text(errors="replace") for p in out.parent.parent.rglob("*") if p.is_file()]
+    assert not any("token-must-never-appear" in t for t in texts)
+    log = state / "helper_env.log"
+    helper_envs = log.read_text().splitlines() if log.exists() else []
+    assert helper_envs and all(line == "[]" for line in helper_envs)  # helper steps run without the bearer
 
 
 def test_submit_sh_commits_waits_reveals_and_writes_the_receipt(published, tmp_path):
     result, calls, out, node, t = _run_submit(published, tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     kinds = [(c[3], "--validate-only" in c) for c in calls]
-    assert kinds == [("commit", True), ("commit", False), ("reveal", False)]
+    assert kinds == [("commit", True), ("commit", False), ("reveal", True), ("reveal", False)]
     for c in calls[:2]:
         assert c[c.index("--chain-id") + 1] == "888" and c[c.index("--network-id") + 1] == "testnet"
-    assert "--signer-key" not in calls[2] and "--receipt-file" not in calls[2]
+    assert all("--signer-key" not in c for c in calls[2:]) and all("--receipt-file" not in c for c in calls)
     receipt = json.loads((out / "receipt.json").read_text())
     record = json.loads((out / "commit.json").read_text())
-    assert receipt["commit_id"] == record["commit_id"] and receipt["commit_height"] == 40000
+    assert receipt["commit_id"] == record["commit_id"] and receipt["commit_height"] == COMMIT_HEIGHT
+    assert (
+        COMMIT_HEIGHT <= receipt["reveal_height"] <= receipt["reveal_window_last_block"] == COMMIT_HEIGHT + 3
+    )
     assert receipt["commit_tx_id"] == "tx-commit-1" and receipt["reveal_tx_id"] == "tx-reveal-1"
     assert receipt["counted_leads_hours"] == [6, 12, 24, 48] and receipt["late_leads_hours"] == [1, 3]
-    assert receipt["reveal_status"] == "revealed_pending_attestation"
     assert all(not p.startswith("/transactions/forecast") for p in node.requests)  # only reads
-    everything = (
-        result.stdout
-        + result.stderr
-        + "".join(
-            p.read_text()
-            for p in out.parent.parent.rglob("*")
-            if p.is_file() and p.suffix in (".json", ".sh", ".log")
-        )
-    )
-    assert "token-must-never-appear" not in everything
-    # A second run refuses before any CLI call.
-    again, calls_again, *_ = _run_submit(published, tmp_path)
-    assert again.returncode != 0 and "already attempted" in again.stdout
+    _no_token_anywhere(result, out, tmp_path / "state")
+    again, calls_again, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
+    assert again.returncode != 0 and "never sent twice" in again.stdout
     assert len(calls_again) == len(calls)
 
 
+@pytest.mark.parametrize("reveal, ok", [("last", True), ("never", False), ("late", False), ("other", False)])
+def test_a_receipt_only_for_our_reveal_included_inside_the_window(published, tmp_path, reveal, ok):
+    """On the last eligible block: a receipt. Still pending when the window closes, reported after it,
+    or reported for another commit: no receipt, and a non-zero exit."""
+    node = _node(tmp_path, published, reveal=reveal)
+    result, calls, out, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
+    assert len(_broadcasts(calls, "reveal")) == 1
+    if ok:
+        assert result.returncode == 0, result.stderr
+        assert json.loads((out / "receipt.json").read_text())["reveal_height"] == COMMIT_HEIGHT + 3
+    else:
+        assert result.returncode != 0 and "no receipt" in result.stderr
+        assert not (out / "receipt.json").exists()
+    _no_token_anywhere(result, out, tmp_path / "state")
+
+
+def test_no_reveal_is_broadcast_once_the_window_has_closed(published, tmp_path):
+    node = _node(tmp_path, published)
+    real = node.answer
+
+    def tip_runs_ahead(path):
+        status, body = real(path)
+        if path == "/network/info" and (node.state / "commit").exists():
+            body = {**body, "chain_height": COMMIT_HEIGHT + 3}  # the next block is past the window
+        return status, body
+
+    node.answer = tip_runs_ahead
+    result, calls, out, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
+    assert result.returncode != 0 and "window has closed" in result.stderr
+    assert _broadcasts(calls, "reveal") == [] and not (out / "receipt.json").exists()
+
+
+def test_a_wrong_commit_id_in_the_pending_status_stops_the_reveal(published, tmp_path):
+    node = _node(tmp_path, published)
+    real = node.answer
+
+    def wrong_pending(path):
+        status, body = real(path)
+        if isinstance(body, dict) and body.get("status") == "committed_pending_reveal":
+            body = {**body, "commit_id": "e" * 64}
+        return status, body
+
+    node.answer = wrong_pending
+    result, calls, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
+    assert result.returncode != 0 and "another commit" in result.stderr
+    assert _broadcasts(calls, "reveal") == []
+
+
+def test_a_changed_manifest_means_zero_reveal_submissions(published, tmp_path):
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    _prepare(root, t, key, cli)
+    path = chain.chain_dir(root, t) / "manifest.json"
+    other = json.loads(path.read_text())
+    other["produced_at"] += 1  # structurally valid, same commit id, a different manifest
+    path.write_text(json.dumps(other, separators=(",", ":")) + "\n")
+    result, calls, out, node, _ = _run_submit(published, tmp_path)
+    node.server.shutdown()
+    assert result.returncode != 0 and "manifest.json differs" in result.stderr
+    assert [c for c in calls if c[3] == "reveal"] == []
+    assert len(_broadcasts(calls, "commit")) == 1
+
+
+def test_the_cli_reveal_body_must_equal_the_prepared_reveal(published):
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    _prepare(root, t, key, cli)
+    out = chain.chain_dir(root, t)
+    record = json.loads((out / "commit.json").read_text())
+    body = {
+        "forecaster": record["forecaster"],
+        "station_id": record["station_id"],
+        "payload": json.loads((out / "data.json").read_text()),
+        "nonce": record["nonce"],
+        "timestamp": record["timestamp"],
+        "commit_hash": record["commit_id"],
+        "manifest": json.loads((out / "manifest.json").read_text()),
+        "verification_receipt": None,
+    }
+    valid = {"validated": True, "submitted": False, "kind": "reveal", "commit_id": record["commit_id"]}
+    good = {"ok": True, "data": {**valid, "body": body}}
+    (out / "reveal_validate.json").write_text(json.dumps(good))
+    chain.check_reveal_validate(out)
+    changes = (
+        {"nonce": "x"},
+        {"manifest": {**body["manifest"], "region": "elsewhere"}},
+        {"verification_receipt": {}},
+    )
+    for change in changes:
+        bad = json.loads(json.dumps(good))
+        bad["data"]["body"].update(change)
+        (out / "reveal_validate.json").write_text(json.dumps(bad))
+        with pytest.raises(chain.ChainRefusedError, match="reveal body differs"):
+            chain.check_reveal_validate(out)
+
+
+def test_two_concurrent_submit_runs_broadcast_one_commit(published, tmp_path):
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    node = _node(tmp_path, published)
+    _prepare(root, t, key, cli)
+    results = []
+
+    def run():
+        results.append(_run_submit(published, tmp_path, node=node, commit_delay=2)[0])
+
+    first = threading.Thread(target=run)
+    first.start()
+    for _ in range(400):
+        if (chain.chain_dir(root, t) / "commit.claim").exists():
+            break
+        threading.Event().wait(0.05)
+    second = threading.Thread(target=run)
+    second.start()
+    first.join(300)
+    second.join(300)
+    node.server.shutdown()
+    assert sorted(r.returncode for r in results) == [0, 1], [r.stdout + r.stderr for r in results]
+    assert any("another submit.sh is running" in r.stdout for r in results)
+    assert len(_broadcasts(_calls(node.state), "commit")) == 1
+
+
+def test_resume_after_an_interrupted_commit_never_rebroadcasts_it(published, tmp_path):
+    node = _node(tmp_path, published)
+    first, calls, out, *_ = _run_submit(published, tmp_path, node=node, crash_after_commit=True)
+    assert (
+        first.returncode != 0
+        and (out / "commit.claim").is_dir()
+        and not (out / "commit_result.json").exists()
+    )
+    plain, calls, *_ = _run_submit(published, tmp_path, node=node, crash_after_commit=True)
+    assert plain.returncode != 0 and "never sent twice" in plain.stdout
+    resumed, calls, *_ = _run_submit(published, tmp_path, mode="resume", node=node, crash_after_commit=True)
+    node.server.shutdown()
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert len(_broadcasts(calls, "commit")) == 1 and len(_broadcasts(calls, "reveal")) == 1
+    receipt = json.loads((out / "receipt.json").read_text())
+    assert receipt["commit_tx_id"] is None and receipt["reveal_tx_id"] == "tx-reveal-1"
+    _no_token_anywhere(resumed, out, node.state)
+
+
+def test_resume_refuses_when_nothing_was_committed(published, tmp_path):
+    data, root, last, key, cli = published
+    _prepare(root, last - 12 * H, key, cli)
+    result, calls, out, node, _ = _run_submit(published, tmp_path, mode="resume")
+    node.server.shutdown()
+    assert result.returncode != 0 and "nothing was committed" in result.stdout and calls == []
+
+
 def test_submit_sh_stops_before_committing_when_the_cli_disagrees_on_the_commit_id(published, tmp_path):
-    result, calls, out, *_ = _run_submit(published, tmp_path, wrong_id=True)
+    result, calls, out, node, _ = _run_submit(published, tmp_path, wrong_id=True)
+    node.server.shutdown()
     assert result.returncode != 0 and "differs from the helper" in result.stderr
     assert [("--validate-only" in c) for c in calls] == [True]
-    assert not (out / "commit_result.json").exists()
+    assert not (out / "commit.claim").exists()
+    _no_token_anywhere(result, out, tmp_path / "state")
 
 
 def test_submit_sh_stops_before_anything_on_another_chain(published, tmp_path):
-    result, calls, out, *_ = _run_submit(published, tmp_path, chain_id="777")
+    node = _node(tmp_path, published, chain_id="777")
+    result, calls, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
     assert result.returncode != 0 and "refusing" in result.stderr
     assert calls == []
+
+
+def test_submit_sh_rechecks_the_key_folder_before_signing(published, tmp_path):
+    data, root, last, key, cli = published
+    _prepare(root, last - 12 * H, key, cli)
+    (root / "keys").chmod(0o755)
+    result, calls, out, node, _ = _run_submit(published, tmp_path)
+    node.server.shutdown()
+    (root / "keys").chmod(0o700)
+    assert result.returncode != 0 and "mode exactly 0700" in result.stderr and calls == []
+
+
+def test_a_pending_block_hash_gives_no_receipt(published, tmp_path):
+    node = _node(tmp_path, published, block_hash="pending")
+    result, calls, out, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
+    assert result.returncode != 0 and "no final hash" in result.stderr and not (out / "receipt.json").exists()
 
 
 def test_wait_pending_refuses_an_unexpected_status_and_times_out(published):
@@ -431,3 +654,106 @@ def test_the_commit_script_refuses_to_start_on_windows(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["live_commit.py", "check-cli", "--dir", "x"])
     with pytest.raises(live.LiveRefusedError, match="not supported on Windows"):
         runpy.run_path(str(REPO / "scripts" / "live_commit.py"), run_name="__main__")
+
+
+# -- binding the metadata to the published store ------------------------------------------------------
+
+
+def _store_and_records(root, t):
+    issue = live.issue_dir(root, t)
+    return issue / "v4.zarr", issue / "build.json", issue / "inputs.json"
+
+
+def _rewrite(path, change):
+    record = json.loads(path.read_text())
+    record.update(change)
+    path.chmod(0o600)
+    path.write_text(json.dumps(record))
+
+
+@pytest.mark.parametrize(
+    "where, change, message",
+    [
+        ("build", {"init": "2026-03-09T00"}, "another issue"),
+        ("inputs", {"init": "2026-03-09T00"}, "another issue"),
+        ("build", {"model_id": "gefs-station-corrected"}, "model differs"),
+        ("build", {"model_version": "2"}, "model differs"),
+    ],
+)
+def test_prepare_refuses_a_record_that_disagrees_with_the_store(published, where, change, message):
+    data, root, last, key, cli = published
+    _, build, inputs = _store_and_records(root, last - 12 * H)
+    _rewrite(build if where == "build" else inputs, change)
+    _expect_refusal(published, message)
+
+
+@pytest.mark.parametrize("attrs", [{"model_version": "2"}, {"model_id": "x"}])
+def test_prepare_refuses_a_store_whose_own_model_attributes_are_not_v4(published, attrs):
+    """content_sha256 deliberately ignores attributes: same hash, another model. Refused on the attrs,
+    also when the build record was changed to agree with them."""
+    import zarr
+
+    data, root, last, key, cli = published
+    store, build, _ = _store_and_records(root, last - 12 * H)
+    zarr.open_group(str(store), mode="r+").attrs.update(attrs)
+    xr.open_zarr(store, chunks=None).close()
+    _rewrite(build, attrs)
+    _expect_refusal(published, "not candidate v4")
+
+
+def test_prepare_refuses_another_issues_store_with_a_matching_hash(published):
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    other_store, other_build, _ = _store_and_records(root, t - 12 * H)
+    store, build, _ = _store_and_records(root, t)
+    shutil.rmtree(store)
+    shutil.copytree(other_store, store)
+    _rewrite(build, {"content_sha256": json.loads(other_build.read_text())["content_sha256"]})
+    _expect_refusal(published, "not the requested issue")
+
+
+def test_prepare_refuses_a_key_folder_that_is_not_exactly_0700(published):
+    data, root, last, key, cli = published
+    for mode in (0o755, 0o750, 0o701):
+        (root / "keys").chmod(mode)
+        _expect_refusal(published, "mode exactly 0700")
+    (root / "keys").chmod(0o700)
+    key.chmod(0o640)
+    _expect_refusal(published, "mode exactly 0600")
+
+
+def test_an_interrupted_prepare_leaves_nothing_and_can_run_again(published):
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    original = chain.metar.publish_file
+
+    def fail_on_script(path, text, *, root):
+        if Path(path).name == "submit.sh":
+            raise OSError("power cut")
+        return original(path, text, root=root)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(chain.metar, "publish_file", fail_on_script)
+        with pytest.raises(OSError, match="power cut"):
+            _prepare(root, t, key, cli)
+    out = chain.chain_dir(root, t)
+    assert not out.exists() and not any((out.parent / ".staging").iterdir())
+    _prepare(root, t, key, cli)
+    assert (out / "submit.sh").is_file()
+
+
+def test_exact_nanosecond_timeliness_survives_the_receipt():
+    t = np.datetime64("2026-12-02T00", "ns")
+    edge = t + 6 * H - np.timedelta64(15, "m")
+    for offset_ns, counted in ((0, True), (1, False), (1000, False)):
+        text = pd.Timestamp(edge + np.timedelta64(offset_ns, "ns")).tz_localize("UTC").isoformat()
+        block = chain.parse_time_ns(text)
+        assert block == edge + np.timedelta64(offset_ns, "ns")
+        leads = chain.counted_leads(t, block)
+        assert (6 in leads["counted_leads_hours"]) is counted
+        stored = chain.format_time_ns(block)
+        assert chain.counted_leads(t, chain.parse_time_ns(stored)) == leads  # recomputable from the receipt
+    shifted = chain.parse_time_ns("2026-12-02T07:45:00.000000001+02:00")
+    assert shifted == np.datetime64("2026-12-02T05:45:00.000000001", "ns")
+    with pytest.raises(chain.ChainRefusedError):
+        chain.parse_time_ns("2026-12-02 05:45:00")

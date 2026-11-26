@@ -8,9 +8,12 @@
 The operator then runs ``bash <live>/chain/<issue>/submit.sh``, which calls the wrfcoin CLI and
 these steps (each takes --dir <live>/chain/<issue>):
 
-  check-cli | check-node | check-validate | check-submitted --step commit|reveal | wait-pending | record
+  check-cli | check-key | check-node | check-validate | check-submitted --step commit|reveal |
+  wait-pending | check-reveal-inputs | check-reveal-validate | check-window | wait-revealed | record
 
-The throwaway forecaster key is made once with the CLI (never a producer, oracle or station key):
+The throwaway forecaster key is made once with the CLI (never a producer, oracle or station key),
+in a folder made first with mode 0700:
+  install -d -m 0700 <live>/keys
   wrfcoin --output json session-key keygen --out <live>/keys/forecaster.key
 Its "session_key_address" is the --forecaster address.
 
@@ -53,7 +56,18 @@ def main() -> None:
     prep.add_argument("--cli", required=True, type=Path)
     prep.add_argument("--cli-sha256", required=True)
     prep.add_argument("--allow-12z", action="store_true")
-    for name in ("check-cli", "check-node", "check-validate", "wait-pending", "record"):
+    for name in (
+        "check-cli",
+        "check-key",
+        "check-node",
+        "check-validate",
+        "wait-pending",
+        "check-reveal-inputs",
+        "check-reveal-validate",
+        "check-window",
+        "wait-revealed",
+        "record",
+    ):
         sub.add_parser(name).add_argument("--dir", required=True)
     submitted = sub.add_parser("check-submitted")
     submitted.add_argument("--step", required=True, choices=("commit", "reveal"))
@@ -78,6 +92,16 @@ def main() -> None:
     out = _chain_dir(root, args.dir)
     if args.command == "check-cli":
         chain.check_cli(out)
+    elif args.command == "check-key":
+        chain.check_key(out)
+    elif args.command == "check-reveal-inputs":
+        chain.check_reveal_inputs(out)
+    elif args.command == "check-reveal-validate":
+        chain.check_reveal_validate(out)
+    elif args.command == "check-window":
+        print(json.dumps({"tip": chain.check_window(out, chain.Node())}))
+    elif args.command == "wait-revealed":
+        print(json.dumps({"revealed_at": chain.wait_revealed(out, chain.Node())["revealed_at"]}))
     elif args.command == "check-node":
         info = chain.check_node(out, chain.Node())
         print(json.dumps({"chain_id": info.get("chain_id"), "network_id": info.get("network_id")}))
@@ -87,11 +111,9 @@ def main() -> None:
         print(json.dumps({"tx_id": chain.check_submitted(out, args.step)["tx_id"]}))
     elif args.command == "wait-pending":
         print(json.dumps({"status": chain.wait_pending(out, chain.Node())["status"]}))
-    else:
+    elif args.command == "record":
         receipt = chain.record_receipt(out, chain.Node())
-        print(
-            json.dumps({k: receipt[k] for k in ("commit_height", "counted_leads_hours", "late_leads_hours")})
-        )
+        print(json.dumps({k: receipt[k] for k in ("commit_height", "reveal_height", "counted_leads_hours")}))
 
 
 if __name__ == "__main__":

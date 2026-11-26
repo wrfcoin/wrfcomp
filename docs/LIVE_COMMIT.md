@@ -23,9 +23,12 @@ The operator runs one script.
 1. **CLI binary.** Build the `wrfcoin` CLI on a build machine that runs no live node, or take it from
    a release. Note its sha256.
 2. **Throwaway forecaster key.** Make it with the CLI, made for this purpose only: never a producer,
-   oracle or station key.
+   oracle or station key. Make the key folder first, owned by you with mode exactly 0700; prepare,
+   and `submit.sh` again right before every signing step, refuse any other mode on the folder, and
+   anything but 0600 on the key file:
 
    ```
+   install -d -m 0700 ~/wrfcomp-data/live/keys
    wrfcoin --output json session-key keygen --out ~/wrfcomp-data/live/keys/forecaster.key
    ```
 
@@ -45,36 +48,51 @@ uv run python -P scripts/live_commit.py prepare --init 2026-12-02T00 \
     --cli /path/to/wrfcoin --cli-sha256 <sha256>
 ```
 
-This writes `~/wrfcomp-data/live/chain/2026-12-02T00Z/` once: `data.json`, `manifest.json`,
-`commit.json` and `submit.sh`. The operator then runs:
+Prepare first checks the published issue against itself: the store's single init and its own
+model attributes (`gefs-station-corrected-own`, version 1) must agree with the requested issue,
+`build.json` and the pinned `inputs.json`, because the content hash covers the numbers and not the
+attributes. It then writes `~/wrfcomp-data/live/chain/2026-12-02T00Z/` as a whole: `data.json`,
+`manifest.json`, `commit.json` and `submit.sh` are staged together and moved into place in one rename,
+so an interrupted prepare leaves nothing and can be run again. The operator then runs:
 
 ```
 bash ~/wrfcomp-data/live/chain/2026-12-02T00Z/submit.sh
 ```
 
-`submit.sh` stops at the first failure. Its steps:
+`submit.sh` stops at the first failure. One run at a time: a second run for the same issue is
+refused while one is active. Its steps:
 
-1. Check that the CLI binary's sha256 equals the one recorded at prepare.
-2. Check that the node (`http://127.0.0.1:8556`, the local node; nothing else) is chain 888 `testnet`.
-3. Validate the commit offline (`--validate-only`). The CLI's commit id must equal the helper's,
-   and the body must name the same forecaster and station.
-4. Commit.
-5. Read the commit status every 20 s until it is `committed_pending_reveal`.
-6. Reveal the data object and the manifest. No oracle receipt is attached.
-7. Write `receipt.json`:
-   - the commit and reveal transaction ids;
-   - the commit height, block hash and block time;
-   - the reveal status;
-   - which leads count.
+1. Check the CLI binary's sha256, the key folder and file, and that the node
+   (`http://127.0.0.1:8556`, the local node; nothing else) is chain 888 `testnet`.
+2. Validate the commit offline (`--validate-only`): the CLI's commit id must equal the helper's, and
+   the body must name the same forecaster and station. Recheck the key, then claim the commit
+   (`commit.claim`) and commit. The commit is never broadcast twice.
+3. Wait until the node reports OUR commit (same id, station and type) as `committed_pending_reveal`,
+   and save its heights: the reveal must land at a block from `committed_at` to the earlier of
+   `commit_expires_at` and `reveal_expires_at` (the chain's own rule, commit_reveal.rs).
+4. Before the reveal: rederive the commit id and the manifest digest from the exact files it will
+   send, check the manifest describes the committed store, and require the CLI's offline reveal body
+   to equal the prepared reveal exactly. Refuse if the next block is already past the window. Then
+   claim the reveal (`reveal.claim`) and reveal the data object and manifest (no oracle receipt).
+5. Wait until the chain reports OUR reveal included at a height inside the window. Only then is
+   `receipt.json` written: the commit and reveal transaction ids, the commit and reveal heights, the
+   window's last block, the commit block's hash (it must be final) and time (to the nanosecond, as
+   the node gives it), and which leads count. A reveal still pending when the window closes, or
+   reported outside it or for another commit, gives no receipt and a non-zero exit.
 
-The script refuses to run again once a commit has been attempted in that folder. If a run stops
-after step 4, check the commit status before doing anything else. A reveal later than 3 blocks
-after the commit is refused by the chain.
+The helper steps run without the operator bearer in their environment; only the CLI sees it, and
+nothing prints it.
+
+**If a run is interrupted**, run `bash submit.sh resume`. It never broadcasts the commit again: it
+continues from the chain's status (wait for the pending commit, reveal if that has not been claimed,
+wait for the included reveal, write the receipt). If a run was killed, remove the `active` folder
+only after checking that no run is still going.
 
 ## Which leads count
 
 The GEFS cycle for T is complete about 4 h after T, so the commit lands after T. A lead counts live
-only if its valid time is at least 15 minutes after the commit block's time (docs/LIVE_V4.md).
+only if its valid time is at least 15 minutes after the commit block's time (docs/LIVE_V4.md),
+compared exactly in integer nanoseconds: a lead 1 ns past the cutoff is late.
 `receipt.json` lists `counted_leads_hours` and `late_leads_hours`. With a commit at about T + 4 h 15 min,
 leads 6, 12, 24 and 48 count. Only 00Z issues are committed; 12Z needs `--allow-12z`.
 
@@ -97,7 +115,7 @@ leads 6, 12, 24 and 48 count. Only 00Z issues are committed; 12Z needs `--allow-
 
 Only unauthenticated GETs to the local node, at least 3 s apart:
 
-- `/network/info`
+- `/network/info` (chain id, network id, chain height)
 - `/transactions/commit/<id>/status`
 - `/chain/block/<height>`
 
