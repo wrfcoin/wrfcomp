@@ -57,7 +57,7 @@ import xarray as xr
 
 from wrfcomp.harness.truth import OFFSET_FILL_VALUE, match_station_to_hours
 from wrfcomp.live.locks import file_lock
-from wrfcomp.live.paths import check_target
+from wrfcomp.live.paths import check_target, refuse_windows
 
 API = "https://aviationweather.gov/api/data/metar"
 USER_AGENT = "wrfcomp-live/0.1"
@@ -164,6 +164,7 @@ def fetch(
     The file is named by its COMPLETION time, to the microsecond, taken after the last response and
     before the file is linked into place: a fetch is available from that moment, never earlier.
     Returns the file and the payload bytes received."""
+    refuse_windows()  # an entry point of the live run
     if not 1 <= hours <= MAX_HOURS:
         raise ValueError(f"hours must be 1..{MAX_HOURS}")
     clock = clock or (lambda: datetime.now(UTC))

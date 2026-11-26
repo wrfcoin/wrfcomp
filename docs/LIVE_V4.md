@@ -153,11 +153,18 @@ policy (identical numbers).
     the last component included), is not inside the real live folder. This is checked before every
     write: fetch files, locks, staging, issue folders, GEFS cycles and every entry of the GEFS point
     cache (before and after each fetch). Links are also refused by name with a clearer message.
-- The check sits in the lowest-level writers themselves (`metar.publish_file`, `LiveYear.write`,
-  `locks.file_lock`; everything else is built on them). Each takes the live root as a required
-  argument and refuses unless it is a real live root and the target is inside it, so no library
-  entry point can write around it.
-- **Live writes are refused on Windows.** Directory junctions and locked files make a full-path
+- The check sits in the lowest-level writers themselves: `metar.publish_file`, `locks.file_lock`,
+  and the two write paths of the frozen code a `LiveYear` policy carries (its private
+  `io.write` and `gefs.extract`, wrapped). A `LiveYear` is bound to one live root; without one it can
+  replay but not write. Everything else writes through these, so no library entry point can write
+  around the check.
+- A write-audit test runs a full synthetic live run (METAR fetch, GEFS fetch through the extractor
+  and its cache, build) with every filesystem write primitive recorded (`open` in write modes,
+  `os.open` with write flags, renames, links, folders, removals, `shutil`, temp files, Zarr and
+  NetCDF writes, `Path.write_*`): every target must lie under the live root and under a path the
+  check approved first.
+- **Live writes are refused on Windows**, at every entry point (`build_issue`, `fetch_cycle`,
+  `metar.fetch`, the script) and again in every writer. Directory junctions and locked files make a full-path
   check unreliable there, and the daily live run is on Linux. Reading, tests and the evaluation code
   are unaffected; the live writer tests run on Linux and macOS, and a test checks the Windows
   refusal on every platform.

@@ -38,6 +38,7 @@ def main() -> None:
     build = sub.add_parser("build")
     build.add_argument("--init", required=True)
     args = parser.parse_args()
+    live.refuse_windows_entry()  # the daily live run is on Linux
     root = live.live_root()
     if args.step in ("fetch-gefs", "fetch-metar") and not args.network:
         parser.error("this step downloads data; pass --network once the download is approved")

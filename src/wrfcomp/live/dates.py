@@ -24,6 +24,7 @@ import functools
 import hashlib
 import importlib.util
 import itertools
+import os
 import sys
 import threading
 from datetime import UTC, datetime
@@ -35,7 +36,7 @@ from wrfcomp.baselines import gefs as shared_gefs
 from wrfcomp.baselines import io as shared_io
 from wrfcomp.harness import schemas
 from wrfcomp.harness.config import load_config
-from wrfcomp.live.paths import check_target
+from wrfcomp.live.paths import LivePathError, check_target
 from wrfcomp.models import citizen_arms as shared_arms
 from wrfcomp.models import gefs_station_v2 as shared_v2
 from wrfcomp.models import gefs_station_v3 as shared_v3
@@ -73,7 +74,9 @@ def _sha256(path: str) -> str:
 class LiveYear:
     """The frozen code for one live year: ``.gefs``, ``.v2``, ``.v3``, ``.arms`` and ``.write``."""
 
-    def __init__(self, year: int):
+    def __init__(self, year: int, root: Path | None = None):
+        """``root``: the live folder this policy may write under. Without it the policy can replay
+        and read but every write through it (``write``, ``io.write``, ``gefs.extract``) is refused."""
         if not isinstance(year, int) or isinstance(year, bool) or year < FIRST_LIVE_YEAR:
             raise LiveRefusedError(f"live years are {FIRST_LIVE_YEAR} or later, not {year!r}")
         self.year = year
@@ -109,6 +112,28 @@ class LiveYear:
         self.arms = _private(shared_arms, tag)
         self.arms.v2 = self.v2
 
+        # Every write the private copies can make goes through these two: the frozen io.write and the
+        # frozen GEFS extractor (its point cache). Both are bound to this policy's live root.
+        self.root = None if root is None else Path(root)
+        frozen_write, frozen_extract = self.io.write, self.gefs.extract
+
+        def guarded_write(ds, path):
+            self.check_store_year(ds)
+            check_target(self._root(), Path(path).parent)
+            check_target(self._root(), path)
+            frozen_write(ds, path)
+
+        def guarded_extract(stations, init, cache, transfer):
+            check_target(self._root(), cache)
+            try:
+                return frozen_extract(stations, init, cache, transfer)
+            finally:
+                for here, dirs, files in os.walk(cache, followlinks=False):
+                    for name in dirs + files:
+                        check_target(self._root(), Path(here) / name)
+
+        self.io.write, self.gefs.extract = guarded_write, guarded_extract
+
         shared = (shared_io, shared_gefs, shared_v2, shared_v3, shared_arms)
         copies = (self.io, self.gefs, self.v2, self.v3, self.arms)
         self.sources = {m.__name__: _sha256(m.__file__) for m in shared}
@@ -122,11 +147,15 @@ class LiveYear:
         if inits.min() < start or (inits[:, None] + ds.lead_time.values[None, :]).max() >= end:
             raise LiveRefusedError(f"a store outside the live year {self.year}")
 
-    def write(self, ds, path, *, root) -> None:
+    def _root(self) -> Path:
+        if self.root is None:
+            raise LivePathError("this live policy has no live root; it cannot write")
+        return self.root
+
+    def write(self, ds, path, *, root=None) -> None:
         """``baselines.io.write`` with the live year's config, after checking every time is in it and
-        that ``path`` is an allowed live write target under the live ``root`` (``paths.check_target``,
-        which also refuses on Windows)."""
-        self.check_store_year(ds)
-        check_target(root, Path(path).parent)
-        check_target(root, path)
+        that ``path`` is an allowed live write target under the policy's live root
+        (``paths.check_target``, which also refuses on Windows). ``root``, if given, must be it."""
+        if root is not None and (self.root is None or Path(root) != self.root):
+            raise LivePathError("write under another root than this live policy's")
         self.io.write(ds, path)

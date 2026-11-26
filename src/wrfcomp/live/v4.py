@@ -56,12 +56,22 @@ from wrfcomp.live.paths import (
     check_data_dir,
     check_live_root,
     check_target,
+    refuse_windows,
 )
 
 ISSUE_HOURS = (0, 12)
 HOUR = np.timedelta64(1, "h")
 S3 = "https://noaa-gefs-pds.s3.amazonaws.com"
 # -- places ------------------------------------------------------------------------------------
+
+
+def refuse_windows_entry() -> None:
+    """The live run's entry points (``build_issue``, ``fetch_cycle``, ``metar.fetch``, the script)
+    refuse to start on Windows: the daily live run is on Linux."""
+    try:
+        refuse_windows()
+    except LivePathError as exc:
+        raise LiveRefusedError(str(exc)) from exc
 
 
 def default_data_dir() -> Path:
@@ -186,9 +196,10 @@ def fetch_cycle(
 ) -> dict:
     """Fetch GEFS cycle ``t`` at the stations and keep it, once, as ``gefs/<YYYYMMDDHH>.zarr``."""
     t = check_issue(t)
-    policy = LiveYear(pd.Timestamp(t).year) if policy is None else policy
-    if policy.year != pd.Timestamp(t).year:
-        raise LiveRefusedError("the live policy is for another year")
+    refuse_windows_entry()
+    policy = LiveYear(pd.Timestamp(t).year, root=root) if policy is None else policy
+    if policy.year != pd.Timestamp(t).year or policy.root != Path(root):
+        raise LiveRefusedError("the live policy is for another year or another live folder")
     with _lock(root, f"gefs-{pd.Timestamp(t):%Y%m%d%H}"):
         dest = safe(root, raw_path(root, t))
         if dest.exists():
@@ -400,10 +411,11 @@ def build_issue(t, data: Path | None = None, *, now=None) -> dict:
     published store that does not reproduce. Each new issue is assembled in a staging folder and moved
     into place in one rename only after its store is built; a failed build publishes nothing for the
     issue it failed on and leaves no pin behind."""
+    refuse_windows_entry()
     root = live_root(data)
     t = check_issue(t)
     year = pd.Timestamp(t).year
-    policy = LiveYear(year)
+    policy = LiveYear(year, root=root)
     with _lock(root, "build"):
         # The synchronization point with fetch publication: the build start and the one list of
         # eligible fetches are taken together under the fetch lock.

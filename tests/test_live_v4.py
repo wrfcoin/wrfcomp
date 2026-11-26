@@ -554,13 +554,13 @@ def test_fetch_cycle_checks_every_index_and_keeps_the_raw_store(tmp_path, monkey
         return [100.0, 280.0, 90.0, -2.0, 1.0, 99000.0][interval[0]]
 
     monkeypatch.setattr(gefs.Transfer, "get", fake_get)
-    policy = LiveYear(2026)
-    monkeypatch.setattr(
-        policy.gefs, "points", lambda value, stations: np.full(stations.sizes["station_id"], value)
-    )
     monkeypatch.setattr(live, "stations", site)
     monkeypatch.setattr(paths, "TEMP_DIRS", ())
     root = live.live_root(tmp_path / "wrfcomp-data")
+    policy = LiveYear(2026, root=root)
+    monkeypatch.setattr(
+        policy.gefs, "points", lambda value, stations: np.full(stations.sizes["station_id"], value)
+    )
     out = live.fetch_cycle(root, t, policy=policy)
     assert all(u.startswith(f"{live.S3}/gefs.20261202/00/atmos/pgrb2ap5/") for u in asked)
     with xr.open_zarr(out["path"], chunks=None) as kept:
@@ -625,7 +625,7 @@ def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", 
     )
     root = live.live_root(data)
     for raw in raws:
-        POLICY_2026.write(raw, live.raw_path(root, raw.init_time.values[0]), root=root)
+        LiveYear(2026, root=root).write(raw, live.raw_path(root, raw.init_time.values[0]))
     last = raws[-1].init_time.values[0]
     _write_fetch(_world_reports(labels, sig) + list(extra_reports), root / "metar", _stamp(last + 4 * H))
     return root, raws, last
@@ -853,7 +853,7 @@ def test_a_lost_or_changed_pinned_cycle_is_refused(live_world):
     shutil.rmtree(kept.with_name("away.zarr"))
     changed = raws[5].copy(deep=True)
     changed["t2m"].values[:] += 1
-    POLICY_2026.write(changed, kept, root=root)
+    LiveYear(2026, root=root).write(changed, kept)
     with pytest.raises(LiveRefusedError, match="differs from its pinned hash"):
         live.build_issue(last, data)
 
@@ -866,7 +866,7 @@ def test_a_published_issue_that_does_not_reproduce_is_refused(live_world):
     other = xr.open_zarr(store, chunks=None).load()
     other["t2m"].values[:] += 0.5
     shutil.rmtree(store)
-    POLICY_2026.write(other, store, root=root)
+    LiveYear(2026, root=root).write(other, store)
     with pytest.raises(LiveRefusedError, match="does not reproduce"):
         live.build_issue(last, data)
     # A failed prefix check leaves no pin, hash, store or build record for the next issue.
@@ -956,7 +956,7 @@ def test_fetch_cycle_refuses_a_link_inside_the_gefs_cache(tmp_path, monkeypatch)
     (tmp_path / "elsewhere").mkdir()
     os.symlink(tmp_path / "elsewhere", root / "cache" / "gefs-v1")
     with pytest.raises(LiveRefusedError, match="linked path"):
-        live.fetch_cycle(root, np.datetime64("2026-12-02T00", "ns"), policy=LiveYear(2026))
+        live.fetch_cycle(root, np.datetime64("2026-12-02T00", "ns"), policy=LiveYear(2026, root=root))
     assert not any((tmp_path / "elsewhere").iterdir())
 
 
@@ -1139,3 +1139,175 @@ def test_a_linked_build_lock_is_refused(live_world):
     with pytest.raises(LiveRefusedError, match="linked"):
         live.build_issue(last, data)
     assert not any(outside.iterdir())
+
+
+# -- round 8: the write audit --------------------------------------------------------------------
+
+
+class WriteAudit:
+    """Records every filesystem write a live run makes and every path ``check_target`` approved."""
+
+    WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+
+    def __init__(self, root):
+        self.root = Path(os.path.realpath(root))
+        self.checked, self.writes = [], []
+
+    def approved(self, target):
+        self.checked.append(Path(os.path.realpath(target)))
+
+    def wrote(self, primitive, target):
+        if target is None or isinstance(target, int):
+            return
+        real = Path(os.path.realpath(os.fspath(target)))
+        covered = any(real == c or real.is_relative_to(c) for c in self.checked)
+        self.writes.append((primitive, real, covered))
+
+
+def _install_audit(monkeypatch, audit):
+    import builtins
+    import io as io_module
+    import tempfile
+
+    from wrfcomp.live import dates, locks
+
+    real_check = paths.check_target
+
+    def checked(root, target):
+        out = real_check(root, target)
+        audit.approved(target)
+        return out
+
+    for module in (paths, live, metar, locks, dates):
+        monkeypatch.setattr(module, "check_target", checked)
+
+    def opener(original, name):
+        def wrapper(file, mode="r", *args, **kwargs):
+            if any(c in mode for c in "wax+"):
+                audit.wrote(name, file)
+            return original(file, mode, *args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(builtins, "open", opener(builtins.open, "open"))
+    monkeypatch.setattr(io_module, "open", opener(io_module.open, "io.open"))
+    real_os_open = os.open
+
+    def os_open(path, flags, *args, **kwargs):
+        if flags & WriteAudit.WRITE_FLAGS:
+            audit.wrote("os.open", path)
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", os_open)
+
+    def recorder(module, name, which):
+        original = getattr(module, name)
+
+        def wrapper(*args, **kwargs):
+            for i in which:
+                if i < len(args):
+                    audit.wrote(f"{module.__name__}.{name}", args[i])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(module, name, wrapper)
+
+    for name, which in (
+        ("replace", (1,)),
+        ("rename", (1,)),
+        ("link", (1,)),
+        ("mkdir", (0,)),
+        ("makedirs", (0,)),
+        ("remove", (0,)),
+        ("unlink", (0,)),
+        ("rmdir", (0,)),
+        ("symlink", (1,)),
+    ):
+        recorder(os, name, which)
+    for name, which in (
+        ("copy", (1,)),
+        ("copy2", (1,)),
+        ("copyfile", (1,)),
+        ("copytree", (1,)),
+        ("move", (1,)),
+        ("rmtree", (0,)),
+    ):
+        recorder(shutil, name, which)
+    real_mkstemp, real_mkdtemp = tempfile.mkstemp, tempfile.mkdtemp
+
+    def mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        audit.wrote("tempfile.mkstemp", name)
+        return fd, name
+
+    def mkdtemp(*args, **kwargs):
+        name = real_mkdtemp(*args, **kwargs)
+        audit.wrote("tempfile.mkdtemp", name)
+        return name
+
+    monkeypatch.setattr(tempfile, "mkstemp", mkstemp)
+    monkeypatch.setattr(tempfile, "mkdtemp", mkdtemp)
+    for method in ("to_zarr", "to_netcdf"):
+        original = getattr(xr.Dataset, method)
+
+        def wrapper(self, store=None, *args, _original=original, _name=method, **kwargs):
+            audit.wrote(f"Dataset.{_name}", store)
+            return _original(self, store, *args, **kwargs)
+
+        monkeypatch.setattr(xr.Dataset, method, wrapper)
+    for method in ("write_text", "write_bytes", "touch"):
+        original = getattr(Path, method)
+
+        def wrapper(self, *args, _original=original, _name=method, **kwargs):
+            audit.wrote(f"Path.{_name}", self)
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, method, wrapper)
+
+
+def test_every_write_of_a_full_live_run_was_checked_and_is_inside_the_live_root(live_world, monkeypatch):
+    """A full synthetic live run: a METAR fetch, a GEFS cycle fetch (extractor and point cache) and a
+    build (locks, staging, store, manifests, rename into place). Every write primitive it reaches is
+    recorded; each target must lie under the live root and under a path check_target approved first."""
+    data, root, raws, last = live_world
+    shutil.rmtree(live.raw_path(root, last))  # fetched below, through the extractor
+
+    def fake_get(self, url, interval=None):
+        name = url.rsplit("/", 1)[1]
+        member, lead = name[2:5], int(name.split(".f")[1][:3])
+        if url.endswith(".idx"):
+            return _index(last, member, lead)
+        return [100.0, 280.0, 90.0, -2.0, 1.0, 99000.0][interval[0]]
+
+    monkeypatch.setattr(gefs.Transfer, "get", fake_get)
+    policy = LiveYear(2026, root=root)
+    monkeypatch.setattr(
+        policy.gefs, "points", lambda value, stations: np.full(stations.sizes["station_id"], value)
+    )
+    correction = [
+        _raw_report(icao, last - 7 * M, {"t2m": 290.0, "td2m": 280.0, "msl": 100000.0}) for icao in ICAO
+    ]
+    audit = WriteAudit(root)
+    _install_audit(monkeypatch, audit)
+    when = pd.Timestamp(last + 5 * H).tz_localize("UTC").to_pydatetime()
+    metar.fetch(root / "metar", ICAO, 30, clock=lambda: when, get=lambda url: json.dumps(correction).encode())
+    live.fetch_cycle(root, last, policy=policy)
+    record = live.build_issue(last, data, now=last + 6 * H)
+    monkeypatch.undo()
+    assert record["init"] == _hour(last)
+    kinds = {primitive for primitive, _, _ in audit.writes}
+    # The audit saw every kind of write the run makes: files, temp files and folders, renames into
+    # place, links, folders, and the Zarr stores.
+    assert {
+        "os.open",
+        "tempfile.mkstemp",
+        "tempfile.mkdtemp",
+        "os.rename",
+        "os.link",
+        "os.mkdir",
+        "Dataset.to_zarr",
+    } <= kinds, kinds
+    assert len(audit.writes) > 50
+    outside = [(p, w) for p, w, _ in audit.writes if not w.is_relative_to(audit.root)]
+    unchecked = [(p, w) for p, w, covered in audit.writes if not covered]
+    assert not outside, outside[:5]
+    assert not unchecked, unchecked[:5]

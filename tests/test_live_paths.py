@@ -93,14 +93,28 @@ def _writers(live, outside):
             pass
 
     return {
-        "LiveYear.write": lambda root, where: LiveYear(2026).write(store, where / "x.zarr", root=root),
+        "LiveYear.write": lambda root, where: LiveYear(2026, root=root).write(store, where / "x.zarr"),
+        "LiveYear.io.write": lambda root, where: LiveYear(2026, root=root).io.write(store, where / "x.zarr"),
+        "LiveYear.gefs.extract": lambda root, where: LiveYear(2026, root=root).gefs.extract(
+            None, "2026-03-01T00", where / "cache", None
+        ),
         "metar.publish_file": lambda root, where: metar.publish_file(where / "x.json", "x\n", root=root),
         "locks.file_lock": lambda root, where: lock(where / "x.lock", root),
         "metar.fetch": lambda root, where: metar.fetch(where, ["KAAA"], 30, get=lambda url: b"[]"),
     }
 
 
-@pytest.mark.parametrize("writer", ["LiveYear.write", "metar.publish_file", "locks.file_lock", "metar.fetch"])
+@pytest.mark.parametrize(
+    "writer",
+    [
+        "LiveYear.write",
+        "LiveYear.io.write",
+        "LiveYear.gefs.extract",
+        "metar.publish_file",
+        "locks.file_lock",
+        "metar.fetch",
+    ],
+)
 def test_each_writer_refuses_on_windows_when_called_directly(tmp_path, monkeypatch, writer):
     live, outside = _tree(tmp_path)
     monkeypatch.setattr(paths, "_platform", lambda: "win32")
@@ -110,7 +124,17 @@ def test_each_writer_refuses_on_windows_when_called_directly(tmp_path, monkeypat
 
 
 @posix_only
-@pytest.mark.parametrize("writer", ["LiveYear.write", "metar.publish_file", "locks.file_lock", "metar.fetch"])
+@pytest.mark.parametrize(
+    "writer",
+    [
+        "LiveYear.write",
+        "LiveYear.io.write",
+        "LiveYear.gefs.extract",
+        "metar.publish_file",
+        "locks.file_lock",
+        "metar.fetch",
+    ],
+)
 def test_each_writer_refuses_a_target_outside_a_live_root_when_called_directly(tmp_path, writer):
     live, outside = _tree(tmp_path)
     call = _writers(live, outside)[writer]
@@ -119,3 +143,41 @@ def test_each_writer_refuses_a_target_outside_a_live_root_when_called_directly(t
     with pytest.raises(LivePathError):
         call(outside, outside)  # a root that is not a live folder
     assert not any(outside.iterdir())
+
+
+def test_a_policy_without_a_root_cannot_write_through_any_private_module(tmp_path):
+    live, outside = _tree(tmp_path)
+    calls = _writers(live, outside)
+    policy = LiveYear(2026)
+    store = LiveYear(2026, root=live)  # only to get a valid dataset below
+    del store
+    with pytest.raises(LivePathError, match="no live root"):
+        policy.gefs.extract(None, "2026-03-01T00", live / "cache", None)
+    with pytest.raises(LivePathError):
+        calls["LiveYear.io.write"](outside, outside)
+    assert not any(live.iterdir()) and not any(outside.iterdir())
+
+
+def test_every_live_entry_point_refuses_to_start_on_windows(tmp_path, monkeypatch):
+    import importlib.util
+
+    from wrfcomp.live import v4 as live
+
+    monkeypatch.setattr(paths, "_platform", lambda: "win32")
+    data = tmp_path / "wrfcomp-data"
+    data.mkdir()
+    with pytest.raises(live.LiveRefusedError, match="not supported on Windows"):
+        live.build_issue(np.datetime64("2026-12-02T00"), data)
+    with pytest.raises(live.LiveRefusedError, match="not supported on Windows"):
+        live.fetch_cycle(data / "live", np.datetime64("2026-12-02T00"))
+    with pytest.raises(LivePathError, match="not supported on Windows"):
+        metar.fetch(data / "live" / "metar", ["KAAA"], 30, get=lambda url: b"[]")
+    script = Path(__file__).resolve().parents[1] / "scripts" / "live_v4.py"
+    spec = importlib.util.spec_from_file_location("live_v4_script", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv("WRFCOMP_DATA_DIR", str(data))
+    monkeypatch.setattr(sys, "argv", ["live_v4.py", "build", "--init", "2026-12-02T00"])
+    with pytest.raises(live.LiveRefusedError, match="not supported on Windows"):
+        module.main()
+    assert [p.name for p in data.iterdir()] == []
