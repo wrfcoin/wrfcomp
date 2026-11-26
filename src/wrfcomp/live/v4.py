@@ -55,6 +55,7 @@ from wrfcomp.live.paths import (
     LivePathError,
     check_data_dir,
     check_live_root,
+    check_path,
     check_target,
     refuse_windows,
     write_scope,
@@ -91,7 +92,8 @@ def live_root(data: Path | None = None) -> Path:
 
 
 def safe(root: Path, path: Path) -> Path:
-    """``path`` inside ``root`` with no symlink on the way (checked before every write)."""
+    """``path`` inside ``root`` with no symlink on the way, for validation and reads (no write
+    approval; see :func:`safe_write`)."""
     path = Path(path)
     rel = path.relative_to(root)
     here = root
@@ -99,6 +101,15 @@ def safe(root: Path, path: Path) -> Path:
         here = here / part
         if here.is_symlink():
             raise LiveRefusedError(f"refusing a linked path inside the live folder: {here}")
+    try:
+        return check_path(root, path)
+    except LivePathError as exc:
+        raise LiveRefusedError(str(exc)) from exc
+
+
+def safe_write(root: Path, path: Path) -> Path:
+    """:func:`safe`, then approve exactly ONE write to ``path`` (call it immediately before it)."""
+    safe(root, path)
     try:
         return check_target(root, path)
     except LivePathError as exc:
@@ -208,7 +219,9 @@ def fetch_cycle(
                 return {"path": str(dest), "content_sha256": content_sha256(kept), "bytes": 0}
         transfer = CheckedTransfer(t) if transfer is None else transfer
         cache = safe(root, root / "cache")
-        cache.mkdir(parents=True, exist_ok=True)
+        if not cache.is_dir():
+            safe_write(root, cache)
+            cache.mkdir(parents=True)
         _no_links_below(root, cache)
         raw = policy.gefs.extract(stations(), t, cache, transfer)
         _no_links_below(root, cache)
@@ -295,10 +308,7 @@ def _sha256(path: Path) -> str:
 def _lock(root: Path, name: str, *, blocking: bool = False):
     """An exclusive writer lock ``locks/<name>.lock`` (``wrfcomp.live.locks``). Non-blocking by
     default: a second writer is refused, not queued."""
-    path = root / "locks" / f"{name}.lock"
-    safe(root, path.parent)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    safe(root, path)
+    path = safe(root, root / "locks" / f"{name}.lock")  # file_lock checks and makes the folder
     try:
         with file_lock(path, root=root, blocking=blocking):
             yield
@@ -543,7 +553,9 @@ def _publish_new(root, policy, c, store, manifest, first, issues) -> dict:
     if final.exists():
         raise LiveRefusedError(f"{final.name} exists but is not a published issue; remove it by hand")
     staging_root = safe(root, root / ".staging")
-    staging_root.mkdir(exist_ok=True)
+    if not staging_root.is_dir():
+        safe_write(root, staging_root)
+        staging_root.mkdir()
     with write_scope(root, staging_root):  # a fresh staging folder for this issue
         staging = Path(tempfile.mkdtemp(dir=staging_root, prefix=f"{final.name}."))
     staging = safe(root, staging)
@@ -572,8 +584,10 @@ def _publish_new(root, policy, c, store, manifest, first, issues) -> dict:
         metar.publish_file(staging / "build.json", json.dumps(record, indent=1) + "\n", root=root)
         if final.exists() or final.is_symlink():
             raise LiveRefusedError(f"{final.name} appeared during the build; refused")
+        safe_write(root, final)
         os.rename(staging, final)
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        with write_scope(root, staging):
+            shutil.rmtree(staging, ignore_errors=True)
         raise
     return record

@@ -57,7 +57,7 @@ import xarray as xr
 
 from wrfcomp.harness.truth import OFFSET_FILL_VALUE, match_station_to_hours
 from wrfcomp.live.locks import file_lock
-from wrfcomp.live.paths import check_target, refuse_windows, write_scope
+from wrfcomp.live.paths import check_path, check_target, refuse_windows, write_scope
 
 API = "https://aviationweather.gov/api/data/metar"
 USER_AGENT = "wrfcomp-live/0.1"
@@ -184,7 +184,7 @@ def fetch(
     with file_lock(_fetch_lock_path(directory), root=directory.parent, blocking=True):
         completed = clock().astimezone(UTC)
         stamp = completed.strftime(STAMP)
-        path = check_target(directory.parent, directory / f"{stamp}.json")
+        path = check_path(directory.parent, directory / f"{stamp}.json")  # publish_file approves it
         body = {
             "source": API,
             "started_at": started.strftime(STAMP),
@@ -205,9 +205,8 @@ def _fetch_lock_path(directory: Path) -> Path:
     for p in (directory, lock.parent, lock):
         if p.is_symlink():
             raise ValueError(f"refusing a linked path inside the live folder: {p}")
-    check_target(live, lock.parent)
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    return check_target(live, lock)
+    check_path(live, lock)  # file_lock approves and makes the folder and the lock file
+    return lock
 
 
 def publish_file(path: Path, text: str, *, root: Path) -> None:
@@ -219,8 +218,9 @@ def publish_file(path: Path, text: str, *, root: Path) -> None:
     directory = path.parent
     if directory.is_symlink():
         raise ValueError(f"refusing to write into a linked folder: {directory}")
-    check_target(root, directory)
-    directory.mkdir(parents=True, exist_ok=True)
+    if not directory.is_dir():
+        check_target(root, directory)
+        directory.mkdir(parents=True)
     with write_scope(root, path):  # staged next to itself, then linked into place
         fd, staging = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".staging")
         try:

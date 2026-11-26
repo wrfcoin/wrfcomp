@@ -62,9 +62,10 @@ def file_lock(path: Path, *, root: Path, blocking: bool = False):
     with ``paths.check_target`` first (also refused on Windows). Non-blocking by default: raises
     :class:`LockBusyError` if another thread or process holds it."""
     path = Path(path)
-    check_target(root, path.parent)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    check_target(root, path)
+    if not path.parent.is_dir():
+        check_target(root, path.parent)
+        path.parent.mkdir(parents=True)
+    check_target(root, path)  # consumed by the os.open below
     if path.parent.is_symlink() or path.is_symlink():
         raise LockPathError(f"refusing a linked lock path: {path}")
     key = os.path.normcase(str(path.parent.resolve() / path.name))

@@ -1203,6 +1203,9 @@ class WriteAudit:
         return {
             "outside": [(p, w) for p, w, _ in self.calls if not w.is_relative_to(self.root)],
             "unchecked": [(p, w) for p, w, ok in self.calls if not ok],
+            # An approval no write consumed: a check that did not guard a write, which a later
+            # unchecked write could otherwise use. Any leftover is a failure.
+            "unused": sorted((w, n) for w, n in self.approved.items() if n > 0),
         }
 
 
@@ -1372,6 +1375,7 @@ def test_every_write_call_of_a_full_live_run_has_its_own_checked_target(live_wor
     found = audit.findings()
     assert not found["outside"], found["outside"][:5]
     assert not found["unchecked"], found["unchecked"][:5]
+    assert not found["unused"], found["unused"][:5]
 
 
 def test_the_audit_fails_when_the_gefs_cache_guard_is_disabled(live_world, monkeypatch):
@@ -1402,15 +1406,18 @@ def test_the_audit_fails_on_an_unchecked_metadata_write(live_world, monkeypatch)
     assert unchecked and all(str(w).endswith(".meta") for _, w in unchecked), unchecked[:5]
 
 
-def test_the_audit_fails_on_an_unchecked_second_write_to_the_same_file(live_world, monkeypatch):
-    """Mutation 3: every published file is written a second time, right after its checked write.
-    Approvals are single-use, so the second write has none and is caught."""
+@pytest.mark.parametrize("mode", ["w", "a"])
+def test_the_audit_fails_on_an_unchecked_second_write_to_the_same_file(live_world, monkeypatch, mode):
+    """Mutation 3: every published file is written a second time (overwritten, or appended to)
+    right after its checked write. Approvals are single-use and publication leaves none behind, so
+    the second write has none and is caught."""
     original = metar.publish_file
 
     def twice(policy, mp):
         def publish(path, text, *, root):
             original(path, text, root=root)
-            Path(path).write_text(text)  # the same file again, never re-checked
+            with open(path, mode) as fh:  # the same file again, never re-checked
+                fh.write("\n" if mode == "a" else text)
 
         mp.setattr(metar, "publish_file", publish)
 

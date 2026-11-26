@@ -89,7 +89,14 @@ def check_live_root(root: Path) -> Path:
 
 
 def check_target(root: Path, target: Path) -> Path:
-    """Return ``target`` if a live write to it is allowed; refuse otherwise (module docstring)."""
+    """Approve ONE live write to ``target``: call it immediately before that write, never for a
+    read or a validation (use :func:`check_path`). Refuses as :func:`check_path` does."""
+    return check_path(root, target)
+
+
+def check_path(root: Path, target: Path) -> Path:
+    """Return ``target`` if it is an allowed live path (module docstring); refuse otherwise. For
+    validation and reads: it approves no write."""
     refuse_windows()
     check_live_root(root)
     real_root = Path(os.path.realpath(root))

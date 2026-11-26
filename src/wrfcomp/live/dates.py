@@ -36,7 +36,7 @@ from wrfcomp.baselines import gefs as shared_gefs
 from wrfcomp.baselines import io as shared_io
 from wrfcomp.harness import schemas
 from wrfcomp.harness.config import load_config
-from wrfcomp.live.paths import LivePathError, check_target, write_scope
+from wrfcomp.live.paths import LivePathError, check_path, check_target, write_scope
 from wrfcomp.models import citizen_arms as shared_arms
 from wrfcomp.models import gefs_station_v2 as shared_v2
 from wrfcomp.models import gefs_station_v3 as shared_v3
@@ -130,7 +130,7 @@ class LiveYear:
             finally:
                 for here, dirs, files in os.walk(cache, followlinks=False):
                     for name in dirs + files:
-                        check_target(self._root(), Path(here) / name)
+                        check_path(self._root(), Path(here) / name)  # validation, no write
 
         self._frozen_extract = frozen_extract  # tests only: the write audit's mutation check
 
