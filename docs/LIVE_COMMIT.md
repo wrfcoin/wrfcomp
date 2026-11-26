@@ -72,42 +72,58 @@ refused while one is active. Its steps:
    `committed_at + 3`, `commit_expires_at` and `reveal_expires_at`, inclusive. That is the chain's
    own rule (commit_reveal.rs), with the 3-block window enforced here even if the node advertises
    later expiries, and the commit block itself excluded.
-4. Before the reveal: rederive the commit id and the manifest digest from the exact files it will
-   send, check the manifest describes the committed store, and require the CLI's offline reveal body
-   to equal the prepared reveal. The comparison is of the decoded objects: core4 prints the body,
-   manifest included, with sorted keys, which is the same manifest; the digest is computed after
-   putting the fields back in the Rust declaration order.
-
-   Then the reveal loop. Each attempt first re-reads the node. If our reveal is already included,
-   nothing is sent. Otherwise the node must still report OUR commit pending at the saved height, its
-   tip must not be below that height, the commit block must be final, and the next block must be
-   inside the window. Then claim the reveal (`reveal.claim`) and reveal the data object and manifest
-   (no oracle receipt). `reveal.sent` is written only after the send returns successfully.
+4. The reveal loop. Every attempt runs these steps in this order:
+   1. **Freeze** read-only (0400) copies of the prepared `data.json` and `manifest.json` into a new
+      folder `reveal_send/<n>/`. Rederive the commit id and the manifest digest from those exact
+      bytes, and check that the manifest describes the committed store. A file changed since
+      prepare (for example during a backoff) refuses the attempt before anything is sent.
+   2. **Validate offline.** The CLI's offline reveal body, made from those frozen files, must
+      equal the prepared reveal. The comparison is of the decoded objects: core4 prints the body,
+      manifest included, with sorted keys, which is the same manifest. The digest is computed after
+      putting the fields back in the Rust declaration order.
+   3. **Re-read the node.** If our reveal is already included, nothing is sent. Otherwise:
+      - the node must still report OUR commit pending at the saved height;
+      - the commit block must be final;
+      - then the tip, read **last**, must not be below the commit and must put the next block
+        inside the window (tip + 1 ≤ commit + 3, and within the chain's expiries).
+   4. **Send** with the same frozen files: claim the reveal (`reveal.claim`) and reveal the data
+      object and manifest (no oracle receipt). `reveal.sent` is written only after the send
+      returns successfully.
 
    A send that fails, whether a temporary refusal or a duplicate, does not end the run. The loop
-   waits (5, 10, 20, then 30 s) and goes round again. Each new attempt starts with the same re-read,
-   so the chain decides:
+   waits (5, 10, 20, then 30 s) and goes round again from step 1, so the chain decides:
    - our reveal is included: done;
    - the commit is still pending: send again (a duplicate is refused by the chain, harmlessly);
    - the next block is past the window: stop, with no receipt.
 5. Wait until the chain reports OUR reveal included (`revealed_pending_attestation` or
    `revealed_attested`, the only two core4 statuses that mean included), and its block at least
-   **6 blocks deep** (the tip at least 6 past it). Nothing is saved here.
+   **6 deep**. Depth is tip − height + 1, so the tip block itself is 1 deep. Nothing is saved here.
 6. Compute `receipt.json` from the chain as the node has it at that moment. No earlier checkpoint is
-   used. After the reveal, core4 no longer reports `committed_at`, so the blocks are found by their
-   transactions, which `/chain/block/<h>` lists by type and sender:
-   - the reveal block is the one the commit status names. It must carry our `ForecastReveal`, sent
-     by our forecaster;
-   - the commit block is the one block among the 3 before it (the window, read backwards) that
-     carries our `ForecastCommit`. The forecaster key commits once per issue, so this is our
-     commit. No such block means the reveal was outside the window, so no receipt;
-   - everything is read twice, and any difference between the two reads (a reorg in progress)
-     gives no receipt yet. Run `resume` later.
+   used:
+   - the commit block is located by **our commit's own transaction id** (the one the CLI returned
+     for our commit id), through core4's `/transactions/<tx_id>/status`. That route needs the
+     Reader role, so this step alone gets the bearer: `WRFCOIN_READER_TOKEN`, or else the
+     operator bearer, exported inside a subshell (never on a command line), sent only to the
+     local node and only on that route, and never printed or saved. The block must carry a
+     `ForecastCommit` from our forecaster. Another issue's commit from the same key can never
+     stand in for ours;
+   - the reveal height is the one the chain reports for our commit id. If the reveal's own
+     transaction id is known, its inclusion must be that same block; it is not known when a resend
+     was refused as a duplicate. The block must carry our `ForecastReveal`;
+   - the reveal must be at commit height + 1 to + 3;
+   - everything is read twice, with the tip read last in each pass, after the block reads. The two
+     passes must agree (heights and block hashes), and the depth comes from the final tip read. A
+     difference (a reorg in progress), or a tip that rolled back below 6 deep, gives no receipt
+     yet. Run `resume` later;
+   - if the commit's transaction id was lost (interrupted around the commit send), its block cannot
+     be located by id. There is then no counted receipt: OPERATOR DECISION.
 
    The receipt holds:
    - the commit and reveal transaction ids;
    - the confirmed commit and reveal heights, and the window's last block;
    - both block hashes and times;
+   - the data sha256 and manifest digest recomputed from the files of every reveal attempt (all
+     must equal the prepared ones);
    - which leads count, timed from the confirmed commit block to the nanosecond.
 
    A replacement chain that moved the commit, or the reveal, before confirmation is therefore
@@ -118,8 +134,8 @@ refused while one is active. Its steps:
    commit gives no receipt and a non-zero exit. The chain itself refuses a reveal past the commit's
    `commit_expires_at` or `reveal_expires_at`.
 
-The helper steps run without the operator bearer in their environment; only the CLI sees it, and
-nothing prints it.
+Apart from `record`, the helper steps run without any bearer in their environment. Only the CLI
+sees the operator bearer, and nothing prints it.
 
 **If a run is interrupted**, run `bash submit.sh resume`. It continues from whatever stage was
 saved and never broadcasts the commit twice:

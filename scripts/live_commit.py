@@ -9,7 +9,7 @@ The operator then runs ``bash <live>/chain/<issue>/submit.sh``, which calls the 
 these steps (each takes --dir <live>/chain/<issue>):
 
   check-cli | check-key | check-node | check-validate | check-submitted --step commit|reveal |
-  wait-pending | check-reveal-inputs | check-reveal-validate | check-window |
+  wait-pending | freeze-reveal | check-reveal-validate --send <folder> | check-window |
   reveal-backoff --attempt N |
   wait-revealed | record
 
@@ -63,13 +63,15 @@ def main() -> None:
         "check-node",
         "check-validate",
         "wait-pending",
-        "check-reveal-inputs",
-        "check-reveal-validate",
+        "freeze-reveal",
         "check-window",
         "wait-revealed",
         "record",
     ):
         sub.add_parser(name).add_argument("--dir", required=True)
+    reveal_check = sub.add_parser("check-reveal-validate")
+    reveal_check.add_argument("--send", required=True, type=Path)
+    reveal_check.add_argument("--dir", required=True)
     backoff = sub.add_parser("reveal-backoff")
     backoff.add_argument("--attempt", required=True, type=int)
     backoff.add_argument("--dir", required=True)
@@ -103,10 +105,10 @@ def main() -> None:
         chain.check_cli(out)
     elif args.command == "check-key":
         chain.check_key(out)
-    elif args.command == "check-reveal-inputs":
-        chain.check_reveal_inputs(out)
+    elif args.command == "freeze-reveal":
+        print(chain.freeze_reveal(out))
     elif args.command == "check-reveal-validate":
-        chain.check_reveal_validate(out)
+        chain.check_reveal_validate(out, args.send)
     elif args.command == "check-window":
         print(chain.check_window(out, chain.Node()))
     elif args.command == "reveal-backoff":
@@ -123,7 +125,7 @@ def main() -> None:
     elif args.command == "wait-pending":
         print(json.dumps({"status": chain.wait_pending(out, chain.Node())["status"]}))
     elif args.command == "record":
-        receipt = chain.record_receipt(out, chain.Node())
+        receipt = chain.record_receipt(out, chain.Node(token=chain.reader_token_from_env()))
         print(json.dumps({k: receipt[k] for k in ("commit_height", "reveal_height", "counted_leads_hours")}))
 
 

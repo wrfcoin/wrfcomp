@@ -303,10 +303,21 @@ else:
         once.write_text("1")
         os.kill(os.getppid(), 9)  # the script dies between its claim and the send
         sys.exit(9)
+    from urllib.request import urlopen
+    with urlopen(opts["node-url"] + "/network/info") as response:  # the tip at the moment of the send
+        tip = json.loads(response.read())["chain_height"]
+    with (state / "send_tips.log").open("a") as fh:
+        fh.write(f"{{kind}} {{tip}}\n")
     failures = state / f"failed_{{kind}}"
     failed = int(failures.read_text()) if failures.exists() else 0
     if failed < behaviour.get("fail_send", {{}}).get(kind, 0):
         failures.write_text(str(failed + 1))
+        if behaviour.get("change_manifest_on_fail") and kind == "reveal":  # changed during the backoff
+            prepared = Path(opts["manifest-file"]).parent.parent.parent / "manifest.json"
+            other = json.loads(prepared.read_text())
+            other["produced_at"] += 1
+            prepared.chmod(0o600)
+            prepared.write_text(json.dumps(other, separators=(",", ":")) + "\n")
         error = {{"code": "unavailable", "message": "node busy, try again", "hint": None}}
         busy = {{"ok": False, "command": "forecast", "exit_code": 2, "error": error}}
         print(json.dumps(busy, sort_keys=True))
@@ -326,7 +337,8 @@ else:
     if kind == "commit" and behaviour.get("crash_after_commit") and not (state / "crashed").exists():
         (state / "crashed").write_text("1")
         sys.exit(9)  # the broadcast happened; the result never reached the script
-    out = {{"commit_id": cid, "tx_id": f"tx-{{kind}}-1", "result": {{"id": f"tx-{{kind}}-1"}}}}
+    tx = ("0c" if kind == "commit" else "0e") * 32
+    out = {{"commit_id": cid, "tx_id": tx, "result": {{"id": tx}}}}
 print(json.dumps({{"ok": True, "command": "forecast", "exit_code": 0, "data": out}}, sort_keys=True))
 """
 
@@ -337,7 +349,7 @@ from pathlib import Path
 args = sys.argv[1:]
 assert args[:5] == ["run", "--frozen", "python", "-P", "scripts/live_commit.py"], args
 with (Path({state!r}) / "helper_env.log").open("a") as fh:
-    fh.write(repr(sorted(k for k in os.environ if "TOKEN" in k)) + "\n")
+    fh.write(args[5] + " " + repr(sorted(k for k in os.environ if "TOKEN" in k)) + "\n")
 from wrfcomp.live import chain, paths
 from wrfcomp.live.dates import LiveYear
 chain.NODE_URL = {node!r}
@@ -351,6 +363,7 @@ runpy.run_path("scripts/live_commit.py", run_name="__main__")
 """
 
 COMMIT_HEIGHT = 40000
+TX_IDS = {"commit": "0c" * 32, "reveal": "0e" * 32}  # the fake CLI's transaction ids
 
 
 BLOCK_SECONDS = 77
@@ -387,7 +400,12 @@ class FakeNode:
         self.base_time = init + 4 * H + np.timedelta64(15, "m") if base_time is None else base_time
         self.block_hash, self.tip, self.requests, self.revealed_at = block_hash, COMMIT_HEIGHT - 1, [], None
         self.other_hashes, self.reads, self.lost, self.commit_at = {}, 0, False, COMMIT_HEIGHT
-        self.reveal_status, self.on_read = "revealed_pending_attestation", None
+        self.reveal_status, self.on_read, self.extra_commits, self.authorization = (
+            "revealed_pending_attestation",
+            None,
+            set(),
+            None,
+        )
         node = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -396,6 +414,7 @@ class FakeNode:
 
             def do_GET(self):
                 node.requests.append(self.path)
+                node.authorization = self.headers.get("Authorization")
                 status, body = node.answer(self.path)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -409,6 +428,8 @@ class FakeNode:
     def block(self, height):
         txs = []
         if (self.state / "commit").exists() and height == self.commit_at:
+            txs.append({"type": "ForecastCommit", "sender": FORECASTER})
+        if height in self.extra_commits:  # another issue's commit from the same forecaster
             txs.append({"type": "ForecastCommit", "sender": FORECASTER})
         if self.revealed_at is not None and height == self.revealed_at and self.reveal != "other":
             txs.append({"type": "ForecastReveal", "sender": FORECASTER})
@@ -471,6 +492,24 @@ class FakeNode:
             if height > self.tip:
                 return 404, {}
             return 200, {"ok": True, "data": self.block(height)}
+        if path.startswith("/transactions/") and path.endswith("/status"):  # core4: Reader role
+            if self.authorization != "Bearer token-must-never-appear":
+                return 401, {"ok": False, "error": {"code": "UNAUTHORIZED"}}
+            tx = path.split("/")[2]
+            where = {}
+            if (self.state / "commit").exists() and not self.lost:
+                where[TX_IDS["commit"]] = (self.commit_at, "ForecastCommit")
+            if (
+                (self.state / "reveal").exists()
+                and self.revealed_at is not None
+                and self.tip >= self.revealed_at
+            ):
+                where[TX_IDS["reveal"]] = (self.revealed_at, "ForecastReveal")
+            if tx not in where:
+                return 200, {"ok": True, "data": {"tx_id": tx, "status": "unknown"}}
+            height, kind = where[tx]
+            data = {"tx_id": tx, "status": "included", "block_height": height, "tx_type": kind}
+            return 200, {"ok": True, "data": data}
         return 404, {}
 
 
@@ -533,7 +572,11 @@ def _no_token_anywhere(result, out, state):
     assert not any("token-must-never-appear" in t for t in texts)
     log = state / "helper_env.log"
     helper_envs = log.read_text().splitlines() if log.exists() else []
-    assert helper_envs and all(line == "[]" for line in helper_envs)  # helper steps run without the bearer
+    # helper steps run without the bearer; only record gets it, as the reader token
+    assert helper_envs and all(
+        line == ("record ['WRFCOIN_READER_TOKEN']" if line.startswith("record ") else line.split()[0] + " []")
+        for line in helper_envs
+    )
 
 
 def test_submit_sh_commits_waits_reveals_and_writes_the_receipt(published, tmp_path):
@@ -550,7 +593,8 @@ def test_submit_sh_commits_waits_reveals_and_writes_the_receipt(published, tmp_p
     assert (
         COMMIT_HEIGHT <= receipt["reveal_height"] <= receipt["reveal_window_last_block"] == COMMIT_HEIGHT + 3
     )
-    assert receipt["commit_tx_id"] == "tx-commit-1" and receipt["reveal_tx_id"] == "tx-reveal-1"
+    assert receipt["commit_tx_id"] == TX_IDS["commit"] and receipt["reveal_tx_id"] == TX_IDS["reveal"]
+    assert any(p == f"/transactions/{TX_IDS['commit']}/status" for p in node.requests)
     assert receipt["counted_leads_hours"] == [6, 12, 24, 48] and receipt["late_leads_hours"] == [1, 3]
     assert all(not p.startswith("/transactions/forecast") for p in node.requests)  # only reads
     _no_token_anywhere(result, out, tmp_path / "state")
@@ -644,8 +688,9 @@ def test_the_cli_reveal_body_must_equal_the_prepared_reveal(published):
     }
     valid = {"validated": True, "submitted": False, "kind": "reveal", "commit_id": record["commit_id"]}
     good = {"ok": True, "data": {**valid, "body": body}}
-    (out / "reveal_validate.json").write_text(json.dumps(good))
-    chain.check_reveal_validate(out)
+    send = chain.freeze_reveal(out)
+    (send / "reveal_validate.json").write_text(json.dumps(good))
+    chain.check_reveal_validate(out, send)
     changes = (
         {"nonce": "x"},
         {"manifest": {**body["manifest"], "region": "elsewhere"}},
@@ -654,9 +699,9 @@ def test_the_cli_reveal_body_must_equal_the_prepared_reveal(published):
     for change in changes:
         bad = json.loads(json.dumps(good))
         bad["data"]["body"].update(change)
-        (out / "reveal_validate.json").write_text(json.dumps(bad))
+        (send / "reveal_validate.json").write_text(json.dumps(bad))
         with pytest.raises(chain.ChainRefusedError, match="reveal body differs"):
-            chain.check_reveal_validate(out)
+            chain.check_reveal_validate(out, send)
 
 
 def test_two_concurrent_submit_runs_broadcast_one_commit(published, tmp_path):
@@ -697,10 +742,10 @@ def test_resume_after_an_interrupted_commit_never_rebroadcasts_it(published, tmp
     assert plain.returncode != 0 and "never sent twice" in plain.stdout
     resumed, calls, *_ = _run_submit(published, tmp_path, mode="resume", node=node, crash_after_commit=True)
     node.server.shutdown()
-    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    # revealed, but the commit's transaction id was lost: its block cannot be located by id
+    assert resumed.returncode != 0 and "transaction id was lost" in resumed.stderr
     assert len(_broadcasts(calls, "commit")) == 1 and len(_broadcasts(calls, "reveal")) == 1
-    receipt = json.loads((out / "receipt.json").read_text())
-    assert receipt["commit_tx_id"] is None and receipt["reveal_tx_id"] == "tx-reveal-1"
+    assert not (out / "receipt.json").exists()
     _no_token_anywhere(resumed, out, node.state)
 
 
@@ -912,13 +957,14 @@ def test_a_reveal_body_in_core4s_sorted_key_order_is_accepted(published):
         "verification_receipt": None,
     }
     valid = {"validated": True, "submitted": False, "kind": "reveal", "commit_id": record["commit_id"]}
-    (out / "reveal_validate.json").write_text(
+    send = chain.freeze_reveal(out)
+    (send / "reveal_validate.json").write_text(
         json.dumps({"ok": True, "data": {**valid, "body": body}}, sort_keys=True)
     )
-    assert list(json.loads((out / "reveal_validate.json").read_text())["data"]["body"]["manifest"]) == sorted(
-        chain.MANIFEST_FIELDS
-    )
-    chain.check_reveal_validate(out)
+    assert list(
+        json.loads((send / "reveal_validate.json").read_text())["data"]["body"]["manifest"]
+    ) == sorted(chain.MANIFEST_FIELDS)
+    chain.check_reveal_validate(out, send)
     with pytest.raises(chain.ChainRefusedError, match="wrong fields"):
         chain.canonical_manifest({**body["manifest"], "extra": 1})
 
@@ -1130,12 +1176,23 @@ def test_a_resend_that_fails_then_succeeds_after_a_kill(published, tmp_path):
 
 
 def test_reveal_retries_stop_once_the_window_has_passed(published, tmp_path):
-    node = _node(tmp_path, published)
+    """Sends fail until the window passes. Every attempt is authorised by a fresh check (round 5,
+    1): no send ever happens while the tip is at commit + 3 or later; then the loop stops."""
+    node = _node(tmp_path, published, expiries=(10, 10))
+
+    def faster(n):  # after the first failure, a block per status read (fewer loop rounds)
+        if (n.state / "failed_reveal").exists():
+            n.reads += 1
+
+    node.on_read = faster
     result, calls, out, *_ = _run_submit(published, tmp_path, node=node, fail_send={"reveal": 1000})
     node.server.shutdown()
     assert result.returncode != 0 and "outside the window" in result.stderr
     assert len(_broadcasts(calls, "reveal")) >= 2 and _sent(node.state, "reveal") == 0
     assert not (out / "receipt.json").exists()
+    tips = [line.split() for line in (node.state / "send_tips.log").read_text().splitlines()]
+    reveal_tips = [int(tip) for kind, tip in tips if kind == "reveal"]
+    assert len(reveal_tips) >= 2 and all(tip + 1 <= COMMIT_HEIGHT + 3 for tip in reveal_tips)
 
 
 def test_no_receipt_until_both_blocks_are_six_deep(published, tmp_path):
@@ -1239,82 +1296,199 @@ def test_a_missing_receipt_is_recomputed_from_the_chain_now(published, tmp_path,
     assert _sent(node.state, "commit") == 1 and _sent(node.state, "reveal") == 1
 
 
-def _memory_chain(record, *, tip=200, reveal_at=103, commit_at=100, sender=None, status=None):
+def _memory_chain(record, *, tip=200, reveal_at=103, commit_at=100, sender=None, status=None, extra=()):
+    """An in-memory chain for ``record_receipt``: our commit (tx ``TX_IDS["commit"]``) at
+    ``commit_at``, our reveal at ``reveal_at``; ``extra`` heights carry another issue's commit from
+    the same forecaster. ``state`` can be changed between reads."""
     sender = sender or record["forecaster"]
-    chain_state = {"tip": tip, "hash": {}}
+    state = {"tip": tip, "hash": {}, "commit_at": commit_at, "reveal_at": reveal_at, "tips": None}
 
-    def get(url):
+    def get(url, token=None):
         if url.endswith("/network/info"):
-            return 200, json.dumps({"chain_height": chain_state["tip"]}).encode()
+            height = next(state["tips"]) if state["tips"] is not None else state["tip"]
+            return 200, json.dumps({"chain_height": height}).encode()
         if "/chain/block/" in url:
             height = int(url.rsplit("/", 1)[1])
             txs = []
-            if height == commit_at:
+            if height == state["commit_at"] or height in extra:
                 txs.append({"type": "ForecastCommit", "sender": record["forecaster"]})
-            if height == reveal_at:
+            if height == state["reveal_at"]:
                 txs.append({"type": "ForecastReveal", "sender": sender})
             block = {
                 "height": height,
-                "hash": chain_state["hash"].get(height, f"{height:064x}"),
+                "hash": state["hash"].get(height, f"{height:064x}"),
                 "timestamp": f"2026-03-10T04:{height % 60:02d}:00Z",
                 "transactions": txs,
             }
             return 200, json.dumps({"ok": True, "data": block}).encode()
-        value = {
-            "commit_id": record["commit_id"],
-            "station_id": record["station_id"],
-            "status": status or "revealed_pending_attestation",
-            "revealed_at": reveal_at,
-        }
-        return 200, json.dumps(value).encode()
+        if "/transactions/commit/" in url:
+            value = {
+                "commit_id": record["commit_id"],
+                "station_id": record["station_id"],
+                "status": status or "revealed_pending_attestation",
+                "revealed_at": state["reveal_at"],
+            }
+            return 200, json.dumps(value).encode()
+        assert token == "reader-token", "the transaction route is read with the reader bearer only"
+        tx = url.split("/")[-2]
+        found = {TX_IDS["commit"]: (state["commit_at"], "ForecastCommit")}
+        found[TX_IDS["reveal"]] = (state["reveal_at"], "ForecastReveal")
+        height, kind = found[tx]
+        data = {"tx_id": tx, "status": "included", "block_height": height, "tx_type": kind}
+        return 200, json.dumps({"ok": True, "data": data}).encode()
 
-    return chain.Node(get=get, sleep=lambda s: None), chain_state
+    return chain.Node(get=get, sleep=lambda s: None, token="reader-token"), state
+
+
+def _sent_issue(published):
+    """A prepared issue whose commit and one reveal attempt were sent (as submit.sh leaves it)."""
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    _prepare(root, t, key, cli)
+    out = chain.chain_dir(root, t)
+    record = json.loads((out / "commit.json").read_text())
+    chain.freeze_reveal(out)
+    for kind in ("commit", "reveal"):
+        result = {"commit_id": record["commit_id"], "tx_id": TX_IDS[kind]}
+        (out / f"{kind}_result.json").write_text(json.dumps({"ok": True, "data": result}))
+    return out, record
 
 
 @pytest.mark.parametrize(
     "kw, message",
     [
-        ({"tip": 108}, "not 6 blocks deep"),
-        ({"reveal_at": 104}, "not in exactly one"),
-        ({"reveal_at": 100}, "not in exactly one"),
+        ({"tip": 107}, "5 deep, not 6"),
+        ({"reveal_at": 104}, "outside the window 101..103"),
+        ({"reveal_at": 100}, "outside the window"),
         ({"sender": "0x" + "22" * 20}, "does not carry our reveal"),
         ({"status": "committed_pending_reveal"}, "not report our reveal"),
         ({"status": "revealed_something"}, "not report our reveal"),
     ],
 )
 def test_the_receipt_needs_our_transactions_in_confirmed_blocks(published, kw, message):
-    data, root, last, key, cli = published
-    t = last - 12 * H
-    _prepare(root, t, key, cli)
-    out = chain.chain_dir(root, t)
-    record = json.loads((out / "commit.json").read_text())
+    out, record = _sent_issue(published)
     node, _ = _memory_chain(record, **kw)
     with pytest.raises(chain.ChainRefusedError, match=message):
         chain.record_receipt(out, node)
     assert not (out / "receipt.json").exists()
-    good, _ = _memory_chain(record, tip=109)
+    good, _ = _memory_chain(record, tip=108)  # 108 - 103 + 1 = 6 deep
     receipt = chain.record_receipt(out, good)
     assert receipt["commit_height"] == 100 and receipt["reveal_height"] == 103
     assert receipt["commit_block_time"] == "2026-03-10T04:40:00.000000000Z"
+    assert receipt["manifest_digest"] == record["manifest_digest"]
+
+
+def test_another_issues_commit_never_supplies_the_commit_block(published):
+    """Round 5 (1): the same forecaster has another issue's commit at 102; ours (by its transaction
+    id) is at 100 and the reveal at 104. Looking up the commit by id finds 100: outside the window,
+    no receipt (by sender and type alone, 102 would have been taken)."""
+    out, record = _sent_issue(published)
+    node, _ = _memory_chain(record, commit_at=100, reveal_at=104, extra=(102,), tip=110)
+    with pytest.raises(
+        chain.ChainRefusedError, match="outside the window 101..103 of our commit at block 100"
+    ):
+        chain.record_receipt(out, node)
+    assert not (out / "receipt.json").exists()
+
+
+def test_the_receipt_needs_the_reader_bearer_for_the_transaction_lookup(published):
+    out, record = _sent_issue(published)
+    node, _ = _memory_chain(record)
+    node._token = None
+    with pytest.raises(chain.ChainRefusedError, match="needs the reader bearer"):
+        chain.record_receipt(out, node)
 
 
 def test_a_chain_that_changes_between_the_two_reads_gives_no_receipt(published):
-    data, root, last, key, cli = published
-    t = last - 12 * H
-    _prepare(root, t, key, cli)
-    out = chain.chain_dir(root, t)
-    record = json.loads((out / "commit.json").read_text())
+    out, record = _sent_issue(published)
     node, state = _memory_chain(record)
     real, seen = node._get, {"n": 0}
 
-    def flip(url):
+    def flip(url, token=None):
         if "/chain/block/103" in url:
             seen["n"] += 1
             if seen["n"] == 2:
                 state["hash"][103] = "ee" * 32
-        return real(url)
+        return real(url, token)
 
     node._get = flip
     with pytest.raises(chain.ChainRefusedError, match="changed while reading"):
         chain.record_receipt(out, node)
     assert not (out / "receipt.json").exists()
+
+
+def test_a_tip_rollback_during_the_last_pass_gives_no_receipt(published):
+    """Round 5 (4): the tip is 109 in the first pass and rolls back to 107 during the second; the
+    depth comes from the last tip read (107 - 103 + 1 = 5): no receipt."""
+    out, record = _sent_issue(published)
+    node, state = _memory_chain(record)
+    state["tips"] = iter([109, 107])
+    with pytest.raises(chain.ChainRefusedError, match="5 deep, not 6"):
+        chain.record_receipt(out, node)
+    assert not (out / "receipt.json").exists()
+
+
+def test_the_window_check_reads_the_tip_last(published):
+    """Round 5 (2): the tip moves from 40002 to 40003 while the commit block is being read; the send
+    is refused because the tip read last puts the next block at 40004."""
+    data, root, last, key, cli = published
+    t = last - 12 * H
+    _prepare(root, t, key, cli)
+    out = chain.chain_dir(root, t)
+    record = json.loads((out / "commit.json").read_text())
+    pending = {
+        "commit_id": record["commit_id"],
+        "station_id": record["station_id"],
+        "contribution_type": "forecast",
+        "status": "committed_pending_reveal",
+        "committed_at": COMMIT_HEIGHT,
+        "commit_expires_at": COMMIT_HEIGHT + 10,
+        "reveal_expires_at": COMMIT_HEIGHT + 10,
+    }
+    (out / "status_pending.json").write_text(json.dumps(pending))
+    tip = {"now": COMMIT_HEIGHT + 2}
+
+    def get(url):
+        if url.endswith("/network/info"):
+            return 200, json.dumps({"chain_height": tip["now"]}).encode()
+        if "/chain/block/" in url:
+            tip["now"] = COMMIT_HEIGHT + 3  # a block arrives during this read
+            block = {"height": COMMIT_HEIGHT, "hash": "ab" * 32, "timestamp": "2026-03-10T04:15:00Z"}
+            return 200, json.dumps({"ok": True, "data": block}).encode()
+        return 200, json.dumps(pending).encode()
+
+    with pytest.raises(chain.ChainRefusedError, match="next block 40004 is outside the window"):
+        chain.check_window(out, chain.Node(get=get, sleep=lambda s: None))
+
+
+def test_a_manifest_changed_during_backoff_is_never_sent(published, tmp_path):
+    """Round 5 (3): the first reveal send fails; during the backoff the manifest's production time is
+    changed. The next attempt's frozen copy is refused before any send; no receipt."""
+    node = _node(tmp_path, published, expiries=(10, 10))
+    result, calls, out, *_ = _run_submit(
+        published, tmp_path, node=node, fail_send={"reveal": 1}, change_manifest_on_fail=True
+    )
+    node.server.shutdown()
+    assert result.returncode != 0 and "manifest.json differs" in result.stderr
+    assert _sent(node.state, "reveal") == 0 and len(_broadcasts(calls, "reveal")) == 1
+    assert not (out / "receipt.json").exists()
+    sent = sorted((out / "reveal_send").iterdir())
+    assert [p.name for p in sent] == ["1", "2"]
+    first = json.loads((sent[0] / "manifest.json").read_text())
+    assert chain.manifest_digest(first) == json.loads((out / "commit.json").read_text())["manifest_digest"]
+
+
+def test_the_receipt_stores_the_digest_of_the_files_actually_sent(published, tmp_path):
+    node = _node(tmp_path, published, expiries=(10, 10))
+    result, calls, out, *_ = _run_submit(published, tmp_path, node=node, fail_send={"reveal": 1})
+    node.server.shutdown()
+    assert result.returncode == 0, result.stdout + result.stderr
+    receipt = json.loads((out / "receipt.json").read_text())
+    attempts = sorted((out / "reveal_send").iterdir())
+    assert len(attempts) == 2 and all(
+        oct((p / "manifest.json").stat().st_mode & 0o777) == "0o400" for p in attempts
+    )
+    sent = json.loads((attempts[-1] / "manifest.json").read_text())
+    assert receipt["manifest_digest"] == chain.manifest_digest(sent)
+    for call in _broadcasts(calls, "reveal"):
+        assert "/reveal_send/" in call[call.index("--manifest-file") + 1]

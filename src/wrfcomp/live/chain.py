@@ -56,7 +56,7 @@ MARGIN = np.timedelta64(15, "m")
 REVEAL_WINDOW_BLOCKS = 3
 INCLUDED_STATUSES = frozenset({"revealed_pending_attestation", "revealed_attested"})
 POLL_SECONDS = 20
-CONFIRMATIONS = 6  # a block counts for the receipt once the tip is this many blocks past it
+CONFIRMATIONS = 6  # a block counts for the receipt once it is this deep (the tip block is 1 deep)
 RETRY_BACKOFF_S = (5, 10, 20, 30)  # between reveal attempts while the window is open
 MIN_REQUEST_GAP_S = 3.0
 # Keys the data object must never carry: the chain would read them as a weather reading or a paid
@@ -376,9 +376,10 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         ]
     )
     commit_cmd = f'"$CLI" --output json forecast commit{cont}{common}{cont}{signing}{cont}--node-url "$NODE"'
+    reveal_common = common.replace('"$DIR/data.json"', '"$SEND/data.json"')
     reveal_cmd = (
-        f'"$CLI" --output json forecast reveal{cont}{common}{cont}'
-        '--manifest-file "$DIR/manifest.json"' + cont + '--node-url "$NODE"'
+        f'"$CLI" --output json forecast reveal{cont}{reveal_common}{cont}'
+        '--manifest-file "$SEND/manifest.json"' + cont + '--node-url "$NODE"'
     )
     reveal_check = reveal_cmd.replace(" reveal", " reveal --validate-only", 1)
     lines = [
@@ -436,12 +437,14 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         '    if [ -e "$DIR/reveal.claim" ]; then',
         '        echo "a reveal was attempted before; asking the chain whether it was included"',
         "    fi",
-        '    echo "checking the reveal against the prepared commitment"',
-        "    py check-reveal-inputs",
-        f'    {reveal_check} > "$DIR/reveal_validate.json"',
-        "    py check-reveal-validate",
         "    ATTEMPT=0",
         "    while :; do",
+        "        # every attempt: freeze read-only copies of the prepared files, validate exactly those,",
+        "        # then re-read the chain (the tip last); the send uses the same frozen files",
+        '        SEND="$(py freeze-reveal)"',
+        '        echo "checking the reveal files against the prepared commitment"',
+        f'        {reveal_check} > "$SEND/reveal_validate.json"',
+        '        py check-reveal-validate --send "$SEND"',
         "        # check-window refuses once the next block is past the window, which ends the loop",
         '        NEXT="$(py check-window)"',
         '        if [ "$NEXT" = included ]; then',
@@ -464,7 +467,14 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         "fi",
         f'echo "waiting until the reveal is included and {CONFIRMATIONS} blocks deep"',
         "py wait-revealed",
-        "py record",
+        'echo "computing the receipt from the confirmed blocks"',
+        "# record locates our transactions by id, a Reader-role read: only this step gets the bearer, as",
+        "# WRFCOIN_READER_TOKEN (exported in a subshell, never on a command line), sent only to the node",
+        "(",
+        '    export WRFCOIN_READER_TOKEN="${WRFCOIN_READER_TOKEN:-${WRFCOIN_OPERATOR_TOKEN:-}}"',
+        "    unset WRFCOIN_OPERATOR_TOKEN",
+        '    uv run --frozen python -P scripts/live_commit.py record --dir "$DIR"',
+        ")",
         'echo "done: $DIR/receipt.json"',
     ]
     return "\n".join(lines) + "\n"
@@ -473,10 +483,29 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
 # -- the steps submit.sh runs ----------------------------------------------------------------------
 
 
-class Node:
-    """Unauthenticated GETs to the local node only, at least MIN_REQUEST_GAP_S apart."""
+_TX_ID = re.compile(r"(0x)?[0-9a-fA-F]{64}")
 
-    def __init__(self, url: str | None = None, *, get=None, sleep=time.sleep, clock=time.monotonic):
+
+def reader_token_from_env() -> str | None:
+    """The bearer for the one authenticated read (a transaction's inclusion). Only the ``record``
+    step is given it; it is sent only to the local node's transaction-status route and never
+    printed or saved."""
+    return os.environ.get("WRFCOIN_READER_TOKEN") or None
+
+
+class Node:
+    """GETs to the local node only, at least MIN_REQUEST_GAP_S apart. All are unauthenticated except
+    :meth:`tx_status`, which sends the reader bearer if one was given."""
+
+    def __init__(
+        self,
+        url: str | None = None,
+        *,
+        get=None,
+        sleep=time.sleep,
+        clock=time.monotonic,
+        token: str | None = None,
+    ):
         url = NODE_URL if url is None else url
         if url not in ALLOWED_NODES:
             raise ChainRefusedError(f"reads go to the local node only ({NODE_URL}), not {url}")
@@ -490,11 +519,15 @@ class Node:
             clock,
             None,
         )
+        self._token = token
 
     @staticmethod
-    def _http_get(url: str) -> tuple[int, bytes]:
+    def _http_get(url: str, token: str | None = None) -> tuple[int, bytes]:
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         try:
-            with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=20) as response:
+            with urlopen(Request(url, headers=headers), timeout=20) as response:
                 return response.status, response.read()
         except Exception as exc:  # noqa: BLE001 - HTTPError carries a status; others are failures
             status = getattr(exc, "code", None)
@@ -502,17 +535,35 @@ class Node:
                 raise
             return status, exc.read() if hasattr(exc, "read") else b""
 
-    def get(self, path: str):
+    def get(self, path: str, *, authenticated: bool = False):
         if self.last is not None:
             wait = MIN_REQUEST_GAP_S - (self.clock() - self.last)
             if wait > 0:
                 self.sleep(wait)
         self.last = self.clock()
-        status, body = self._get(self.url + path)
+        if authenticated:
+            status, body = self._get(self.url + path, self._token)
+        else:
+            status, body = self._get(self.url + path)
         value = json.loads(body) if body else None
         if isinstance(value, dict) and value.get("ok") is True and "data" in value:
             value = value["data"]
         return status, value
+
+    def tx_status(self, tx_id: str) -> dict:
+        """Where the node's chain has transaction ``tx_id`` now (core4 ``/transactions/<id>/status``,
+        Reader role): ``{"status": "included", "block_height": h, "tx_type": ...}`` or pending/unknown."""
+        if not (isinstance(tx_id, str) and _TX_ID.fullmatch(tx_id)):
+            raise ChainRefusedError("the saved transaction id is not a 32-byte hex hash; no receipt")
+        if not self._token:
+            raise ChainRefusedError(
+                "a transaction's inclusion needs the reader bearer (WRFCOIN_READER_TOKEN, or the operator "
+                "bearer, in the shell that runs submit.sh); no receipt"
+            )
+        status, value = self.get(f"/transactions/{tx_id}/status", authenticated=True)
+        if status != 200 or not isinstance(value, dict):
+            raise ChainRefusedError(f"the node did not report transaction {tx_id}; no receipt")
+        return value
 
     def tip(self) -> int:
         status, info = self.get("/network/info")
@@ -657,10 +708,12 @@ def wait_pending(
         sleep(POLL_SECONDS)
 
 
-def check_reveal_inputs(out: Path) -> None:
-    """Rederive everything the reveal will carry from the exact files it will send."""
+def check_reveal_inputs(out: Path, folder: Path | None = None) -> None:
+    """Rederive everything the reveal will carry from the exact files it will send (``folder``, one
+    frozen attempt; the prepared files by default)."""
     record = _load(out, "commit.json")
-    raw = (Path(out) / "data.json").read_text()
+    folder = Path(out) if folder is None else Path(folder)
+    raw = (folder / "data.json").read_text()
     data = json.loads(raw)
     check_data(data)
     if (
@@ -670,26 +723,54 @@ def check_reveal_inputs(out: Path) -> None:
         raise ChainRefusedError("data.json differs from the prepared data object; not revealing")
     if commit_id(data, record["nonce"], record["station_id"], record["timestamp"]) != record["commit_id"]:
         raise ChainRefusedError("data.json no longer derives the committed id; not revealing")
-    man = json.loads((Path(out) / "manifest.json").read_text())
+    man = json.loads((folder / "manifest.json").read_text())
     if manifest_digest(man) != record["manifest_digest"]:
         raise ChainRefusedError("manifest.json differs from the prepared manifest; not revealing")
     if man["output_hash"] != data["forecast_sha256"] or man["model_id"] != data["model_id"]:
         raise ChainRefusedError("the manifest does not describe the committed store; not revealing")
 
 
-def check_reveal_validate(out: Path) -> None:
-    """The CLI's offline reveal body must be exactly the prepared reveal."""
+def _send_folder(out: Path, folder) -> Path:
+    folder = Path(folder)
+    if folder.parent != Path(out) / "reveal_send" or not folder.name.isdigit() or folder.is_symlink():
+        raise ChainRefusedError("--send must be <issue>/reveal_send/<n>/")
+    return folder
+
+
+def freeze_reveal(out: Path) -> Path:
+    """A new attempt folder ``reveal_send/<n>/`` holding read-only copies of the prepared data
+    object and manifest, rechecked against the prepared commitment. The validation, the window
+    check and the send of this attempt all use exactly these files."""
+    live_root = _live(out)
+    base = Path(out) / "reveal_send"
+    if not base.is_dir():
+        check_target(live_root, base)
+        make_dir(base)
+    n = 1 + max((int(p.name) for p in base.iterdir() if p.name.isdigit()), default=0)
+    folder = base / str(n)
+    for name in ("data.json", "manifest.json"):
+        _publish_file(folder / name, (Path(out) / name).read_text(), root=live_root)
+        (folder / name).chmod(0o400)
+    check_reveal_inputs(out, folder)
+    return folder
+
+
+def check_reveal_validate(out: Path, folder: Path) -> None:
+    """The CLI's offline reveal body, made from this attempt's files, must be exactly the prepared
+    reveal; the files themselves are rechecked against the prepared commitment."""
     record = _load(out, "commit.json")
-    data = _cli_data(out, "reveal_validate.json")
+    folder = _send_folder(out, folder)
+    check_reveal_inputs(out, folder)
+    data = _cli_data(folder, "reveal_validate.json")
     body = data.get("body", {})
     expected = {
         "forecaster": record["forecaster"],
         "station_id": record["station_id"],
-        "payload": json.loads((Path(out) / "data.json").read_text()),
+        "payload": json.loads((folder / "data.json").read_text()),
         "nonce": record["nonce"],
         "timestamp": record["timestamp"],
         "commit_hash": record["commit_id"],
-        "manifest": json.loads((Path(out) / "manifest.json").read_text()),
+        "manifest": json.loads((folder / "manifest.json").read_text()),
         "verification_receipt": None,
     }
     if (
@@ -740,10 +821,10 @@ def check_window(out: Path, node: Node) -> str:
     if int(now["committed_at"]) != committed:
         raise ChainRefusedError("the node reports our commit at another height; not revealing")
     first, last = reveal_window(now)
-    tip = node.tip()
+    _final_block(node, committed)
+    tip = node.tip()  # the last read before the send is authorised
     if tip < committed:
         raise ChainRefusedError(f"the node is behind the commit (tip {tip} < {committed}); not revealing")
-    _final_block(node, committed)
     if not first <= tip + 1 <= last:
         raise ChainRefusedError(
             f"the next block {tip + 1} is outside the window {first}..{last}; not revealing"
@@ -770,7 +851,7 @@ def wait_revealed(
         included = status == 200 and _our_reveal_included(record, value)
         if included and isinstance(value.get("revealed_at"), int):
             height = value["revealed_at"]
-            if node.tip() >= height + CONFIRMATIONS:
+            if depth(node.tip(), height) >= CONFIRMATIONS:
                 return height
         else:
             pending_now = isinstance(value, dict) and value.get("status") == "committed_pending_reveal"
@@ -818,8 +899,7 @@ def _block(node: Node, height: int) -> dict:
 
 
 def _ours(block: dict, tx_type: str, forecaster: str) -> int:
-    """How many transactions of ``tx_type`` sent by our forecaster the block carries. The forecaster
-    key is used for this lane only and commits once per issue, so a match is our transaction."""
+    """How many transactions of ``tx_type`` sent by our forecaster the block carries."""
     return sum(
         1
         for tx in block["transactions"]
@@ -829,14 +909,50 @@ def _ours(block: dict, tx_type: str, forecaster: str) -> int:
     )
 
 
+def _included_at(node: Node, tx_id: str, tx_type: str) -> int:
+    """The height at which the node's chain includes transaction ``tx_id`` (of ``tx_type``) now."""
+    value = node.tx_status(tx_id)
+    height = value.get("block_height")
+    if value.get("status") != "included" or not isinstance(height, int) or isinstance(height, bool):
+        raise ChainRefusedError(f"transaction {tx_id} is not included now; no receipt")
+    if value.get("tx_type") != tx_type:
+        raise ChainRefusedError(
+            f"transaction {tx_id} is a {value.get('tx_type')!r}, not {tx_type}; no receipt"
+        )
+    return height
+
+
+def depth(tip: int, height: int) -> int:
+    """How deep block ``height`` is under ``tip``: the tip block itself is 1 deep."""
+    return tip - height + 1
+
+
 def confirmed_inclusion(out: Path, node: Node) -> dict:
-    """OUR commit and reveal as the node's chain has them NOW, both at least CONFIRMATIONS blocks
-    deep. Nothing saved earlier is used: the reveal height comes from the commit status, the reveal
-    block must carry our ForecastReveal, and the commit block is the one block among the three
-    before it (the reveal window) that carries our ForecastCommit. Everything is read twice; any
-    change between the reads (a reorg in progress) refuses."""
+    """OUR commit and reveal as the node's chain has them NOW, both at least CONFIRMATIONS deep.
+    Nothing saved earlier is used:
+
+    * the commit is located by ITS OWN transaction id (the one the CLI returned for our commit id),
+      through the node's transaction-inclusion route; the block there must carry a ForecastCommit
+      from our forecaster;
+    * the reveal height is the one the chain reports for OUR commit id; if the reveal transaction id
+      is known, its inclusion must be that same block; the block must carry our ForecastReveal;
+    * the reveal height must be commit height + 1 .. + 3.
+
+    Everything is read twice, the tip LAST in each pass, after the block reads; the two passes must
+    agree (heights and block hashes), and the depth is computed from the final tip read."""
     record = _load(out, "commit.json")
     forecaster = record["forecaster"]
+    try:
+        commit_tx = check_submitted(out, "commit")["tx_id"]
+    except FileNotFoundError:
+        raise ChainRefusedError(
+            "the commit's transaction id was lost (interrupted around the commit send), so its block "
+            "cannot be located by id: no counted receipt, OPERATOR DECISION"
+        ) from None
+    try:
+        reveal_tx = check_submitted(out, "reveal")["tx_id"]
+    except FileNotFoundError:
+        reveal_tx = None  # a resend refused as a duplicate: the chain's report for our commit id decides
 
     def read() -> dict:
         status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
@@ -845,28 +961,31 @@ def confirmed_inclusion(out: Path, node: Node) -> dict:
         revealed = value.get("revealed_at")
         if not isinstance(revealed, int) or isinstance(revealed, bool) or revealed < 1:
             raise ChainRefusedError("the node reports no reveal height; no receipt")
-        tip = node.tip()
-        if tip < revealed + CONFIRMATIONS:
+        committed = _included_at(node, commit_tx, "ForecastCommit")
+        if reveal_tx is not None and _included_at(node, reveal_tx, "ForecastReveal") != revealed:
             raise ChainRefusedError(
-                f"the reveal block {revealed} is not {CONFIRMATIONS} blocks deep yet (tip {tip}); "
-                "no receipt yet (resume later)"
+                "our reveal transaction is in another block than the chain reports; no receipt"
             )
-        reveal_block = _block(node, revealed)
-        if _ours(reveal_block, "ForecastReveal", forecaster) != 1:
+        last = committed + REVEAL_WINDOW_BLOCKS
+        if not committed + 1 <= revealed <= last:
+            raise ChainRefusedError(
+                f"the reveal at block {revealed} is outside the window {committed + 1}..{last} "
+                f"of our commit at block {committed}; no receipt"
+            )
+        commit_block, reveal_block = _block(node, committed), _block(node, revealed)
+        if _ours(commit_block, "ForecastCommit", forecaster) < 1:
+            raise ChainRefusedError(f"block {committed} does not carry our commit; no receipt")
+        if _ours(reveal_block, "ForecastReveal", forecaster) < 1:
             raise ChainRefusedError(f"block {revealed} does not carry our reveal; no receipt")
-        found = []
-        for height in range(revealed - 1, max(revealed - REVEAL_WINDOW_BLOCKS, 0) - 1, -1):
-            block = _block(node, height)
-            if _ours(block, "ForecastCommit", forecaster):
-                found.append(block)
-        if len(found) != 1 or _ours(found[0], "ForecastCommit", forecaster) != 1:
+        tip = node.tip()  # last, after the block reads
+        if depth(tip, revealed) < CONFIRMATIONS:
             raise ChainRefusedError(
-                f"our commit is not in exactly one of the {REVEAL_WINDOW_BLOCKS} blocks before the reveal "
-                f"block {revealed} (the reveal window); no receipt"
+                f"the reveal block {revealed} is {depth(tip, revealed)} deep, not {CONFIRMATIONS} "
+                f"(tip {tip}); no receipt yet (resume later)"
             )
-        commit_block = found[0]
         return {
-            "commit_height": commit_block["height"],
+            "commit_tx_id": commit_tx,
+            "commit_height": committed,
             "commit_block_hash": commit_block["hash"],
             "commit_block_time": format_time_ns(parse_time_ns(commit_block["timestamp"])),
             "reveal_height": revealed,
@@ -880,23 +999,41 @@ def confirmed_inclusion(out: Path, node: Node) -> dict:
     return first
 
 
+def sent_reveal_digests(out: Path) -> tuple[str, str]:
+    """The data sha256 and manifest digest recomputed from the exact files of every reveal attempt
+    (``reveal_send/<n>/``); all must equal the prepared ones."""
+    record = _load(out, "commit.json")
+    base = Path(out) / "reveal_send"
+    folders = sorted(p for p in base.iterdir() if p.name.isdigit()) if base.is_dir() else []
+    if not folders:
+        raise ChainRefusedError("no reveal attempt files are saved; no receipt")
+    for folder in folders:
+        data = json.loads((folder / "data.json").read_text())
+        sent = (
+            hashlib.sha256(compact(data).encode()).hexdigest(),
+            manifest_digest(json.loads((folder / "manifest.json").read_text())),
+        )
+        if sent != (record["data_sha256"], record["manifest_digest"]):
+            raise ChainRefusedError(
+                f"reveal attempt {folder.name} sent other files than prepared; no receipt"
+            )
+    return sent
+
+
 def record_receipt(out: Path, node: Node) -> dict:
     """Compute the receipt from the confirmed blocks read from the node now (never from a saved
     checkpoint) and write it once. Replay recomputes it the same way: an identical receipt is
     returned as it is; a different one (the chain changed) is refused."""
     record = _load(out, "commit.json")
+    data_sha256, sent_manifest = sent_reveal_digests(out)
     blocks = confirmed_inclusion(out, node)
-    try:
-        commit_tx = check_submitted(out, "commit")["tx_id"]
-    except FileNotFoundError:
-        commit_tx = None
     try:
         reveal_tx = check_submitted(out, "reveal")["tx_id"]
     except FileNotFoundError:
-        reveal_tx = None  # a resend refused as a duplicate: the chain's inclusion is the evidence
+        reveal_tx = None
     receipt = {
         "commit_id": record["commit_id"],
-        "commit_tx_id": commit_tx,
+        "commit_tx_id": blocks.pop("commit_tx_id"),
         "reveal_tx_id": reveal_tx,
         **blocks,
         "reveal_window_last_block": blocks["commit_height"] + REVEAL_WINDOW_BLOCKS,
@@ -907,7 +1044,8 @@ def record_receipt(out: Path, node: Node) -> dict:
         "forecaster": record["forecaster"],
         "init": record["init"],
         "content_sha256": record["content_sha256"],
-        "manifest_digest": record["manifest_digest"],
+        "data_sha256": data_sha256,
+        "manifest_digest": sent_manifest,
         "rule": "a lead counts only if its valid time is at least 15 minutes after the commit block time",
         **counted_leads(np.datetime64(record["init"], "ns"), parse_time_ns(blocks["commit_block_time"])),
     }
