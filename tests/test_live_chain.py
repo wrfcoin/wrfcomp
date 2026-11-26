@@ -359,7 +359,6 @@ assert args[:5] == ["run", "--frozen", "python", "-P", "scripts/live_commit.py"]
 with (Path({state!r}) / "helper_env.log").open("a") as fh:
     fh.write(args[5] + " " + repr(sorted(k for k in os.environ if "TOKEN" in k)) + "\n")
 from wrfcomp.live import chain, paths
-from wrfcomp.live.dates import LiveYear
 chain.NODE_URL = {node!r}
 chain.ALLOWED_NODES = frozenset({{{node!r}}})
 chain.MIN_REQUEST_GAP_S = 0.0
@@ -527,7 +526,7 @@ def _node(tmp_path, published, **kw):
     return FakeNode(state, published[2] - 12 * H, **kw)
 
 
-def _run_submit(published, tmp_path, *, mode=None, node=None, **cli_kw):
+def _run_submit(published, tmp_path, *, mode=None, node=None, extra_env=None, **cli_kw):
     data, root, last, key, _ = published
     t = last - 12 * H
     state = tmp_path / "state"
@@ -548,6 +547,7 @@ def _run_submit(published, tmp_path, *, mode=None, node=None, **cli_kw):
         "WRFCOIN_OPERATOR_TOKEN": "token-must-never-appear",
         "HOME": os.environ.get("HOME", str(tmp_path)),
         "PYTHONPATH": str(REPO / "src"),
+        **(extra_env or {}),
     }
     argv = ["bash", str(chain.chain_dir(root, t) / "submit.sh"), *([mode] if mode else [])]
     result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=300)
@@ -1616,3 +1616,78 @@ def test_an_interrupted_freeze_leaves_no_attempt_and_does_not_block_the_receipt(
     node, _ = _memory_chain(record, tip=109)
     receipt = chain.record_receipt(out, node)
     assert receipt["manifest_digest"] == record["manifest_digest"]
+
+
+# -- round 7 regressions ---------------------------------------------------------------------------------
+
+
+class _Proxy:
+    """A fake HTTP proxy that records every request it gets (and answers nothing useful)."""
+
+    def __init__(self):
+        self.seen = []
+        proxy = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                proxy.seen.append((self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"chain_height": 999999999}')
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+
+def test_node_reads_never_use_a_proxy(published, tmp_path):
+    """HTTP_PROXY and friends point at a fake proxy when a fresh process starts (as in real use);
+    the helper's reads, the authenticated one too, still go straight to the node, and the proxy
+    sees nothing."""
+    proxy = _Proxy()
+    fake = _node(tmp_path, published)
+    (fake.state / "commit").write_text("broadcast")
+    code = (
+        "import sys\n"
+        "from wrfcomp.live import chain\n"
+        "url = sys.argv[1]\n"
+        "chain.ALLOWED_NODES = frozenset({url})\n"
+        "node = chain.Node(url, sleep=lambda s: None, token='token-must-never-appear')\n"
+        "print(node.tip(), node.tx_status(sys.argv[2])['status'])\n"
+    )
+    env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+    env.update({name: proxy.url for name in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")})
+    env["PYTHONPATH"] = str(REPO / "src")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", code, fake.url, TX_IDS["commit"]],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        fake.server.shutdown()
+        proxy.server.shutdown()
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [str(COMMIT_HEIGHT - 1), "included"]
+    assert proxy.seen == []
+    assert f"/transactions/{TX_IDS['commit']}/status" in fake.requests
+
+
+def test_submit_sh_clears_proxy_variables_for_the_cli_and_the_helper(published, tmp_path):
+    proxy = _Proxy()
+    env = {name: proxy.url for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY")}
+    node = _node(tmp_path, published)
+    result, calls, out, *_ = _run_submit(published, tmp_path, node=node, extra_env=env)
+    node.server.shutdown()
+    proxy.server.shutdown()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert proxy.seen == [] and (out / "receipt.json").is_file()
+    script = (out / "submit.sh").read_text()
+    assert (
+        "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy" in script
+    )

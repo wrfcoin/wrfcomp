@@ -20,7 +20,10 @@ counts live only if its valid time is at least 15 minutes after the commit block
 (docs/LIVE_V4.md); ``receipt.json`` lists which leads count.
 
 **Reads** go to the local node only (``http://127.0.0.1:8556``; never wrfcoin.com or another host),
-unauthenticated GETs, at least 3 s apart (under 30 a minute).
+at least 3 s apart (under 30 a minute), never through a proxy and never following a redirect. All
+are unauthenticated GETs except one: the ``record`` step reads our transactions' inclusion
+(``/transactions/<tx_id>/status``, Reader role) with the reader bearer, which it takes from its
+environment and never prints or saves.
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 import numpy as np
 
@@ -393,6 +396,8 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         "# without it, and nothing prints it. One run at a time; the commit is never broadcast twice.",
         "set -euo pipefail",
         "umask 077",
+        "# no proxy for the CLI or the helper: the node is local, and a proxy would see the bearer",
+        "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy",
         f"DIR={q(str(out))}",
         f"REPO={q(str(Path(repo).resolve()))}",
         f"CLI={q(record['cli'])}",
@@ -493,7 +498,9 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
-_OPENER = build_opener(_NoRedirect)
+# No proxy, ever (an empty ProxyHandler overrides HTTP_PROXY and friends and the macOS system
+# proxies): a proxy would see the bearer and could forge the node's answers.
+_OPENER = build_opener(ProxyHandler({}), _NoRedirect)
 
 
 def reader_token_from_env() -> str | None:

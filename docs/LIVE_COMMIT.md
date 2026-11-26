@@ -15,8 +15,10 @@ Each 00Z live v4 issue is committed on chain, then revealed:
   carries no weather field, no `temp_c_centi` or `pressure_pa`, and no schema marker. The station id
   is the label `wrfcomp-live-v4`, never a real or registered station.
 
-The helper never signs or submits anything. It never opens the key file and never reads a token.
-The operator runs one script.
+The helper never signs or submits anything, and never opens the key file. Only one step reads a
+token: `record` uses the reader bearer (`WRFCOIN_READER_TOKEN`, else the operator bearer) from its
+environment, for one Reader-role read of our transactions' inclusion on the local node. It never
+prints or saves it. The operator runs one script.
 
 ## One-time setup (operator)
 
@@ -186,13 +188,15 @@ leads 6, 12, 24 and 48 count. Only 00Z issues are committed; 12Z needs `--allow-
 
 ## Reads
 
-Only unauthenticated GETs to the local node, at least 3 s apart:
+GETs to the local node only, at least 3 s apart. Never wrfcoin.com or any other host, never through
+a proxy (the helper's opener ignores `HTTP_PROXY` and the system proxies, and `submit.sh` unsets
+the proxy variables before the CLI and the helper run), and never following a redirect (a 3xx is
+refused):
 
-- `/network/info` (chain id, network id, chain height)
-- `/transactions/commit/<id>/status`
-- `/chain/block/<height>`
-
-Never wrfcoin.com or any other host.
+- unauthenticated: `/network/info` (chain id, network id, chain height),
+  `/transactions/commit/<id>/status`, `/chain/block/<height>`;
+- with the reader bearer, in the `record` step only: `/transactions/<tx_id>/status` (our commit's
+  and reveal's inclusion, Reader role). The answer must name the transaction id that was asked for.
 
 ## Not verified
 
