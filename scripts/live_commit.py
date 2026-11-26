@@ -9,7 +9,8 @@ The operator then runs ``bash <live>/chain/<issue>/submit.sh``, which calls the 
 these steps (each takes --dir <live>/chain/<issue>):
 
   check-cli | check-key | check-node | check-validate | check-submitted --step commit|reveal |
-  wait-pending | check-reveal-inputs | check-reveal-validate | check-window | wait-revealed | record
+  wait-pending | check-reveal-inputs | check-reveal-validate | check-window | reconcile-reveal |
+  wait-revealed | record
 
 The throwaway forecaster key is made once with the CLI (never a producer, oracle or station key),
 in a folder made first with mode 0700:
@@ -65,6 +66,7 @@ def main() -> None:
         "check-reveal-inputs",
         "check-reveal-validate",
         "check-window",
+        "reconcile-reveal",
         "wait-revealed",
         "record",
     ):
@@ -99,7 +101,9 @@ def main() -> None:
     elif args.command == "check-reveal-validate":
         chain.check_reveal_validate(out)
     elif args.command == "check-window":
-        print(json.dumps({"tip": chain.check_window(out, chain.Node())}))
+        print(chain.check_window(out, chain.Node()))
+    elif args.command == "reconcile-reveal":
+        print(chain.reconcile_reveal(out, chain.Node()))
     elif args.command == "wait-revealed":
         print(json.dumps({"revealed_at": chain.wait_revealed(out, chain.Node())["revealed_at"]}))
     elif args.command == "check-node":

@@ -56,6 +56,7 @@ VARIABLES = ["msl", "t2m", "td2m", "u10", "v10"]
 LEAD_HOURS = (1, 3, 6, 12, 24, 48)
 MARGIN = np.timedelta64(15, "m")
 REVEAL_WINDOW_BLOCKS = 3
+INCLUDED_STATUSES = frozenset({"revealed_pending_attestation", "revealed_attested"})
 POLL_SECONDS = 20
 MIN_REQUEST_GAP_S = 3.0
 # Keys the data object must never carry: the chain would read them as a weather reading or a paid
@@ -375,6 +376,7 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         f'"$CLI" --output json forecast reveal{cont}{common}{cont}'
         '--manifest-file "$DIR/manifest.json"' + cont + '--node-url "$NODE"'
     )
+    reveal_check = reveal_cmd.replace(" reveal", " reveal --validate-only", 1)
     lines = [
         "#!/usr/bin/env bash",
         f"# submit.sh for live v4 issue {record['init']}: testnet {record['chain_id']} only.",
@@ -422,20 +424,37 @@ def submit_script(out: Path, record: dict, repo: Path) -> str:
         f'    {commit_cmd} > "$DIR/commit_result.json.part"',
         '    mv "$DIR/commit_result.json.part" "$DIR/commit_result.json"',
         "    py check-submitted --step commit",
+        '    mkdir "$DIR/commit.sent"',
         "fi",
         f'echo "waiting for committed_pending_reveal (one read every {POLL_SECONDS} s)"',
         "py wait-pending",
-        'if [ ! -e "$DIR/reveal.claim" ]; then',
-        '    echo "checking the reveal against the prepared commitment"',
-        "    py check-reveal-inputs",
-        f'    {reveal_cmd.replace(" reveal", " reveal --validate-only", 1)} > "$DIR/reveal_validate.json"',
-        "    py check-reveal-validate",
-        "    py check-window",
-        '    mkdir "$DIR/reveal.claim"',
-        '    echo "revealing the hash and manifest"',
-        f'    {reveal_cmd} > "$DIR/reveal_result.json.part"',
-        '    mv "$DIR/reveal_result.json.part" "$DIR/reveal_result.json"',
-        "    py check-submitted --step reveal",
+        'if [ ! -e "$DIR/reveal.sent" ]; then',
+        "    NEXT=send",
+        '    if [ -e "$DIR/reveal.claim" ]; then',
+        '        echo "a reveal was attempted before; asking the chain whether it was included"',
+        '        NEXT="$(py reconcile-reveal)"',
+        "    fi",
+        '    if [ "$NEXT" != included ]; then',
+        '        echo "checking the reveal against the prepared commitment"',
+        "        py check-reveal-inputs",
+        f'        {reveal_check} > "$DIR/reveal_validate.json"',
+        "        py check-reveal-validate",
+        '        NEXT="$(py check-window)"',
+        "    fi",
+        '    if [ "$NEXT" = send ]; then',
+        '        mkdir -p "$DIR/reveal.claim"',
+        '        echo "revealing the hash and manifest"',
+        f'        if {reveal_cmd} > "$DIR/reveal_result.json.part"; then',
+        '            mv "$DIR/reveal_result.json.part" "$DIR/reveal_result.json"',
+        "            py check-submitted --step reveal",
+        '            mkdir "$DIR/reveal.sent"',
+        "        else",
+        '            echo "the reveal send failed (a resend may be refused as a duplicate);"',
+        '            echo "the chain decides: waiting for our reveal to be included"',
+        "        fi",
+        "    else",
+        '        echo "our earlier reveal is already included; nothing is sent"',
+        "    fi",
         "fi",
         'echo "waiting for the reveal to be included inside the reveal window"',
         "py wait-revealed",
@@ -605,7 +624,7 @@ def _check_revealed(record: dict, pending: dict, value: dict) -> dict:
     """OUR reveal, included (a revealed_* status), at a height inside the window."""
     if value.get("commit_id") != record["commit_id"] or value.get("station_id") != record["station_id"]:
         raise ChainRefusedError("the node reports another reveal; no receipt")
-    if not str(value.get("status", "")).startswith("revealed_"):
+    if value.get("status") not in INCLUDED_STATUSES:
         raise ChainRefusedError("the reveal is not reported as included; no receipt")
     first, last = reveal_window(pending)
     height = value.get("revealed_at")
@@ -623,7 +642,7 @@ def wait_pending(
     record = _load(out, "commit.json")
     if (Path(out) / "status_pending.json").exists():  # resumed: reuse the saved, rechecked checkpoint
         return _check_pending(record, _load(out, "status_pending.json"))
-    start = clock()
+    start, start_tip = clock(), node.tip()
     while True:
         status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
         if status == 200 and isinstance(value, dict):
@@ -633,9 +652,10 @@ def wait_pending(
                 return pending
             if value.get("status") not in (None, "not_found"):
                 raise ChainRefusedError(f"unexpected commit status {value.get('status')!r}; not revealing")
-        if clock() - start > timeout_s:
+        if clock() - start > timeout_s or node.tip() > start_tip + 2 * REVEAL_WINDOW_BLOCKS:
             raise ChainRefusedError(
-                "the commit did not reach committed_pending_reveal in time; not revealing"
+                "the commit is not on chain: OPERATOR DECISION needed. It is never sent again "
+                "automatically; check the node, then decide whether to prepare a new commit."
             )
         sleep(POLL_SECONDS)
 
@@ -687,35 +707,105 @@ def check_reveal_validate(out: Path) -> None:
         raise ChainRefusedError("the CLI's reveal manifest differs from the prepared one; not revealing")
 
 
-def check_window(out: Path, node: Node) -> int:
-    """Refuse to broadcast a reveal that can no longer land inside the window (next block > deadline)."""
-    deadline = _deadline(_load(out, "status_pending.json"))
+def _final_block(node: Node, height: int) -> str:
+    status, block = node.get(f"/chain/block/{height}")
+    if status != 200 or not isinstance(block, dict) or block.get("height") != height:
+        raise ChainRefusedError(f"the node did not return block {height}")
+    if not (isinstance(block.get("hash"), str) and _hex64(block["hash"])):
+        raise ChainRefusedError(f"block {height} has no final hash")
+    return block["hash"]
+
+
+def check_window(out: Path, node: Node) -> str:
+    """Broadcast the reveal only if the next block can carry it: the node's current view still has
+    OUR commit pending at the saved height, the node is not behind that height, the commit block is
+    final, and the next block is inside the window (both bounds). Returns "send", or "included" if
+    our earlier reveal has meanwhile been included (then nothing is sent)."""
+    record = _load(out, "commit.json")
+    pending = _check_pending(record, _load(out, "status_pending.json"))
+    first, last = reveal_window(pending)
+    committed = int(pending["committed_at"])
+    status, now = node.get(f"/transactions/commit/{record['commit_id']}/status")
+    if status == 200 and isinstance(now, dict) and now.get("status") in INCLUDED_STATUSES:
+        _check_revealed(record, pending, now)
+        return "included"
+    if status != 200 or not isinstance(now, dict) or now.get("status") != "committed_pending_reveal":
+        raise ChainRefusedError("the node does not report our commit as pending; not revealing")
+    if int(_check_pending(record, now)["committed_at"]) != committed:
+        raise ChainRefusedError("the node reports our commit at another height; not revealing")
     tip = node.tip()
-    if tip + 1 > deadline:
+    if tip < committed:
+        raise ChainRefusedError(f"the node is behind the commit (tip {tip} < {committed}); not revealing")
+    _final_block(node, committed)
+    if not first <= tip + 1 <= last:
         raise ChainRefusedError(
-            f"the reveal window has closed (tip {tip}, last block {deadline}); not revealing"
+            f"the next block {tip + 1} is outside the window {first}..{last}; not revealing"
         )
-    return tip
+    return "send"
+
+
+def reconcile_reveal(out: Path, node: Node) -> str:
+    """A reveal was attempted but not confirmed sent (interrupted around the send): ask the chain.
+    "included" if our reveal is there; "resend" if our commit is still pending (sending again is safe:
+    the chain refuses a duplicate reveal); otherwise refused for the operator to decide."""
+    record = _load(out, "commit.json")
+    status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
+    if status == 200 and isinstance(value, dict):
+        if value.get("status") in INCLUDED_STATUSES and value.get("commit_id") == record["commit_id"]:
+            return "included"
+        if value.get("status") == "committed_pending_reveal":
+            _check_pending(record, value)
+            return "resend"
+    raise ChainRefusedError(
+        "the chain shows neither our pending commit nor our reveal: OPERATOR DECISION needed"
+    )
+
+
+def _inclusion(record: dict, pending: dict, value: dict, node: Node) -> dict:
+    """The evidence for OUR included reveal, read from the node now: the reveal height inside the
+    window, and the final hashes of the commit block and of the reveal block."""
+    value = _check_revealed(record, pending, value)
+    return {
+        "commit_id": record["commit_id"],
+        "station_id": record["station_id"],
+        "status": value["status"],
+        "committed_at": int(pending["committed_at"]),
+        "revealed_at": int(value["revealed_at"]),
+        "commit_block_hash": _final_block(node, int(pending["committed_at"])),
+        "reveal_block_hash": _final_block(node, int(value["revealed_at"])),
+    }
+
+
+PINNED = ("commit_id", "station_id", "committed_at", "revealed_at", "commit_block_hash", "reveal_block_hash")
+
+
+def _same_inclusion(saved: dict, fresh: dict) -> bool:
+    return all(saved.get(k) == fresh.get(k) for k in PINNED)
 
 
 def wait_revealed(
     out: Path, node: Node, *, timeout_s: float = 900.0, sleep=time.sleep, clock=time.monotonic
 ) -> dict:
-    """Poll until the chain reports OUR reveal included at a height inside the window; save it.
-    Refused (no receipt) if the window passes first, or the reveal is reported outside it. A saved
-    checkpoint (a resumed run) is rechecked and reused."""
+    """Poll until the node reports OUR reveal included inside the window, with final commit and
+    reveal blocks; pin that evidence once. Always read from the node: on a resumed run the fresh
+    evidence must match the pinned one (same heights and block hashes), or there is no receipt."""
     record = _load(out, "commit.json")
     pending = _check_pending(record, _load(out, "status_pending.json"))
-    if (Path(out) / "status_revealed.json").exists():
-        return _check_revealed(record, pending, _load(out, "status_revealed.json"))
     deadline = _deadline(pending)
+    pinned_path = Path(out) / "status_revealed.json"
     start = clock()
     while True:
         status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
-        if status == 200 and isinstance(value, dict) and str(value.get("status", "")).startswith("revealed_"):
-            value = _check_revealed(record, pending, value)
-            _save(out, "status_revealed.json", value)
-            return value
+        if status == 200 and isinstance(value, dict) and value.get("status") in INCLUDED_STATUSES:
+            evidence = _inclusion(record, pending, value, node)
+            if pinned_path.exists():
+                if not _same_inclusion(_load(out, "status_revealed.json"), evidence):
+                    raise ChainRefusedError("the node's inclusion differs from the pinned one; no receipt")
+                return evidence
+            _save(out, "status_revealed.json", {k: evidence[k] for k in PINNED})
+            return evidence
+        if pinned_path.exists():
+            raise ChainRefusedError("the node no longer reports the pinned inclusion; no receipt")
         if node.tip() > deadline:
             raise ChainRefusedError(
                 f"the reveal window closed at block {deadline} without our reveal; no receipt"
@@ -746,34 +836,44 @@ def format_time_ns(t: np.datetime64) -> str:
 
 
 def record_receipt(out: Path, node: Node) -> dict:
-    """Write receipt.json, only for OUR reveal included inside the window, with the commit block."""
+    """Write receipt.json, only after re-reading OUR reveal's inclusion from the node now: heights
+    inside the window, and the same commit and reveal block hashes as pinned when it was confirmed."""
     record = _load(out, "commit.json")
     pending = _check_pending(record, _load(out, "status_pending.json"))
-    revealed = _check_revealed(record, pending, _load(out, "status_revealed.json"))
+    pinned = _load(out, "status_revealed.json")
+    status, value = node.get(f"/transactions/commit/{record['commit_id']}/status")
+    if status != 200 or not isinstance(value, dict):
+        raise ChainRefusedError("the node does not report our reveal now; no receipt")
+    evidence = _inclusion(record, pending, value, node)
+    if not _same_inclusion(pinned, evidence):
+        raise ChainRefusedError("the node's inclusion differs from the pinned one; no receipt")
     committed, deadline = int(pending["committed_at"]), _deadline(pending)
-    status, block = node.get(f"/chain/block/{committed}")
-    if status != 200 or not isinstance(block, dict) or block.get("height") != committed:
-        raise ChainRefusedError(f"the node did not return block {committed}; no receipt")
-    if not (isinstance(block.get("hash"), str) and _hex64(block["hash"])):
-        raise ChainRefusedError(f"block {committed} has no final hash; no receipt")
+    block_status, block = node.get(f"/chain/block/{committed}")
+    if (
+        block_status != 200
+        or not isinstance(block, dict)
+        or block.get("hash") != evidence["commit_block_hash"]
+    ):
+        raise ChainRefusedError(f"block {committed} changed; no receipt")
     block_time = parse_time_ns(block["timestamp"])
 
     def tx(step):
         try:
             return check_submitted(out, step)["tx_id"]
         except FileNotFoundError:
-            return None  # interrupted after broadcast; the chain status is the evidence
+            return None  # interrupted around the broadcast; the chain status is the evidence
 
     receipt = {
         "commit_id": record["commit_id"],
         "commit_tx_id": tx("commit"),
         "reveal_tx_id": tx("reveal"),
         "commit_height": committed,
-        "reveal_height": int(revealed["revealed_at"]),
+        "reveal_height": evidence["revealed_at"],
         "reveal_window_last_block": deadline,
-        "commit_block_hash": block["hash"],
+        "commit_block_hash": evidence["commit_block_hash"],
+        "reveal_block_hash": evidence["reveal_block_hash"],
         "commit_block_time": format_time_ns(block_time),
-        "reveal_status": revealed["status"],
+        "reveal_status": evidence["status"],
         "chain_id": record["chain_id"],
         "network_id": record["network_id"],
         "station_id": record["station_id"],

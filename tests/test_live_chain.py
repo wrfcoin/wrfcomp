@@ -285,7 +285,23 @@ if opts.get("validate_only"):
 else:
     if kind == "commit":
         time.sleep(behaviour.get("commit_delay", 0))
+    once = state / f"killed_{{kind}}"
+    if behaviour.get("kill_before_send") == kind and not once.exists():
+        once.write_text("1")
+        os.kill(os.getppid(), 9)  # the script dies between its claim and the send
+        sys.exit(9)
+    if kind == "reveal" and (state / "reveal").exists():
+        error = {{"code": "rejected", "message": "duplicate reveal", "hint": None}}
+        refused = {{"ok": False, "command": "forecast", "exit_code": 1, "error": error}}
+        print(json.dumps(refused, sort_keys=True))
+        sys.exit(1)
     (state / kind).write_text("broadcast")
+    with (state / "sent.log").open("a") as fh:
+        fh.write(kind + "\n")
+    if behaviour.get("kill_after_send") == kind and not once.exists():
+        once.write_text("1")
+        os.kill(os.getppid(), 9)  # sent; the script dies before it records that
+        sys.exit(9)
     if kind == "commit" and behaviour.get("crash_after_commit") and not (state / "crashed").exists():
         (state / "crashed").write_text("1")
         sys.exit(9)  # the broadcast happened; the result never reached the script
@@ -332,6 +348,7 @@ class FakeNode:
         when = pd.Timestamp(init + 4 * H + np.timedelta64(15, "m")).tz_localize("UTC")
         self.block_time = when.isoformat()
         self.block_hash, self.tip, self.requests, self.revealed_at = block_hash, COMMIT_HEIGHT - 1, [], None
+        self.other_hashes, self.reads, self.lost = {}, 0, False
         node = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -356,14 +373,18 @@ class FakeNode:
             return 200, {"chain_id": self.chain_id, "network_id": "testnet", "chain_height": self.tip}
         if path.startswith("/transactions/commit/"):
             cid = path.split("/")[3]
-            self.tip += 1
+            if self.lost:
+                return 404, {"commit_id": cid, "status": "not_found"}
+            self.reads += 1
+            self.tip = COMMIT_HEIGHT - 1 + self.reads // 2
             if (self.state / "reveal").exists() and self.revealed_at is None and self.reveal != "never":
                 heights = {
-                    "next": self.tip,
+                    "next": self.tip + 1,  # a reveal sent at tip T lands at T + 1 at the earliest
                     "last": deadline,
                     "late": deadline + 1,
-                    "other": self.tip,
+                    "other": self.tip + 1,
                     "beyond_cap": COMMIT_HEIGHT + 4,
+                    "lag": min(self.tip + 2, deadline),
                 }
                 self.revealed_at = heights[self.reveal]
             if self.revealed_at is not None and self.tip >= min(
@@ -386,8 +407,14 @@ class FakeNode:
                     "reveal_expires_at": COMMIT_HEIGHT + self.expiries[1],
                 }
             return 404, {"commit_id": cid, "status": "not_found"}
-        if path == f"/chain/block/{COMMIT_HEIGHT}":
-            data = {"height": COMMIT_HEIGHT, "hash": self.block_hash, "timestamp": self.block_time}
+        if path.startswith("/chain/block/"):
+            height = int(path.rsplit("/", 1)[1])
+            if height > self.tip:
+                return 404, {}
+            block_hash = (
+                self.block_hash if height == COMMIT_HEIGHT else self.other_hashes.get(height, "cd" * 32)
+            )
+            data = {"height": height, "hash": block_hash, "timestamp": self.block_time}
             return 200, {"ok": True, "data": data}
         return 404, {}
 
@@ -431,6 +458,18 @@ def _calls(state):
 
 def _broadcasts(calls, kind):
     return [c for c in calls if c[3] == kind and "--validate-only" not in c]
+
+
+def _sent(state, kind):
+    """Broadcasts that actually happened (the fake CLI logs them; a refused duplicate is not one)."""
+    log = state / "sent.log"
+    return log.read_text().splitlines().count(kind) if log.exists() else 0
+
+
+def _after_kill(out):
+    """The operator's step after a killed run (docs): check nothing runs, remove the active claim."""
+    if (out / "active").exists():
+        (out / "active").rmdir()
 
 
 def _no_token_anywhere(result, out, state):
@@ -496,7 +535,7 @@ def test_no_reveal_is_broadcast_once_the_window_has_closed(published, tmp_path):
     node.answer = tip_runs_ahead
     result, calls, out, *_ = _run_submit(published, tmp_path, node=node)
     node.server.shutdown()
-    assert result.returncode != 0 and "window has closed" in result.stderr
+    assert result.returncode != 0 and "outside the window" in result.stderr
     assert _broadcasts(calls, "reveal") == [] and not (out / "receipt.json").exists()
 
 
@@ -658,14 +697,21 @@ def test_wait_pending_refuses_an_unexpected_status_and_times_out(published):
     data, root, last, key, cli = published
     _prepare(root, last - 12 * H, key, cli)
     out = chain.chain_dir(root, last - 12 * H)
-    answers = iter([(200, b'{"status": "revealed_attested"}')])
-    node = chain.Node(get=lambda url: next(answers), sleep=lambda s: None)
+
+    def node_with(status_answer):
+        tips = iter(range(100, 10_000))
+
+        def get(url):
+            if url.endswith("/network/info"):
+                return 200, json.dumps({"chain_height": next(tips)}).encode()
+            return status_answer
+
+        return chain.Node(get=get, sleep=lambda s: None)
+
     with pytest.raises(chain.ChainRefusedError, match="unexpected commit status"):
-        chain.wait_pending(out, node, sleep=lambda s: None)
-    clock = iter(range(0, 10_000, 100))
-    node = chain.Node(get=lambda url: (404, b'{"status": "not_found"}'), sleep=lambda s: None)
-    with pytest.raises(chain.ChainRefusedError, match="in time"):
-        chain.wait_pending(out, node, timeout_s=250, sleep=lambda s: None, clock=lambda: next(clock))
+        chain.wait_pending(out, node_with((200, b'{"status": "revealed_attested"}')), sleep=lambda s: None)
+    with pytest.raises(chain.ChainRefusedError, match="OPERATOR DECISION"):
+        chain.wait_pending(out, node_with((404, b'{"status": "not_found"}')), sleep=lambda s: None)
     assert not (out / "status_pending.json").exists()
 
 
@@ -882,8 +928,24 @@ def test_record_validates_the_saved_evidence_itself(published, change, message):
         "reveal_expires_at": 112,
     }
     revealed = {**base, "status": "revealed_pending_attestation", "revealed_at": 103, **change}
-    _checkpoints(out, record, pending, revealed)
-    node = chain.Node(get=lambda url: (200, b"{}"), sleep=lambda s: None)
+    pinned = {
+        **base,
+        "committed_at": 100,
+        "revealed_at": 103,
+        "commit_block_hash": "ab" * 32,
+        "reveal_block_hash": "cd" * 32,
+    }
+    _checkpoints(out, record, pending, pinned)
+
+    def get(url):
+        if "/chain/block/" in url:
+            height = int(url.rsplit("/", 1)[1])
+            digest = ("ab" if height == 100 else "cd") * 32
+            block = {"height": height, "hash": digest, "timestamp": "2026-03-10T04:15:00Z"}
+            return 200, json.dumps({"ok": True, "data": block}).encode()
+        return 200, json.dumps(revealed).encode()
+
+    node = chain.Node(get=get, sleep=lambda s: None)
     with pytest.raises(chain.ChainRefusedError, match=message):
         chain.record_receipt(out, node)
     assert not (out / "receipt.json").exists()
@@ -914,23 +976,149 @@ def test_resume_from_the_included_stage(published, tmp_path):
     assert (out / "receipt.json").is_file()
 
 
-def test_resume_from_the_revealed_stage_and_again_after_the_receipt(published, tmp_path):
-    """Reveal confirmed and saved, then the block lookup had no final hash; after it recovers, resume
-    writes the receipt without any broadcast; a further resume changes nothing."""
+def test_resume_after_the_node_recovers_and_again_after_the_receipt(published, tmp_path):
+    """The commit block had no final hash yet: nothing is revealed. After the node recovers, resume
+    reveals and writes the receipt with one commit and one reveal broadcast; a further resume changes
+    nothing."""
     node = _node(tmp_path, published, block_hash="pending")
     first, calls, out, *_ = _run_submit(published, tmp_path, node=node)
-    assert (
-        first.returncode != 0
-        and (out / "status_revealed.json").exists()
-        and not (out / "receipt.json").exists()
-    )
+    assert first.returncode != 0 and "no final hash" in first.stderr and _sent(node.state, "reveal") == 0
     node.block_hash = "ab" * 32
     resumed, calls, *_ = _run_submit(published, tmp_path, mode="resume", node=node)
     assert resumed.returncode == 0, resumed.stdout + resumed.stderr
-    assert len(_broadcasts(calls, "commit")) == 1 and len(_broadcasts(calls, "reveal")) == 1
+    assert _sent(node.state, "commit") == 1 and _sent(node.state, "reveal") == 1
     receipt = (out / "receipt.json").read_text()
-    again, calls_again, *_ = _run_submit(published, tmp_path, mode="resume", node=node)
+    again, *_ = _run_submit(published, tmp_path, mode="resume", node=node)
     node.server.shutdown()
     assert again.returncode == 0, again.stdout + again.stderr
-    assert len(_broadcasts(calls_again, "commit")) == 1 and len(_broadcasts(calls_again, "reveal")) == 1
+    assert _sent(node.state, "commit") == 1 and _sent(node.state, "reveal") == 1
     assert (out / "receipt.json").read_text() == receipt
+
+
+# -- round 3 regressions ---------------------------------------------------------------------------------
+
+
+def test_no_reveal_when_the_node_is_behind_the_commit(published, tmp_path):
+    """A stale or wrong node: its tip is below the saved commit height. Nothing is broadcast."""
+    node = _node(tmp_path, published)
+    real = node.answer
+
+    def behind(path):
+        status, body = real(path)
+        if path == "/network/info" and (node.state / "commit").exists():
+            body = {**body, "chain_height": COMMIT_HEIGHT - 1}
+        return status, body
+
+    node.answer = behind
+    result, calls, out, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
+    assert result.returncode != 0 and "behind the commit" in result.stderr
+    assert _sent(node.state, "reveal") == 0 and not (out / "receipt.json").exists()
+
+
+def test_no_reveal_when_the_node_reports_the_commit_at_another_height(published, tmp_path):
+    node = _node(tmp_path, published)
+    real = node.answer
+    seen = {"n": 0}
+
+    def moved(path):
+        status, body = real(path)
+        if isinstance(body, dict) and body.get("status") == "committed_pending_reveal":
+            seen["n"] += 1
+            if seen["n"] > 1:  # the saved checkpoint says 40000; the node's view now differs
+                body = {**body, "committed_at": COMMIT_HEIGHT - 5}
+        return status, body
+
+    node.answer = moved
+    result, calls, *_ = _run_submit(published, tmp_path, node=node)
+    node.server.shutdown()
+    assert result.returncode != 0 and "another height" in result.stderr and _sent(node.state, "reveal") == 0
+
+
+def test_resume_after_a_kill_between_the_reveal_claim_and_the_send(published, tmp_path):
+    """reveal.claim exists, nothing was sent: resume asks the chain (commit still pending), sends the
+    reveal, and finishes with one commit and one reveal broadcast."""
+    node = _node(tmp_path, published, expiries=(10, 10))
+    first, calls, out, *_ = _run_submit(published, tmp_path, node=node, kill_before_send="reveal")
+    assert first.returncode != 0 and (out / "reveal.claim").is_dir() and not (out / "reveal.sent").exists()
+    assert _sent(node.state, "reveal") == 0
+    _after_kill(out)
+    resumed, *_ = _run_submit(published, tmp_path, mode="resume", node=node, kill_before_send="reveal")
+    node.server.shutdown()
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert "asking the chain" in resumed.stdout
+    assert _sent(node.state, "commit") == 1 and _sent(node.state, "reveal") == 1
+    assert (out / "receipt.json").is_file() and (out / "reveal.sent").is_dir()
+
+
+def test_resume_after_a_kill_right_after_the_reveal_send_does_not_send_again(published, tmp_path):
+    """Sent, but the script died before recording it: the chain shows our reveal; no second send."""
+    node = _node(tmp_path, published, expiries=(10, 10))
+    first, calls, out, *_ = _run_submit(published, tmp_path, node=node, kill_after_send="reveal")
+    assert first.returncode != 0 and not (out / "reveal.sent").exists() and _sent(node.state, "reveal") == 1
+    _after_kill(out)
+    resumed, calls, *_ = _run_submit(published, tmp_path, mode="resume", node=node, kill_after_send="reveal")
+    node.server.shutdown()
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert _sent(node.state, "reveal") == 1 and (out / "receipt.json").is_file()
+
+
+def test_a_resend_refused_as_a_duplicate_is_settled_by_the_chain(published, tmp_path):
+    """Sent and killed before recording; the chain has not shown the reveal yet, so resume sends it
+    again; the chain refuses the duplicate; the inclusion it then reports decides."""
+    node = _node(tmp_path, published, reveal="lag", expiries=(10, 10))
+    first, calls, out, *_ = _run_submit(published, tmp_path, node=node, kill_after_send="reveal")
+    assert first.returncode != 0 and _sent(node.state, "reveal") == 1
+    _after_kill(out)
+    node.revealed_at = None  # the reveal is not visible yet when resume asks
+    resumed, calls, *_ = _run_submit(published, tmp_path, mode="resume", node=node, kill_after_send="reveal")
+    node.server.shutdown()
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert "a resend may be refused as a duplicate" in resumed.stdout
+    assert _sent(node.state, "reveal") == 1 and (out / "receipt.json").is_file()
+
+
+def test_a_commit_interrupted_before_its_send_is_never_sent_by_resume(published, tmp_path):
+    """commit.claim exists, nothing was sent: resume never rebroadcasts the commit; it reports that
+    the operator must decide."""
+    node = _node(tmp_path, published)
+    first, calls, out, *_ = _run_submit(published, tmp_path, node=node, kill_before_send="commit")
+    assert first.returncode != 0 and (out / "commit.claim").is_dir() and _sent(node.state, "commit") == 0
+    _after_kill(out)
+    resumed, *_ = _run_submit(published, tmp_path, mode="resume", node=node, kill_before_send="commit")
+    node.server.shutdown()
+    assert resumed.returncode != 0 and "OPERATOR DECISION" in resumed.stderr
+    assert _sent(node.state, "commit") == 0 and not (out / "receipt.json").exists()
+
+
+@pytest.mark.parametrize(
+    "damage", ["replacement reveal block", "replacement commit block", "commitment lost"]
+)
+def test_resume_rechecks_pinned_inclusion_before_any_receipt(published, tmp_path, damage):
+    """Interrupted after the inclusion was pinned, before the receipt. On resume the node shows a
+    replacement block, or no longer has the commitment: no receipt."""
+    node = _node(tmp_path, published)
+    done, calls, out, *_ = _run_submit(published, tmp_path, node=node)
+    assert done.returncode == 0, done.stderr
+    pinned = json.loads((out / "status_revealed.json").read_text())
+    (out / "receipt.json").unlink()  # as if the run stopped right before writing it
+    if damage == "replacement reveal block":
+        node.other_hashes[pinned["revealed_at"]] = "ee" * 32
+    elif damage == "replacement commit block":
+        node.block_hash = "ee" * 32
+    else:
+        node.lost = True
+    resumed, *_ = _run_submit(published, tmp_path, mode="resume", node=node)
+    node.server.shutdown()
+    assert resumed.returncode != 0 and "no receipt" in resumed.stderr
+    assert not (out / "receipt.json").exists()
+    assert _sent(node.state, "commit") == 1 and _sent(node.state, "reveal") == 1
+
+
+def test_only_the_included_statuses_core4_defines_count():
+    record = {"commit_id": "a" * 64, "station_id": "wrfcomp-live-v4"}
+    pending = {"committed_at": 100, "commit_expires_at": 106, "reveal_expires_at": 112}
+    for status in ("revealed_pending_attestation", "revealed_attested"):
+        chain._check_revealed(record, pending, {**record, "status": status, "revealed_at": 101})
+    with pytest.raises(chain.ChainRefusedError, match="not reported as included"):
+        chain._check_revealed(record, pending, {**record, "status": "revealed_something", "revealed_at": 101})

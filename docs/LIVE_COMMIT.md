@@ -76,13 +76,27 @@ refused while one is active. Its steps:
    send, check the manifest describes the committed store, and require the CLI's offline reveal body
    to equal the prepared reveal. The comparison is of the decoded objects: core4 prints the body,
    manifest included, with sorted keys, which is the same manifest; the digest is computed after
-   putting the fields back in the Rust declaration order. Refuse if the next block is already past the window. Then
-   claim the reveal (`reveal.claim`) and reveal the data object and manifest (no oracle receipt).
-5. Wait until the chain reports OUR reveal included at a height inside the window. Only then is
-   `receipt.json` written: the commit and reveal transaction ids, the commit and reveal heights, the
-   window's last block, the commit block's hash (it must be final) and time (to the nanosecond, as
-   the node gives it), and which leads count. A reveal still pending when the window closes, or
-   reported outside it or for another commit, gives no receipt and a non-zero exit.
+   putting the fields back in the Rust declaration order.
+
+   Then re-read the node. It must still report OUR commit pending at the saved height, its tip
+   must not be below that height, the commit block must be final, and the next block must be inside
+   the window. Then claim the reveal (`reveal.claim`) and reveal the data object and manifest (no
+   oracle receipt). `reveal.sent` is written only after the send returns successfully.
+5. Wait until the chain reports OUR reveal included (`revealed_pending_attestation` or
+   `revealed_attested`, the only two core4 statuses that mean included) at a height inside the
+   window. Pin that evidence once: both heights and the final hashes of the commit block and the
+   reveal block (`status_revealed.json`).
+6. Before writing `receipt.json`, read the inclusion from the node again. Both heights and both
+   block hashes must equal the pinned ones; a replacement block, or a node that no longer has the
+   commitment, gives no receipt. The receipt holds:
+   - the commit and reveal transaction ids;
+   - the commit and reveal heights, and the window's last block;
+   - both block hashes;
+   - the commit block's time, to the nanosecond as the node gives it;
+   - which leads count.
+
+   A reveal still pending when the window closes, or reported outside it or for another commit,
+   gives no receipt and a non-zero exit.
 
 The helper steps run without the operator bearer in their environment; only the CLI sees it, and
 nothing prints it.
@@ -91,9 +105,13 @@ nothing prints it.
 saved and never broadcasts the commit twice:
 
 - **prepared:** validate and commit;
-- **committed:** wait for the pending commit;
-- **included:** `status_pending.json` saved; reveal, if the reveal has not been claimed;
-- **revealed:** `status_revealed.json` saved; write the receipt.
+- **committed:** wait for the pending commit. A commit that was claimed but is not on chain a few
+  blocks later is never sent again: resume stops with OPERATOR DECISION;
+- **included:** `status_pending.json` saved; reveal. If a reveal was claimed but `reveal.sent` is
+  missing (killed around the send), resume asks the chain. If our reveal is included, nothing is
+  sent. If our commit is still pending, the reveal is sent again; a duplicate is refused by the
+  chain, and the inclusion it then reports decides;
+- **revealed:** inclusion pinned; re-read it from the node and write the receipt.
 
 Running it again after the receipt changes nothing. Every saved checkpoint is rechecked before it is
 reused, and the `record` step validates the saved evidence itself (our commit id and station, an
