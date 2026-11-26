@@ -42,6 +42,10 @@ GH_REPO="wrfcoin/wrfcomp"
 py() {
     env -u WRFCOIN_OPERATOR_TOKEN -u WRFCOIN_READER_TOKEN uv run --frozen python -P "$@"
 }
+# gh never sees a node bearer either
+ghx() {
+    env -u WRFCOIN_OPERATOR_TOKEN -u WRFCOIN_READER_TOKEN gh "$@"
+}
 
 echo "== $ISSUE: airport readings (the last 30 hours)"
 py scripts/live_v4.py fetch-metar --hours 30 --network
@@ -72,7 +76,7 @@ if [ ! -f "$CHAIN_DIR/receipt.json" ]; then
     fi
 fi
 
-echo "== $ISSUE: publish"
+echo "== $ISSUE: publish (only after the chain confirms the reveal now)"
 NAMES="$(py scripts/live_publish.py names --init "$INIT")"
 read -r TAG ASSET ARCHIVE <<< "$NAMES"
 if [ -z "${ARCHIVE:-}" ]; then
@@ -80,17 +84,28 @@ if [ -z "${ARCHIVE:-}" ]; then
     exit 1
 fi
 py scripts/live_publish.py pack --init "$INIT"
-if ! gh release view "$TAG" --repo "$GH_REPO" > /dev/null 2>&1; then
-    gh release create "$TAG" --repo "$GH_REPO" --title "Live v4 forecasts ${DAY:0:7}" \
-        --notes "Daily live v4 forecast stores on testnet 888, one asset per issue. Check one with scripts/live_publish.py check-reveal."
+# every gh call fails the run on any error (plain assignments under set -e, no "if !" fall-through)
+TAGS="$(ghx release list --repo "$GH_REPO" --limit 1000 --json tagName --jq '.[].tagName')"
+if ! grep -qxF "$TAG" <<< "$TAGS"; then
+    ghx release create "$TAG" --repo "$GH_REPO" --title "Live v4 forecasts ${DAY:0:7}" \
+        --notes "Daily live v4 forecast stores on testnet 888, one asset and its .sha256 per issue. Check one with scripts/live_publish.py check-reveal."
 fi
-if ! gh release view "$TAG" --repo "$GH_REPO" --json assets --jq '.assets[].name' | grep -qxF "$ASSET"; then
-    gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --repo "$GH_REPO"
+NAMES_UP="$(ghx release view "$TAG" --repo "$GH_REPO" --json assets --jq '.assets[].name')"
+HAVE_ASSET=no
+HAVE_SUM=no
+grep -qxF "$ASSET" <<< "$NAMES_UP" && HAVE_ASSET=yes
+grep -qxF "$ASSET.sha256" <<< "$NAMES_UP" && HAVE_SUM=yes
+if [ "$HAVE_ASSET$HAVE_SUM" = nono ]; then
+    ghx release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --repo "$GH_REPO"
+elif [ "$HAVE_ASSET$HAVE_SUM" != yesyes ]; then
+    echo "the release has only one of $ASSET and $ASSET.sha256: OPERATOR DECISION (nothing is replaced)" >&2
+    exit 1
 fi
 
 echo "== $ISSUE: verify the published copy against the chain"
-DOWNLOAD="$LIVE/verify/download"
-mkdir -p "$DOWNLOAD"
-gh release download "$TAG" --repo "$GH_REPO" --pattern "$ASSET" --dir "$DOWNLOAD" --clobber
+mkdir -p "$LIVE/verify/download"
+DOWNLOAD="$(mktemp -d "$LIVE/verify/download/$ISSUE.XXXXXX")"
+ghx release download "$TAG" --repo "$GH_REPO" --pattern "$ASSET" --pattern "$ASSET.sha256" --dir "$DOWNLOAD"
+py scripts/live_publish.py verify-download --init "$INIT" --dir "$DOWNLOAD"
 py scripts/live_publish.py check-reveal --init "$INIT" --archive "$DOWNLOAD/$ASSET"
 echo "done: $LIVE/verify/$ISSUE.json"

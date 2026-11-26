@@ -2,10 +2,13 @@
 receipt (I2 deliverables 3 and 4). Each step takes --init T (e.g. 2026-12-02T00).
 
   names         prints "<release tag> <asset name> <archive path>" (no I/O beyond the path check)
-  pack          writes <live>/publish/<asset> and <asset>.sha256 once the reveal is confirmed
-  check-reveal  --archive <file>: re-hashes the published store against data.json, the manifest and
-                the receipt, re-derives the commit id, and re-reads the chain; writes
-                <live>/verify/<issue>.json
+  pack          writes <live>/publish/<asset> and <asset>.sha256, only after the issue's files are
+                verified and the chain confirms the reveal now (6 blocks after it, status served)
+  verify-download --dir <folder>: the downloaded asset's sha256 must equal its .sha256 file and the
+                archive packed here
+  check-reveal  --archive <file>: verifies the archive's files (store hash, data, manifest, commit
+                id, lock) and re-reads the chain (served status, blocks, 6 confirmations, twice);
+                writes <live>/verify/<issue>.json
   ledger        re-checks the receipt on the chain and prints the pofs_shadow evidence per lead
                 (wallet, digest, commit time, deadline, timely)
 
@@ -32,6 +35,9 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("names", "pack", "ledger"):
         sub.add_parser(name).add_argument("--init", required=True)
+    download = sub.add_parser("verify-download")
+    download.add_argument("--init", required=True)
+    download.add_argument("--dir", required=True, type=Path)
     check = sub.add_parser("check-reveal")
     check.add_argument("--init", required=True)
     check.add_argument("--archive", required=True, type=Path)
@@ -42,7 +48,9 @@ def main() -> None:
     if args.command == "names":
         print(publish.release_tag(t), publish.asset_name(t), publish.archive_path(root, t))
     elif args.command == "pack":
-        print(json.dumps(publish.pack(root, t)))
+        print(json.dumps(publish.pack(root, t, chain.Node())))
+    elif args.command == "verify-download":
+        print(json.dumps({"sha256": publish.verify_download(root, t, args.dir)}))
     elif args.command == "check-reveal":
         result = publish.check_reveal(root, args.archive, t, chain.Node())
         keys = ("issue", "ok", "content_sha256", "commit_status_served", "counted_leads_hours")
@@ -50,7 +58,10 @@ def main() -> None:
     else:
         from wrfcomp.live import ledger
 
-        print(json.dumps(ledger.summary(ledger.issue_evidence(root, t, chain.Node())), indent=1))
+        receipt = ledger.verified_receipt(root, t, chain.Node())
+        rows = ledger.summary(ledger.per_lead(receipt, ledger.gefs_digest(root, t)))
+        counted = receipt["counted_leads_hours"]
+        print(json.dumps({"per_lead": rows, "settle_with_a_scorecard_over_leads": counted}, indent=1))
 
 
 if __name__ == "__main__":

@@ -170,11 +170,16 @@ The owner may change these research defaults. Ledger settings are centralized in
 ## Live receipts from testnet 888
 
 For the live v4 forecasts, `src/wrfcomp/live/ledger.py` builds this ledger's `EpochEvidence` from
-on-chain commits. Each `receipt.json` is re-checked on the chain first, then becomes
-`Commitment(digest = the store's content hash, received_at = the commit block's time)` for the
-forecaster's wallet. The live rule is per lead: a lead counts only if its valid time is at least 15
-minutes after the commit block time. So each lead L of issue T gets its own evidence, with
-`init_time = T + L − 15 min + 1 ns`. The settlement rules here are unchanged. See `docs/LIVE_DAILY.md`.
+on-chain commits. Each `receipt.json` is verified first: the issue's files and store bind its content
+hash, and the chain must still serve its commitment. It then becomes
+`Commitment(digest = the store's content hash, received_at = …)` for the forecaster's wallet, with
+`init_time` = the issue's init.
+
+The live rule is per lead: a lead counts only if its valid time is at least 15 minutes after the
+commit block time. This ledger pays a scorecard only over all its leads, so `received_at` is the
+commit block time + 15 min − the shortest scored lead − 1 ns. It is timely if and only if every
+scored lead counts, and a live issue is settled with a scorecard over its counted leads. The
+settlement rules here are unchanged. See `docs/LIVE_DAILY.md`.
 
 ## Historical pre-S3 comparison (superseded)
 
