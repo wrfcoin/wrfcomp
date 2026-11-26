@@ -1,10 +1,14 @@
-"""Live v4 builder (wrfcomp.live). Synthetic data only, fixed seeds, no network."""
+"""Live v4 builder (wrfcomp.live). Synthetic data only, fixed seeds, no network.
+
+Live writes are refused on Windows (wrfcomp.live.paths); tests/test_live_paths.py checks that
+refusal on every platform. These tests write live data, so they run on Linux and macOS."""
 
 from __future__ import annotations
 
 import json
 import os
 import shutil
+import sys
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +39,9 @@ DAYS = 34
 SHIFT = np.datetime64("2026-01-01", "ns") - np.datetime64("2024-01-01", "ns")  # 731 days
 ICAO = ["KAAA", "KBBB", "KCCC", "KDDD"]
 POLICY_2026 = LiveYear(2026)
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="live writes are refused on Windows (wrfcomp.live.paths)"
+)
 
 
 def site() -> xr.Dataset:
@@ -1101,17 +1108,6 @@ def test_safe_never_opens_the_file_it_checks(live_world, monkeypatch):
     assert live.safe(root, lock) == lock
     with pytest.raises(LiveRefusedError, match="outside the live folder"):
         live.safe(root, root / ".." / "elsewhere.json")
-
-
-def test_inside_compares_case_insensitively_where_the_platform_does(monkeypatch):
-    monkeypatch.setattr(live.os.path, "normcase", lambda p: str(p).lower().replace("\\", "/"))
-    assert live.inside(
-        Path("C:/Users/RunnerAdmin/wrfcomp-data/live/locks/build.lock"),
-        Path("c:/users/runneradmin/wrfcomp-data/live"),
-    )
-    assert not live.inside(
-        Path("C:/Users/RunnerAdmin/wrfcomp-data/truth/x"), Path("c:/users/runneradmin/wrfcomp-data/live")
-    )
 
 
 @pytest.mark.parametrize("linked", ["locks folder", "lock file"])

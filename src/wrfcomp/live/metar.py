@@ -57,6 +57,7 @@ import xarray as xr
 
 from wrfcomp.harness.truth import OFFSET_FILL_VALUE, match_station_to_hours
 from wrfcomp.live.locks import file_lock
+from wrfcomp.live.paths import check_target
 
 API = "https://aviationweather.gov/api/data/metar"
 USER_AGENT = "wrfcomp-live/0.1"
@@ -182,7 +183,7 @@ def fetch(
     with file_lock(_fetch_lock_path(directory), blocking=True):
         completed = clock().astimezone(UTC)
         stamp = completed.strftime(STAMP)
-        path = directory / f"{stamp}.json"
+        path = check_target(directory.parent, directory / f"{stamp}.json")
         body = {
             "source": API,
             "started_at": started.strftime(STAMP),
@@ -203,11 +204,9 @@ def _fetch_lock_path(directory: Path) -> Path:
     for p in (directory, lock.parent, lock):
         if p.is_symlink():
             raise ValueError(f"refusing a linked path inside the live folder: {p}")
+    check_target(live, lock.parent)
     lock.parent.mkdir(parents=True, exist_ok=True)
-    resolved = Path(os.path.normcase(lock.parent.resolve() / lock.name))
-    if not resolved.is_relative_to(Path(os.path.normcase(live.resolve()))):
-        raise ValueError(f"{lock} is outside the live folder")
-    return lock
+    return check_target(live, lock)
 
 
 def publish_file(path: Path, text: str) -> None:

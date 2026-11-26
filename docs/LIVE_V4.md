@@ -94,9 +94,7 @@ Differences from the 2024 truth (NOAA ISD) and how they are handled:
   (`live/locks/<issue>.lock`); a second writer is refused, not queued. Each lock is a thread lock
   (threads of one process) plus an OS file lock (`flock` on Linux and macOS, `msvcrt.locking` on
   Windows; other processes), both released when the holder finishes or the process ends. A lock
-  file or lock folder that is a link is refused, for builds and for the METAR writer alike, and every
-  path check resolves folders, never the (possibly locked) file, comparing case-insensitively on
-  Windows. Every file is staged under an exclusive temporary name and linked into place
+  file or lock folder that is a link is refused, for builds and for the METAR writer alike. Every file is staged under an exclusive temporary name and linked into place
   without replacing anything.
 
 ## Learned state (v2 regression, v3 pressure gain, v4 own-reading gain)
@@ -151,8 +149,14 @@ policy (identical numbers).
   - a data directory that is, or is inside, an evaluation folder (`truth`, `candidates`, `baselines`,
     `phase3`, `gate1` and the others the pipeline uses);
   - a `live` folder that is a symlink or holds an evaluation folder;
-  - any symlink on the way to a file the builder writes (checked before every write), and any
-    symlink inside the GEFS point cache (checked before and after each fetch).
+  - any write whose FULL target path, resolved with `os.path.realpath` (every link on the way,
+    the last component included), is not inside the real live folder. This is checked before every
+    write: fetch files, locks, staging, issue folders, GEFS cycles and every entry of the GEFS point
+    cache (before and after each fetch). Links are also refused by name with a clearer message.
+- **Live writes are refused on Windows.** Directory junctions and locked files make a full-path
+  check unreliable there, and the daily live run is on Linux. Reading, tests and the evaluation code
+  are unaffected; the live writer tests run on Linux and macOS, and a test checks the Windows
+  refusal on every platform.
 
 ## Output
 
