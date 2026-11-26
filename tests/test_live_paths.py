@@ -181,3 +181,28 @@ def test_every_live_entry_point_refuses_to_start_on_windows(tmp_path, monkeypatc
     with pytest.raises(live.LiveRefusedError, match="not supported on Windows"):
         module.main()
     assert [p.name for p in data.iterdir()] == []
+
+
+@posix_only
+def test_a_folder_created_by_a_concurrent_writer_is_not_an_error(tmp_path, monkeypatch):
+    """The race seen in the concurrency test: two writers both see the lock folder missing; the one
+    that creates it second must not fail. Simulated deterministically: the folder appears between the
+    existence check and the mkdir."""
+    live, _ = _tree(tmp_path)
+    lock = live / "locks" / "build.lock"
+    real_is_dir = Path.is_dir
+
+    def appears_meanwhile(self):
+        if self == lock.parent and not real_is_dir(self):
+            os.mkdir(self)  # the other writer wins the race right after the check
+            return False
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", appears_meanwhile)
+    with file_lock(lock, root=live):
+        pass
+    monkeypatch.undo()
+    assert lock.parent.is_dir() and lock.is_file()
+    (live / "locks" / "file").write_text("x")
+    with pytest.raises(FileExistsError):
+        paths.make_dir(live / "locks" / "file")  # an existing FILE is still an error

@@ -57,6 +57,7 @@ from wrfcomp.live.paths import (
     check_live_root,
     check_path,
     check_target,
+    make_dir,
     refuse_windows,
     write_scope,
 )
@@ -221,7 +222,7 @@ def fetch_cycle(
         cache = safe(root, root / "cache")
         if not cache.is_dir():
             safe_write(root, cache)
-            cache.mkdir(parents=True)
+            make_dir(cache)
         _no_links_below(root, cache)
         raw = policy.gefs.extract(stations(), t, cache, transfer)
         _no_links_below(root, cache)
@@ -555,7 +556,7 @@ def _publish_new(root, policy, c, store, manifest, first, issues) -> dict:
     staging_root = safe(root, root / ".staging")
     if not staging_root.is_dir():
         safe_write(root, staging_root)
-        staging_root.mkdir()
+        make_dir(staging_root, parents=False)
     with write_scope(root, staging_root):  # a fresh staging folder for this issue
         staging = Path(tempfile.mkdtemp(dir=staging_root, prefix=f"{final.name}."))
     staging = safe(root, staging)

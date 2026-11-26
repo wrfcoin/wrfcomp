@@ -921,8 +921,8 @@ def test_concurrent_builds_keep_one_intact_manifest_inside_the_live_tree(live_wo
     def run():
         try:
             results.append(live.build_issue(last, data)["content_sha256"])
-        except LiveRefusedError as exc:
-            errors.append(str(exc))
+        except Exception as exc:  # noqa: BLE001 - every failure is recorded; only refusals are allowed
+            errors.append(f"{type(exc).__name__}: {exc}")
 
     threads = [threading.Thread(target=run) for _ in range(3)]
     for th in threads:
@@ -930,7 +930,7 @@ def test_concurrent_builds_keep_one_intact_manifest_inside_the_live_tree(live_wo
     for th in threads:
         th.join(300)
     assert results and all(r == results[0] for r in results), (results, errors)
-    assert all("another live writer" in e for e in errors), errors
+    assert all(e.startswith("LiveRefusedError: another live writer") for e in errors), errors
     assert live.build_issue(last, data)["content_sha256"] == results[0]
     for here, dirs, files in os.walk(data):
         for name in dirs + files:

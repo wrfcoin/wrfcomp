@@ -57,7 +57,7 @@ import xarray as xr
 
 from wrfcomp.harness.truth import OFFSET_FILL_VALUE, match_station_to_hours
 from wrfcomp.live.locks import file_lock
-from wrfcomp.live.paths import check_path, check_target, refuse_windows, write_scope
+from wrfcomp.live.paths import check_path, check_target, make_dir, refuse_windows, write_scope
 
 API = "https://aviationweather.gov/api/data/metar"
 USER_AGENT = "wrfcomp-live/0.1"
@@ -220,7 +220,7 @@ def publish_file(path: Path, text: str, *, root: Path) -> None:
         raise ValueError(f"refusing to write into a linked folder: {directory}")
     if not directory.is_dir():
         check_target(root, directory)
-        directory.mkdir(parents=True)
+        make_dir(directory)
     with write_scope(root, path):  # staged next to itself, then linked into place
         fd, staging = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".staging")
         try:

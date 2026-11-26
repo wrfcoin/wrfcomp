@@ -114,3 +114,13 @@ def write_scope(root: Path, target: Path):
     holds every writer to that, call by call."""
     check_target(root, target)
     yield Path(target)
+
+
+def make_dir(path: Path, *, parents: bool = True) -> None:
+    """Create ``path`` (its write was just approved). Another writer creating it at the same moment
+    is not an error; anything else that is not a real folder is."""
+    try:
+        Path(path).mkdir(parents=parents)
+    except FileExistsError:
+        if not Path(path).is_dir() or Path(path).is_symlink():
+            raise
