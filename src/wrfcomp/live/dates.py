@@ -36,7 +36,7 @@ from wrfcomp.baselines import gefs as shared_gefs
 from wrfcomp.baselines import io as shared_io
 from wrfcomp.harness import schemas
 from wrfcomp.harness.config import load_config
-from wrfcomp.live.paths import LivePathError, check_target
+from wrfcomp.live.paths import LivePathError, check_target, write_scope
 from wrfcomp.models import citizen_arms as shared_arms
 from wrfcomp.models import gefs_station_v2 as shared_v2
 from wrfcomp.models import gefs_station_v3 as shared_v3
@@ -120,17 +120,19 @@ class LiveYear:
         def guarded_write(ds, path):
             self.check_store_year(ds)
             check_target(self._root(), Path(path).parent)
-            check_target(self._root(), path)
-            frozen_write(ds, path)
+            with write_scope(self._root(), path):  # the store; io.write stages it next to itself
+                frozen_write(ds, path)
 
         def guarded_extract(stations, init, cache, transfer):
-            check_target(self._root(), cache)
             try:
-                return frozen_extract(stations, init, cache, transfer)
+                with write_scope(self._root(), cache):  # the point cache
+                    return frozen_extract(stations, init, cache, transfer)
             finally:
                 for here, dirs, files in os.walk(cache, followlinks=False):
                     for name in dirs + files:
                         check_target(self._root(), Path(here) / name)
+
+        self._frozen_extract = frozen_extract  # tests only: the write audit's mutation check
 
         self.io.write, self.gefs.extract = guarded_write, guarded_extract
 

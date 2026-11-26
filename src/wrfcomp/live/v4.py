@@ -57,6 +57,7 @@ from wrfcomp.live.paths import (
     check_live_root,
     check_target,
     refuse_windows,
+    write_scope,
 )
 
 ISSUE_HOURS = (0, 12)
@@ -294,7 +295,8 @@ def _sha256(path: Path) -> str:
 def _lock(root: Path, name: str, *, blocking: bool = False):
     """An exclusive writer lock ``locks/<name>.lock`` (``wrfcomp.live.locks``). Non-blocking by
     default: a second writer is refused, not queued."""
-    path = safe(root, root / "locks" / f"{name}.lock")
+    path = root / "locks" / f"{name}.lock"
+    safe(root, path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
     safe(root, path)
     try:
@@ -542,7 +544,9 @@ def _publish_new(root, policy, c, store, manifest, first, issues) -> dict:
         raise LiveRefusedError(f"{final.name} exists but is not a published issue; remove it by hand")
     staging_root = safe(root, root / ".staging")
     staging_root.mkdir(exist_ok=True)
-    staging = safe(root, Path(tempfile.mkdtemp(dir=staging_root, prefix=f"{final.name}.")))
+    with write_scope(root, staging_root):  # a fresh staging folder for this issue
+        staging = Path(tempfile.mkdtemp(dir=staging_root, prefix=f"{final.name}."))
+    staging = safe(root, staging)
     try:
         metar.publish_file(staging / "inputs.json", json.dumps(manifest, indent=1) + "\n", root=root)
         dest = staging / "v4.zarr"

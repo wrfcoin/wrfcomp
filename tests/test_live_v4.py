@@ -1141,33 +1141,69 @@ def test_a_linked_build_lock_is_refused(live_world):
     assert not any(outside.iterdir())
 
 
-# -- round 8: the write audit --------------------------------------------------------------------
+# -- the write audit (rounds 8 and 9) -----------------------------------------------------------
 
 
 class WriteAudit:
-    """Records every filesystem write a live run makes and every path ``check_target`` approved."""
+    """Records every filesystem write CALL of a live run, and judges each call on its own target.
+
+    * Outside a write scope, a call is allowed only if its own target was approved by
+      ``check_target`` before the call (exact path: an approved folder does not cover its contents).
+    * Inside a ``write_scope(root, target)`` (approved exactly when it opens), a call is allowed if
+      its target is the scope target or below it, or one of the scope's own temporary files or
+      folders (made by mkstemp/mkdtemp inside the scope, in or next to the target) or below them,
+      or was itself approved exactly.
+    """
 
     WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 
     def __init__(self, root):
         self.root = Path(os.path.realpath(root))
-        self.checked, self.writes = [], []
+        self.approved, self.scopes, self.calls = set(), [], []
+        self.in_temp = 0  # inside mkstemp/mkdtemp: their own os.open/os.mkdir are the temp creation
 
-    def approved(self, target):
-        self.checked.append(Path(os.path.realpath(target)))
+    @staticmethod
+    def real(target):
+        return Path(os.path.realpath(os.fspath(target)))
+
+    def approve(self, target):
+        self.approved.add(self.real(target))
+
+    def _allowed(self, real):
+        if real in self.approved:
+            return True
+        if not self.scopes:
+            return False
+        scope = self.scopes[-1]
+        under = (scope["target"], *scope["temps"])
+        return any(real == u or real.is_relative_to(u) for u in under)
 
     def wrote(self, primitive, target):
-        if target is None or isinstance(target, int):
+        if target is None or isinstance(target, int) or self.in_temp:
             return
-        real = Path(os.path.realpath(os.fspath(target)))
-        covered = any(real == c or real.is_relative_to(c) for c in self.checked)
-        self.writes.append((primitive, real, covered))
+        real = self.real(target)
+        self.calls.append((primitive, real, self._allowed(real)))
+
+    def made_temp(self, primitive, name):
+        real = self.real(name)
+        if self.scopes:
+            scope = self.scopes[-1]["target"]
+            if real.parent in (scope, scope.parent) or real.is_relative_to(scope):
+                self.scopes[-1]["temps"].add(real)
+        self.calls.append((primitive, real, self._allowed(real)))
+
+    def findings(self):
+        return {
+            "outside": [(p, w) for p, w, _ in self.calls if not w.is_relative_to(self.root)],
+            "unchecked": [(p, w) for p, w, ok in self.calls if not ok],
+        }
 
 
 def _install_audit(monkeypatch, audit):
     import builtins
     import io as io_module
     import tempfile
+    from contextlib import contextmanager
 
     from wrfcomp.live import dates, locks
 
@@ -1175,11 +1211,23 @@ def _install_audit(monkeypatch, audit):
 
     def checked(root, target):
         out = real_check(root, target)
-        audit.approved(target)
+        audit.approve(target)
         return out
+
+    @contextmanager
+    def scope(root, target):
+        real_check(root, target)
+        audit.approve(target)
+        audit.scopes.append({"target": audit.real(target), "temps": set()})
+        try:
+            yield Path(target)
+        finally:
+            audit.scopes.pop()
 
     for module in (paths, live, metar, locks, dates):
         monkeypatch.setattr(module, "check_target", checked)
+        if hasattr(module, "write_scope"):
+            monkeypatch.setattr(module, "write_scope", scope)
 
     def opener(original, name):
         def wrapper(file, mode="r", *args, **kwargs):
@@ -1235,13 +1283,21 @@ def _install_audit(monkeypatch, audit):
     real_mkstemp, real_mkdtemp = tempfile.mkstemp, tempfile.mkdtemp
 
     def mkstemp(*args, **kwargs):
-        fd, name = real_mkstemp(*args, **kwargs)
-        audit.wrote("tempfile.mkstemp", name)
+        audit.in_temp += 1
+        try:
+            fd, name = real_mkstemp(*args, **kwargs)
+        finally:
+            audit.in_temp -= 1
+        audit.made_temp("tempfile.mkstemp", name)
         return fd, name
 
     def mkdtemp(*args, **kwargs):
-        name = real_mkdtemp(*args, **kwargs)
-        audit.wrote("tempfile.mkdtemp", name)
+        audit.in_temp += 1
+        try:
+            name = real_mkdtemp(*args, **kwargs)
+        finally:
+            audit.in_temp -= 1
+        audit.made_temp("tempfile.mkdtemp", name)
         return name
 
     monkeypatch.setattr(tempfile, "mkstemp", mkstemp)
@@ -1264,10 +1320,9 @@ def _install_audit(monkeypatch, audit):
         monkeypatch.setattr(Path, method, wrapper)
 
 
-def test_every_write_of_a_full_live_run_was_checked_and_is_inside_the_live_root(live_world, monkeypatch):
-    """A full synthetic live run: a METAR fetch, a GEFS cycle fetch (extractor and point cache) and a
-    build (locks, staging, store, manifests, rename into place). Every write primitive it reaches is
-    recorded; each target must lie under the live root and under a path check_target approved first."""
+def _audited_live_run(live_world, monkeypatch, *, mutate=None):
+    """A full synthetic live run (METAR fetch, GEFS fetch through the extractor and its point cache,
+    build) under the audit. ``mutate(policy)`` may break something first. Returns the audit."""
     data, root, raws, last = live_world
     shutil.rmtree(live.raw_path(root, last))  # fetched below, through the extractor
 
@@ -1283,31 +1338,59 @@ def test_every_write_of_a_full_live_run_was_checked_and_is_inside_the_live_root(
     monkeypatch.setattr(
         policy.gefs, "points", lambda value, stations: np.full(stations.sizes["station_id"], value)
     )
+    if mutate is not None:
+        mutate(policy, monkeypatch)
     correction = [
         _raw_report(icao, last - 7 * M, {"t2m": 290.0, "td2m": 280.0, "msl": 100000.0}) for icao in ICAO
     ]
     audit = WriteAudit(root)
-    _install_audit(monkeypatch, audit)
-    when = pd.Timestamp(last + 5 * H).tz_localize("UTC").to_pydatetime()
-    metar.fetch(root / "metar", ICAO, 30, clock=lambda: when, get=lambda url: json.dumps(correction).encode())
-    live.fetch_cycle(root, last, policy=policy)
-    record = live.build_issue(last, data, now=last + 6 * H)
-    monkeypatch.undo()
+    with monkeypatch.context() as patched:
+        _install_audit(patched, audit)
+        when = pd.Timestamp(last + 5 * H).tz_localize("UTC").to_pydatetime()
+        metar.fetch(
+            root / "metar", ICAO, 30, clock=lambda: when, get=lambda url: json.dumps(correction).encode()
+        )
+        live.fetch_cycle(root, last, policy=policy)
+        record = live.build_issue(last, data, now=last + 6 * H)
     assert record["init"] == _hour(last)
-    kinds = {primitive for primitive, _, _ in audit.writes}
-    # The audit saw every kind of write the run makes: files, temp files and folders, renames into
-    # place, links, folders, and the Zarr stores.
-    assert {
-        "os.open",
-        "tempfile.mkstemp",
-        "tempfile.mkdtemp",
-        "os.rename",
-        "os.link",
-        "os.mkdir",
-        "Dataset.to_zarr",
-    } <= kinds, kinds
-    assert len(audit.writes) > 50
-    outside = [(p, w) for p, w, _ in audit.writes if not w.is_relative_to(audit.root)]
-    unchecked = [(p, w) for p, w, covered in audit.writes if not covered]
-    assert not outside, outside[:5]
-    assert not unchecked, unchecked[:5]
+    return audit
+
+
+def test_every_write_call_of_a_full_live_run_has_its_own_checked_target(live_world, monkeypatch):
+    audit = _audited_live_run(live_world, monkeypatch)
+    kinds = {primitive for primitive, _, _ in audit.calls}
+    # The audit saw every kind of write the run makes.
+    expected = {"os.open", "tempfile.mkstemp", "tempfile.mkdtemp", "os.rename", "os.link", "os.mkdir"}
+    assert expected <= kinds and "Dataset.to_zarr" in kinds, kinds
+    assert len(audit.calls) > 1000
+    found = audit.findings()
+    assert not found["outside"], found["outside"][:5]
+    assert not found["unchecked"], found["unchecked"][:5]
+
+
+def test_the_audit_fails_when_the_gefs_cache_guard_is_disabled(live_world, monkeypatch):
+    """Mutation 1: the extractor runs without its write scope (the cache is not checked)."""
+
+    def unguarded(policy, mp):
+        mp.setattr(policy.gefs, "extract", policy._frozen_extract)
+
+    audit = _audited_live_run(live_world, monkeypatch, mutate=unguarded)
+    unchecked = audit.findings()["unchecked"]
+    assert unchecked and all("cache" in str(w) for _, w in unchecked), unchecked[:5]
+
+
+def test_the_audit_fails_on_an_unchecked_metadata_write(live_world, monkeypatch):
+    """Mutation 2: every published file also gets a metadata file next to it, never checked. Its
+    folder WAS approved; the per-call rule still catches it."""
+    original = metar.publish_file
+
+    def with_metadata(policy, mp):
+        def publish(path, text, *, root):
+            original(path, text, root=root)
+            Path(path).with_name(Path(path).name + ".meta").write_text("{}")
+
+        mp.setattr(metar, "publish_file", publish)
+
+    audit = _audited_live_run(live_world, monkeypatch, mutate=with_metadata)
+    unchecked = audit.findings()["unchecked"]
+    assert unchecked and all(str(w).endswith(".meta") for _, w in unchecked), unchecked[:5]

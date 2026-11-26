@@ -161,8 +161,13 @@ policy (identical numbers).
 - A write-audit test runs a full synthetic live run (METAR fetch, GEFS fetch through the extractor
   and its cache, build) with every filesystem write primitive recorded (`open` in write modes,
   `os.open` with write flags, renames, links, folders, removals, `shutil`, temp files, Zarr and
-  NetCDF writes, `Path.write_*`): every target must lie under the live root and under a path the
-  check approved first.
+  NetCDF writes, `Path.write_*`). Each write CALL is judged on its own target: outside a write
+  scope, that exact target must have been approved by the check before the call (an approved folder
+  does not cover its contents); inside a `write_scope(root, target)` (used for a Zarr store, the
+  GEFS point cache and a staged file linked into place, whose inner names are not known in advance),
+  the call must stay under the scope's own checked target or its own temporary files. Two mutation
+  tests prove the audit bites: with the GEFS cache guard disabled it fails on the cache writes, and
+  with an extra unchecked metadata file next to each published file it fails on exactly those.
 - **Live writes are refused on Windows**, at every entry point (`build_issue`, `fetch_cycle`,
   `metar.fetch`, the script) and again in every writer. Directory junctions and locked files make a full-path
   check unreliable there, and the daily live run is on Linux. Reading, tests and the evaluation code

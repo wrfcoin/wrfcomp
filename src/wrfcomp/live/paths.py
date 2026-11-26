@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 LIVE_DIR = "live"
@@ -96,3 +97,13 @@ def check_target(root: Path, target: Path) -> Path:
     if not real.is_relative_to(real_root):
         raise LivePathError(f"{target} resolves to {real}, outside the live folder {real_root}")
     return Path(target)
+
+
+@contextmanager
+def write_scope(root: Path, target: Path):
+    """For a write whose inner file names are not known in advance (a Zarr store, the GEFS point
+    cache, a staged file linked into place): check ``target`` exactly, then run the write. Its inner
+    writes must stay under ``target`` or be its own temporary files next to it; the write-audit test
+    holds every writer to that, call by call."""
+    check_target(root, target)
+    yield Path(target)
