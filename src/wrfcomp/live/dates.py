@@ -156,6 +156,7 @@ class LiveYear:
         """``baselines.io.write`` with the live year's config, after checking every time is in it and
         that ``path`` is an allowed live write target under the policy's live root
         (``paths.check_target``, which also refuses on Windows). ``root``, if given, must be it."""
+        self.check_store_year(ds)  # the year first: nothing about paths is consulted for a wrong year
         if root is not None and (self.root is None or Path(root) != self.root):
             raise LivePathError("write under another root than this live policy's")
         self.io.write(ds, path)
