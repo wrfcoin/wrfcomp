@@ -153,6 +153,10 @@ policy (identical numbers).
     the last component included), is not inside the real live folder. This is checked before every
     write: fetch files, locks, staging, issue folders, GEFS cycles and every entry of the GEFS point
     cache (before and after each fetch). Links are also refused by name with a clearer message.
+- The check sits in the lowest-level writers themselves (`metar.publish_file`, `LiveYear.write`,
+  `locks.file_lock`; everything else is built on them). Each takes the live root as a required
+  argument and refuses unless it is a real live root and the target is inside it, so no library
+  entry point can write around it.
 - **Live writes are refused on Windows.** Directory junctions and locked files make a full-path
   check unreliable there, and the daily live run is on Linux. Reading, tests and the evaluation code
   are unaffected; the live writer tests run on Linux and macOS, and a test checks the Windows

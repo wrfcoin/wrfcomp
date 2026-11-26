@@ -23,7 +23,7 @@ from wrfcomp.baselines import io as baselines_io
 from wrfcomp.baselines.io import UNITS, layout
 from wrfcomp.harness import schemas
 from wrfcomp.harness.hashing import content_sha256
-from wrfcomp.live import metar
+from wrfcomp.live import metar, paths
 from wrfcomp.live import v4 as live
 from wrfcomp.live.dates import LiveRefusedError, LiveYear
 from wrfcomp.models import citizen_arms as arms
@@ -219,7 +219,7 @@ def test_live_policy_refuses_every_other_year():
         policy.io.layout(site(), [np.datetime64("2027-01-01T00")], RAW_LEADS, 31, "noaa-gefs")
     store_2025 = LiveYear(2025).io.layout(site(), [np.datetime64("2025-06-01T00")], RAW_LEADS, 31, "x")
     with pytest.raises(LiveRefusedError, match="outside the live year"):
-        policy.write(store_2025, "unused")
+        policy.write(store_2025, "unused", root="unused")  # refused on the year, before any path
     start = np.datetime64("2025-01-01", "ns")
     raws_2025 = raw_world(start, days=2)
     truth_2025 = truth_world(start)
@@ -324,12 +324,12 @@ def test_check_issue_accepts_the_last_buildable_issue():
 
 
 def test_live_root_refuses_temp_repository_and_evaluation_folders(tmp_path, monkeypatch):
-    monkeypatch.setattr(live, "TEMP_DIRS", (str(tmp_path),))
+    monkeypatch.setattr(paths, "TEMP_DIRS", (str(tmp_path),))
     with pytest.raises(LiveRefusedError, match="external"):
         live.live_root(tmp_path / "data")
     with pytest.raises(LiveRefusedError, match="external"):
         live.live_root(baselines_io.CONFIG.parents[1] / "data")
-    monkeypatch.setattr(live, "TEMP_DIRS", ())
+    monkeypatch.setattr(paths, "TEMP_DIRS", ())
     data = tmp_path / "wrfcomp-data"
     for evaluation in ("truth", "candidates/gefs-station-corrected-v3", "phase3/2024", "baselines"):
         (data / evaluation).mkdir(parents=True, exist_ok=True)
@@ -341,7 +341,7 @@ def test_live_root_refuses_temp_repository_and_evaluation_folders(tmp_path, monk
 
 
 def test_live_root_refuses_links_and_evaluation_folders_inside(tmp_path, monkeypatch):
-    monkeypatch.setattr(live, "TEMP_DIRS", ())
+    monkeypatch.setattr(paths, "TEMP_DIRS", ())
     data = tmp_path / "wrfcomp-data"
     (data / "truth").mkdir(parents=True)
     os.symlink(data / "truth", data / "live")
@@ -410,7 +410,9 @@ def test_report_time_must_match_the_raw_report():
         metar.report_time({"obsTime": t, "rawOb": "KAAA 021153Z 27005KT 10SM CLR 07/02 A3000"})
 
 
-def test_fetch_batches_and_stores_append_only(tmp_path):
+def test_fetch_batches_and_stores_append_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "TEMP_DIRS", ())
+    store = tmp_path / "wrfcomp-data" / "live" / "metar"
     asked = []
 
     def get(url):
@@ -419,15 +421,15 @@ def test_fetch_batches_and_stores_append_only(tmp_path):
 
     now = datetime(2026, 12, 2, 4, 30, tzinfo=UTC)
     icaos = [f"K{i:03d}" for i in range(250)]
-    path, received = metar.fetch(tmp_path / "metar", icaos, 30, clock=lambda: now, get=get)
+    path, received = metar.fetch(store, icaos, 30, clock=lambda: now, get=get)
     assert len(asked) == 3 and all("hours=30" in u and u.startswith(metar.API) for u in asked)
     assert path.name == "20261202T043000.000000Z.json" and received > 0
     assert len(json.loads(path.read_text())["reports"]) == 3
     assert metar.fetch_time(path) == np.datetime64("2026-12-02T04:30:00", "ns")
     with pytest.raises(FileExistsError):
-        metar.fetch(tmp_path / "metar", icaos, 30, clock=lambda: now, get=get)
+        metar.fetch(store, icaos, 30, clock=lambda: now, get=get)
     with pytest.raises(ValueError):
-        metar.fetch(tmp_path / "metar", icaos, 49, clock=lambda: now, get=get)
+        metar.fetch(store, icaos, 49, clock=lambda: now, get=get)
 
 
 def _raw_report(icao, when, values):
@@ -557,7 +559,7 @@ def test_fetch_cycle_checks_every_index_and_keeps_the_raw_store(tmp_path, monkey
         policy.gefs, "points", lambda value, stations: np.full(stations.sizes["station_id"], value)
     )
     monkeypatch.setattr(live, "stations", site)
-    monkeypatch.setattr(live, "TEMP_DIRS", ())
+    monkeypatch.setattr(paths, "TEMP_DIRS", ())
     root = live.live_root(tmp_path / "wrfcomp-data")
     out = live.fetch_cycle(root, t, policy=policy)
     assert all(u.startswith(f"{live.S3}/gefs.20261202/00/atmos/pgrb2ap5/") for u in asked)
@@ -616,14 +618,14 @@ def make_live_world(data, monkeypatch, *, extra_reports=(), start="2026-03-01", 
     start = np.datetime64(start, "ns")
     labels, sig = signal(start, days=days, seed=3)
     raws = raw_world(start, seed=3, days=days)
-    monkeypatch.setattr(live, "TEMP_DIRS", ())
+    monkeypatch.setattr(paths, "TEMP_DIRS", ())
     monkeypatch.setattr(live, "stations", site)
     monkeypatch.setattr(
         live, "icao_map", lambda: dict(zip(ICAO, site().station_id.values.tolist(), strict=True))
     )
     root = live.live_root(data)
     for raw in raws:
-        POLICY_2026.write(raw, live.raw_path(root, raw.init_time.values[0]))
+        POLICY_2026.write(raw, live.raw_path(root, raw.init_time.values[0]), root=root)
     last = raws[-1].init_time.values[0]
     _write_fetch(_world_reports(labels, sig) + list(extra_reports), root / "metar", _stamp(last + 4 * H))
     return root, raws, last
@@ -851,7 +853,7 @@ def test_a_lost_or_changed_pinned_cycle_is_refused(live_world):
     shutil.rmtree(kept.with_name("away.zarr"))
     changed = raws[5].copy(deep=True)
     changed["t2m"].values[:] += 1
-    POLICY_2026.write(changed, kept)
+    POLICY_2026.write(changed, kept, root=root)
     with pytest.raises(LiveRefusedError, match="differs from its pinned hash"):
         live.build_issue(last, data)
 
@@ -864,7 +866,7 @@ def test_a_published_issue_that_does_not_reproduce_is_refused(live_world):
     other = xr.open_zarr(store, chunks=None).load()
     other["t2m"].values[:] += 0.5
     shutil.rmtree(store)
-    POLICY_2026.write(other, store)
+    POLICY_2026.write(other, store, root=root)
     with pytest.raises(LiveRefusedError, match="does not reproduce"):
         live.build_issue(last, data)
     # A failed prefix check leaves no pin, hash, store or build record for the next issue.
@@ -873,16 +875,18 @@ def test_a_published_issue_that_does_not_reproduce_is_refused(live_world):
     assert last not in live.published_issues(root, 2026)
 
 
-def test_publish_file_never_replaces_and_leaves_no_staging(tmp_path):
-    path = tmp_path / "issue" / "inputs.json"
-    metar.publish_file(path, "first\n")
+def test_publish_file_never_replaces_and_leaves_no_staging(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "TEMP_DIRS", ())
+    root = tmp_path / "wrfcomp-data" / "live"
+    path = root / "issue" / "inputs.json"
+    metar.publish_file(path, "first\n", root=root)
     with pytest.raises(FileExistsError):
-        metar.publish_file(path, "second\n")
+        metar.publish_file(path, "second\n", root=root)
     assert path.read_text() == "first\n"
     assert [p.name for p in path.parent.iterdir()] == ["inputs.json"]
-    os.symlink(tmp_path / "issue", tmp_path / "linked")
+    os.symlink(root / "issue", root / "linked")
     with pytest.raises(ValueError, match="linked folder"):
-        metar.publish_file(tmp_path / "linked" / "x.json", "x\n")
+        metar.publish_file(root / "linked" / "x.json", "x\n", root=root)
 
 
 def test_an_interrupted_build_publishes_nothing_for_that_issue_and_reruns_cleanly(live_world, monkeypatch):
@@ -892,11 +896,11 @@ def test_an_interrupted_build_publishes_nothing_for_that_issue_and_reruns_cleanl
     calls = {"n": 0}
     original = LiveYear.write
 
-    def crash_on_last(self, ds, path):
+    def crash_on_last(self, ds, path, **kw):
         if np.datetime64(ds.init_time.values[0], "ns") == last and calls["n"] == 0:
             calls["n"] += 1
             raise OSError("power cut")
-        return original(self, ds, path)
+        return original(self, ds, path, **kw)
 
     monkeypatch.setattr(LiveYear, "write", crash_on_last)
     with pytest.raises(OSError, match="power cut"):
@@ -946,7 +950,7 @@ def test_a_second_writer_is_refused_while_the_lock_is_held(live_world):
 
 
 def test_fetch_cycle_refuses_a_link_inside_the_gefs_cache(tmp_path, monkeypatch):
-    monkeypatch.setattr(live, "TEMP_DIRS", ())
+    monkeypatch.setattr(paths, "TEMP_DIRS", ())
     root = live.live_root(tmp_path / "wrfcomp-data")
     (root / "cache").mkdir(parents=True)
     (tmp_path / "elsewhere").mkdir()
@@ -1027,11 +1031,11 @@ def test_fetch_publication_and_the_build_start_share_one_synchronization_point(l
     paused, release = threading.Event(), threading.Event()
     original = metar.publish_file
 
-    def slow_publish(path, text):
+    def slow_publish(path, text, **kw):
         if path.parent.name == "metar":
             paused.set()
             release.wait(30)
-        return original(path, text)
+        return original(path, text, **kw)
 
     monkeypatch.setattr(metar, "publish_file", slow_publish)
     fetched = {}

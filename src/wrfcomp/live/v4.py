@@ -50,36 +50,17 @@ from wrfcomp.harness.hashing import content_sha256
 from wrfcomp.live import metar
 from wrfcomp.live.dates import LiveRefusedError, LiveYear
 from wrfcomp.live.locks import LockBusyError, LockPathError, file_lock
-from wrfcomp.live.paths import LivePathError, check_target
+from wrfcomp.live.paths import (
+    LIVE_DIR,
+    LivePathError,
+    check_data_dir,
+    check_live_root,
+    check_target,
+)
 
-LIVE_DIR = "live"
 ISSUE_HOURS = (0, 12)
 HOUR = np.timedelta64(1, "h")
 S3 = "https://noaa-gefs-pds.s3.amazonaws.com"
-# Folder names the evaluation pipeline uses under the data directory. A live root must not be one of
-# them, sit inside one, or hold one.
-EVALUATION_DIRS = frozenset(
-    {
-        "baselines",
-        "bundle",
-        "candidates",
-        "citizen",
-        "confirm-2023",
-        "configs",
-        "experiments",
-        "gate1",
-        "isd-lite",
-        "parsed",
-        "phase3",
-        "promotion",
-        "raw",
-        "thresholds",
-        "truth",
-    }
-)
-TEMP_DIRS = ("/tmp", tempfile.gettempdir())
-
-
 # -- places ------------------------------------------------------------------------------------
 
 
@@ -88,23 +69,14 @@ def default_data_dir() -> Path:
 
 
 def live_root(data: Path | None = None) -> Path:
-    """``<data>/live``, refused unless it is a safe place for live data:
-
+    """``<data>/live``, refused unless it is a safe place for live data (``paths.check_live_root``):
     the data directory is not inside the repository or a temp directory, is not an evaluation folder
     and is not inside one; ``live`` is not a symlink and holds no evaluation folder."""
     data = Path(default_data_dir() if data is None else data)
-    resolved = data.resolve()
-    repo = CONFIG.parents[1].resolve()
-    if resolved.is_relative_to(repo) or any(resolved.is_relative_to(Path(t).resolve()) for t in TEMP_DIRS):
-        raise LiveRefusedError("live data belongs in the external data directory")
-    if EVALUATION_DIRS.intersection(resolved.parts) or resolved.name == LIVE_DIR:
-        raise LiveRefusedError(f"the data directory {resolved} is or is inside an evaluation folder")
-    root = resolved / LIVE_DIR
-    if root.is_symlink() or (root.exists() and not root.is_dir()):
-        raise LiveRefusedError("the live folder must be a real directory, not a link")
-    if root.is_dir() and EVALUATION_DIRS.intersection(p.name for p in root.iterdir()):
-        raise LiveRefusedError("the live folder holds an evaluation folder")
-    return root
+    try:
+        return check_live_root(check_data_dir(data) / LIVE_DIR)
+    except LivePathError as exc:
+        raise LiveRefusedError(str(exc)) from exc
 
 
 def safe(root: Path, path: Path) -> Path:
@@ -228,7 +200,7 @@ def fetch_cycle(
         _no_links_below(root, cache)
         raw = policy.gefs.extract(stations(), t, cache, transfer)
         _no_links_below(root, cache)
-        policy.write(raw, dest)
+        policy.write(raw, dest, root=root)
         with xr.open_zarr(dest, chunks=None) as kept:
             return {"path": str(dest), "content_sha256": content_sha256(kept), "bytes": transfer.bytes}
 
@@ -315,11 +287,11 @@ def _lock(root: Path, name: str, *, blocking: bool = False):
     path.parent.mkdir(parents=True, exist_ok=True)
     safe(root, path)
     try:
-        with file_lock(path, blocking=blocking):
+        with file_lock(path, root=root, blocking=blocking):
             yield
     except LockBusyError as exc:
         raise LiveRefusedError(f"another live writer holds {path.name}") from exc
-    except LockPathError as exc:
+    except (LockPathError, LivePathError) as exc:
         raise LiveRefusedError(str(exc)) from exc
 
 
@@ -328,7 +300,7 @@ def _publish_once(root: Path, path: Path, text: str) -> bool:
     file untouched, if it already exists."""
     path = safe(root, path)
     try:
-        metar.publish_file(path, text)
+        metar.publish_file(path, text, root=root)
     except FileExistsError:
         return False
     return True
@@ -560,12 +532,12 @@ def _publish_new(root, policy, c, store, manifest, first, issues) -> dict:
     staging_root.mkdir(exist_ok=True)
     staging = safe(root, Path(tempfile.mkdtemp(dir=staging_root, prefix=f"{final.name}.")))
     try:
-        metar.publish_file(staging / "inputs.json", json.dumps(manifest, indent=1) + "\n")
+        metar.publish_file(staging / "inputs.json", json.dumps(manifest, indent=1) + "\n", root=root)
         dest = staging / "v4.zarr"
-        policy.write(_clean_store(store), dest)
+        policy.write(_clean_store(store), dest, root=root)
         with xr.open_zarr(dest, chunks=None) as saved:
             digest = content_sha256(saved)
-        metar.publish_file(staging / "v4.sha256", f"{digest}  v4.zarr\n")
+        metar.publish_file(staging / "v4.sha256", f"{digest}  v4.zarr\n", root=root)
         record = {
             "init": manifest["init"],
             "model_id": store.attrs["model_id"],
@@ -581,7 +553,7 @@ def _publish_new(root, policy, c, store, manifest, first, issues) -> dict:
             "inputs": "inputs.json",
             "issues": list(issues),
         }
-        metar.publish_file(staging / "build.json", json.dumps(record, indent=1) + "\n")
+        metar.publish_file(staging / "build.json", json.dumps(record, indent=1) + "\n", root=root)
         if final.exists() or final.is_symlink():
             raise LiveRefusedError(f"{final.name} appeared during the build; refused")
         os.rename(staging, final)

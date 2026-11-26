@@ -35,6 +35,7 @@ from wrfcomp.baselines import gefs as shared_gefs
 from wrfcomp.baselines import io as shared_io
 from wrfcomp.harness import schemas
 from wrfcomp.harness.config import load_config
+from wrfcomp.live.paths import check_target
 from wrfcomp.models import citizen_arms as shared_arms
 from wrfcomp.models import gefs_station_v2 as shared_v2
 from wrfcomp.models import gefs_station_v3 as shared_v3
@@ -121,7 +122,11 @@ class LiveYear:
         if inits.min() < start or (inits[:, None] + ds.lead_time.values[None, :]).max() >= end:
             raise LiveRefusedError(f"a store outside the live year {self.year}")
 
-    def write(self, ds, path) -> None:
-        """``baselines.io.write`` with the live year's config, after checking every time is in it."""
+    def write(self, ds, path, *, root) -> None:
+        """``baselines.io.write`` with the live year's config, after checking every time is in it and
+        that ``path`` is an allowed live write target under the live ``root`` (``paths.check_target``,
+        which also refuses on Windows)."""
         self.check_store_year(ds)
+        check_target(root, Path(path).parent)
+        check_target(root, path)
         self.io.write(ds, path)

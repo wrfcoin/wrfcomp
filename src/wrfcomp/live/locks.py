@@ -13,6 +13,8 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+from wrfcomp.live.paths import check_target
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -55,11 +57,14 @@ def _os_unlock(fd: int) -> None:
 
 
 @contextmanager
-def file_lock(path: Path, *, blocking: bool = False):
-    """Hold the lock ``path`` (created if needed). Non-blocking by default: raises
+def file_lock(path: Path, *, root: Path, blocking: bool = False):
+    """Hold the lock ``path`` (created if needed) under the live ``root``; the lock path is checked
+    with ``paths.check_target`` first (also refused on Windows). Non-blocking by default: raises
     :class:`LockBusyError` if another thread or process holds it."""
     path = Path(path)
+    check_target(root, path.parent)
     path.parent.mkdir(parents=True, exist_ok=True)
+    check_target(root, path)
     if path.parent.is_symlink() or path.is_symlink():
         raise LockPathError(f"refusing a linked lock path: {path}")
     key = os.path.normcase(str(path.parent.resolve() / path.name))

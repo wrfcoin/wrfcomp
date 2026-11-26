@@ -180,7 +180,7 @@ def fetch(
     # The completion time is taken and the file linked into place under the fetch lock, the same lock
     # a build holds while it records its start and lists the fetches: a fetch is either complete and
     # in place before a build starts, or completed after it.
-    with file_lock(_fetch_lock_path(directory), blocking=True):
+    with file_lock(_fetch_lock_path(directory), root=directory.parent, blocking=True):
         completed = clock().astimezone(UTC)
         stamp = completed.strftime(STAMP)
         path = check_target(directory.parent, directory / f"{stamp}.json")
@@ -191,7 +191,7 @@ def fetch(
             "hours": hours,
             "reports": reports,
         }
-        publish_file(path, json.dumps(body, sort_keys=True) + "\n")
+        publish_file(path, json.dumps(body, sort_keys=True) + "\n", root=directory.parent)
     return path, received
 
 
@@ -209,14 +209,18 @@ def _fetch_lock_path(directory: Path) -> Path:
     return check_target(live, lock)
 
 
-def publish_file(path: Path, text: str) -> None:
-    """Write ``path`` once: an exclusive temporary file in the same folder, then an atomic link that
-    fails if ``path`` exists (no replace, also against a concurrent writer). The folder must not be a
-    link. Raises ``FileExistsError`` if ``path`` exists."""
+def publish_file(path: Path, text: str, *, root: Path) -> None:
+    """Write ``path`` once, under the live ``root``: the folder and the file are checked with
+    ``paths.check_target`` (also refused on Windows), then an exclusive temporary file in the same
+    folder is linked into place atomically, failing if ``path`` exists (no replace, also against a
+    concurrent writer). Raises ``FileExistsError`` if ``path`` exists."""
+    path = Path(path)
     directory = path.parent
-    directory.mkdir(parents=True, exist_ok=True)
     if directory.is_symlink():
         raise ValueError(f"refusing to write into a linked folder: {directory}")
+    check_target(root, directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    check_target(root, path)
     fd, staging = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".staging")
     try:
         with os.fdopen(fd, "w") as fh:

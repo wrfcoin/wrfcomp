@@ -1,34 +1,98 @@
-"""The one check every live write goes through.
+"""The one check every live write goes through, called by the lowest-level writers themselves.
 
-Before any file or folder under the live tree is written (fetch files, locks, staging, issue
-folders, GEFS cycles and cache), its FULL target path is resolved with ``os.path.realpath`` (every
-symlink on the way, the last component included) and must lie inside ``realpath(live root)``.
+Every writer of the live tree (``metar.publish_file``, ``LiveYear.write``, ``locks.file_lock``,
+and everything built on them) takes the live root as a required argument and calls
+:func:`check_target` before it writes. It refuses unless:
 
-Live writes are refused on Windows: directory junctions and locked files make a full-path check
-unreliable there, and the daily live run is on Linux. Reading, testing and the evaluation code are
-unaffected.
+* the platform is not Windows: directory junctions and locked files make a full-path check
+  unreliable there, and the daily live run is on Linux. Reading, tests and the evaluation code are
+  unaffected;
+* the root is a real live root (:func:`check_live_root`): a folder named ``live`` that is not a
+  link and holds no evaluation folder, in a data directory that is not inside the repository or a
+  temp directory and is not, or is not inside, an evaluation folder;
+* the FULL target path, resolved with ``os.path.realpath`` (every link on the way, the last
+  component included), lies inside ``realpath(root)``.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
+
+LIVE_DIR = "live"
+REPO = Path(__file__).resolve().parents[3]
+# Folder names the evaluation pipeline uses under the data directory. A live root must not be one of
+# them, sit inside one, or hold one.
+EVALUATION_DIRS = frozenset(
+    {
+        "baselines",
+        "bundle",
+        "candidates",
+        "citizen",
+        "confirm-2023",
+        "configs",
+        "experiments",
+        "gate1",
+        "isd-lite",
+        "parsed",
+        "phase3",
+        "promotion",
+        "raw",
+        "thresholds",
+        "truth",
+    }
+)
+TEMP_DIRS = ("/tmp", tempfile.gettempdir())
 
 
 class LivePathError(RuntimeError):
-    """A live write target is outside the live tree, or live writes are not supported here."""
+    """A live write target or root is not allowed, or live writes are not supported here."""
 
 
-def check_target(live_root: Path, target: Path) -> Path:
-    """Return ``target`` if its full real path is inside the real live root; refuse otherwise."""
-    if sys.platform == "win32":
+def _platform() -> str:
+    return sys.platform
+
+
+def refuse_windows() -> None:
+    if _platform() == "win32":
         raise LivePathError(
             "live writes are not supported on Windows (junctions and locked files make the path "
             "check unreliable); run the live builder on Linux or macOS"
         )
-    root = Path(os.path.realpath(live_root))
+
+
+def check_data_dir(data: Path) -> Path:
+    """The resolved data directory, refused if it is inside the repository or a temp directory, or
+    is or is inside an evaluation folder (or is itself a ``live`` folder)."""
+    resolved = Path(data).resolve()
+    if resolved.is_relative_to(REPO) or any(resolved.is_relative_to(Path(t).resolve()) for t in TEMP_DIRS):
+        raise LivePathError("live data belongs in the external data directory")
+    if EVALUATION_DIRS.intersection(resolved.parts) or resolved.name == LIVE_DIR:
+        raise LivePathError(f"the data directory {resolved} is or is inside an evaluation folder")
+    return resolved
+
+
+def check_live_root(root: Path) -> Path:
+    """``root`` if it is a real live root (see the module docstring)."""
+    root = Path(root)
+    if root.name != LIVE_DIR:
+        raise LivePathError(f"{root} is not a live folder")
+    check_data_dir(root.parent)
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise LivePathError("the live folder must be a real directory, not a link")
+    if root.is_dir() and EVALUATION_DIRS.intersection(p.name for p in root.iterdir()):
+        raise LivePathError("the live folder holds an evaluation folder")
+    return root
+
+
+def check_target(root: Path, target: Path) -> Path:
+    """Return ``target`` if a live write to it is allowed; refuse otherwise (module docstring)."""
+    refuse_windows()
+    check_live_root(root)
+    real_root = Path(os.path.realpath(root))
     real = Path(os.path.realpath(target))
-    if not real.is_relative_to(root):
-        raise LivePathError(f"{target} resolves to {real}, outside the live folder {root}")
+    if not real.is_relative_to(real_root):
+        raise LivePathError(f"{target} resolves to {real}, outside the live folder {real_root}")
     return Path(target)
